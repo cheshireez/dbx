@@ -275,6 +275,42 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 }
 
 // ---------------------------------------------------------------------------
+// 可选传输层 SQL 载荷加密(绕过内容型 WAF 对 SQL 关键字的误拦)
+// 仅在构建时设置 VITE_DBX_WAF_SQL_ENCODE=1 才启用;后端 waf_codec 负责解密,
+// 密钥需与后端 DBX_WAF_SQL_KEY 保持一致(缺省用同一内置默认值)。
+// ---------------------------------------------------------------------------
+const WAF_SQL_ENCODE = import.meta.env.VITE_DBX_WAF_SQL_ENCODE === "1";
+const WAF_SQL_KEY = import.meta.env.VITE_DBX_WAF_SQL_KEY || "dbx-waf-default-key-2026";
+const WAF_SQL_PREFIX = "dbx1:";
+
+function wafBytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(bin);
+}
+
+async function encodeSql(sql: string): Promise<string> {
+  if (!WAF_SQL_ENCODE) return sql;
+  try {
+    const enc = new TextEncoder();
+    const keyBytes = await crypto.subtle.digest("SHA-256", enc.encode(WAF_SQL_KEY));
+    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(sql)));
+    const payload = new Uint8Array(iv.length + cipher.length);
+    payload.set(iv, 0);
+    payload.set(cipher, iv.length);
+    return WAF_SQL_PREFIX + wafBytesToBase64(payload);
+  } catch {
+    // 加密不可用(如非 HTTPS 环境)时退回明文,保证功能可用
+    return sql;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
 
@@ -863,7 +899,7 @@ export async function executeQuery(
   return post("/api/query/execute", {
     connectionId,
     database,
-    sql,
+    sql: await encodeSql(sql),
     schema,
     executionId,
     ...options,
@@ -892,7 +928,7 @@ export async function executeMulti(
   return post("/api/query/execute-multi", {
     connectionId,
     database,
-    sql,
+    sql: await encodeSql(sql),
     schema,
     executionId,
     ...options,
@@ -974,7 +1010,7 @@ export async function executeBatch(connectionId: string, database: string, state
   return post("/api/query/execute-batch", {
     connectionId,
     database,
-    statements,
+    statements: await Promise.all(statements.map(encodeSql)),
     schema,
   });
 }
@@ -983,7 +1019,7 @@ export async function executeScript(connectionId: string, database: string, sql:
   return post("/api/query/execute-script", {
     connectionId,
     database,
-    sql,
+    sql: await encodeSql(sql),
     schema,
   });
 }
@@ -992,7 +1028,7 @@ export async function executeScriptWith2pc(connectionId: string, database: strin
   return post("/api/query/execute-script-2pc", {
     connectionId,
     database,
-    statements,
+    statements: await Promise.all(statements.map(encodeSql)),
     schema,
   });
 }
@@ -1001,7 +1037,7 @@ export async function executeInTransaction(connectionId: string, database: strin
   return post("/api/query/execute-in-transaction", {
     connectionId,
     database,
-    statements,
+    statements: await Promise.all(statements.map(encodeSql)),
     schema,
     catalog,
   });

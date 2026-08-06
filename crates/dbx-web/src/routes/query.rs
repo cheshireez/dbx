@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::state::WebState;
+use crate::waf_codec;
 use dbx_core::query_cancel::RunningTaskMetadata;
 
 #[derive(Deserialize)]
@@ -331,6 +332,8 @@ pub async fn execute_query(
     headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    let mut req = req;
+    req.sql = waf_codec::decode_sql(&req.sql)?;
     let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
     super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql, allow_database_switch)
         .await?;
@@ -377,6 +380,8 @@ pub async fn execute_multi(
     headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<Vec<dbx_core::query::ExecuteMultiResult>>, AppError> {
+    let mut req = req;
+    req.sql = waf_codec::decode_sql(&req.sql)?;
     let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
     super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql, allow_database_switch)
         .await?;
@@ -429,6 +434,8 @@ pub async fn execute_batch(
     headers: HeaderMap,
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    let mut req = req;
+    req.statements = waf_codec::decode_sql_vec(req.statements)?;
     for statement in &req.statements {
         super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, statement, false).await?;
     }
@@ -498,6 +505,8 @@ pub async fn execute_script(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    let mut req = req;
+    req.sql = waf_codec::decode_sql(&req.sql)?;
     tracing::debug!(connection_id = %req.connection_id, "execute_script");
     let db_type = {
         let configs = state.app.configs.read().await;
@@ -524,6 +533,8 @@ pub async fn execute_in_transaction(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    let mut req = req;
+    req.statements = waf_codec::decode_sql_vec(req.statements)?;
     tracing::debug!(connection_id = %req.connection_id, "execute_in_transaction");
     let result = dbx_core::query::execute_statements_in_transaction(
         &state.app,
@@ -543,6 +554,8 @@ pub async fn execute_script_with_2pc(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::query::SchemaDiffDeployResult>, AppError> {
+    let mut req = req;
+    req.statements = waf_codec::decode_sql_vec(req.statements)?;
     tracing::debug!(connection_id = %req.connection_id, "execute_script_with_2pc");
     // Single-connection real transaction (not per-statement auto-commit 2PC).
     let result = dbx_core::query::execute_schema_diff_deploy(

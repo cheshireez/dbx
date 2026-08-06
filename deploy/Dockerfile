@@ -11,6 +11,13 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 COPY apps/desktop/ apps/desktop/
 COPY crates/dbx-core/assets/database-drivers.manifest.json crates/dbx-core/assets/database-drivers.manifest.json
+# 可选:构建前端时启用 SQL 载荷加密(绕过内容型 WAF 误拦)。
+# 开启方式:docker build --build-arg VITE_DBX_WAF_SQL_ENCODE=1 ...
+# 密钥需与后端运行时环境变量 DBX_WAF_SQL_KEY 保持一致。
+ARG VITE_DBX_WAF_SQL_ENCODE=0
+ARG VITE_DBX_WAF_SQL_KEY=dbx-waf-default-key-2026
+ENV VITE_DBX_WAF_SQL_ENCODE=$VITE_DBX_WAF_SQL_ENCODE
+ENV VITE_DBX_WAF_SQL_KEY=$VITE_DBX_WAF_SQL_KEY
 RUN pnpm build
 
 # Stage 2: Cross-compile Rust backend for the requested platform (native, no emulation)

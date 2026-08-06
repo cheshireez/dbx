@@ -4,6 +4,7 @@ mod routes;
 mod sse;
 mod ssh_prompt;
 mod state;
+mod waf_codec;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
