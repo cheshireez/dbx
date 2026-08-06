@@ -799,6 +799,14 @@ async fn main() {
 
     if public_base_path != "/" {
         app = Router::new().nest(&public_base_path, app);
+        // axum 的 nest 不匹配“子路径根目录”(带尾斜杠,如 /dbx/),导致子路径部署时首页 404。
+        // 在 nest 外层显式把根目录挂到 index.html,浏览器地址栏保持 /dbx/ 不变,
+        // 相对资源与前端路径推断都依赖这个 URL 形态。见 issue #5518。
+        if let Ok(static_dir) = std::env::var("DBX_STATIC_DIR") {
+            use tower_http::services::ServeFile;
+            let index_path = format!("{static_dir}/index.html");
+            app = app.route_service(&format!("{public_base_path}/"), ServeFile::new(index_path));
+        }
     }
 
     // Bind address
