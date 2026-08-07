@@ -1,4 +1,5 @@
 import { normalizeBackendError, sanitizeBackendErrorMessage, type BackendError } from "@/lib/backend/errorUtils";
+import { PHOENIX_DRIVER_NOT_INSTALLED_ERROR, PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR } from "@/lib/database/phoenixConnection";
 
 /**
  * Minimal shape of a translate function, satisfied by both `useI18n().t` inside
@@ -32,6 +33,20 @@ const taggedAiCliErrorKeys: Record<string, string> = {
   piAgentProtocolError: "ai.cliErrors.piAgentProtocolError",
   piAgentModelInvalid: "ai.cliErrors.piAgentModelInvalid",
   piAgentRunFailed: "ai.cliErrors.piAgentRunFailed",
+  openCodeNotInstalled: "ai.cliErrors.openCodeNotInstalled",
+  openCodeCliPathInvalid: "ai.cliErrors.openCodeCliPathInvalid",
+  openCodeEnvInvalid: "ai.cliErrors.openCodeEnvInvalid",
+  openCodeEnvReserved: "ai.cliErrors.openCodeEnvReserved",
+  openCodeNotAuthenticated: "ai.cliErrors.openCodeNotAuthenticated",
+  openCodeMcpStartupFailed: "ai.cliErrors.openCodeMcpStartupFailed",
+  openCodeTimeout: "ai.cliErrors.openCodeTimeout",
+  openCodeProtocolError: "ai.cliErrors.openCodeProtocolError",
+  openCodeRunFailed: "ai.cliErrors.openCodeRunFailed",
+};
+
+const exactMessageKeys: Record<string, string> = {
+  [PHOENIX_DRIVER_NOT_INSTALLED_ERROR]: "connection.phoenixDriverNotInstalled",
+  [PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR]: "connection.phoenixDriverNotInstalled",
 };
 
 const patterns: [RegExp, string][] = [
@@ -139,6 +154,9 @@ export function translateBackendError(t: BackendErrorTranslate, error: unknown):
   if (structured) return translateStructuredBackendError(t, structured);
 
   const message = backendErrorMessage(error);
+  const exactKey = exactMessageKeys[message];
+  if (exactKey) return t(exactKey);
+
   const tagged = message.match(/^\[([A-Za-z][A-Za-z0-9]+)\]\s*([\s\S]*)$/);
   if (tagged) {
     const [, code, rawDetail] = tagged;

@@ -2014,7 +2014,8 @@ impl AppState {
                     Some(&db_config.password),
                     db_config.ssl,
                     connect_timeout,
-                );
+                )
+                .with_database(db_config.database.as_deref());
                 db::vector_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::VectorDb(client)
             }
@@ -4986,6 +4987,7 @@ mod tests {
 
     fn mysql_config(database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "conn".to_string(),
             name: "MySQL".to_string(),
             note: String::new(),
@@ -5213,6 +5215,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         assert_eq!(gaussdb_identifier_quote_from_query_result(&result).as_deref(), Some("`"));
