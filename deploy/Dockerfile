@@ -6,6 +6,8 @@ WORKDIR /app
 # 固定与 package.json packageManager 一致的 pnpm 版本,
 # 避免最新 pnpm 对 ignored build scripts 的报错导致构建失败。
 RUN npm i -g pnpm@10.27.0
+# 中国大陆网络加速: npm 走 npmmirror 镜像
+RUN npm config set registry https://registry.npmmirror.com
 # Keep the workspace package available because Vite resolves it directly from source.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/mongo-shell/ packages/mongo-shell/
@@ -26,6 +28,10 @@ RUN pnpm build
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend
 ARG TARGETARCH
 WORKDIR /app
+# 中国大陆网络加速: crates 走 rsproxy 稀疏索引
+RUN mkdir -p /root/.cargo && printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /root/.cargo/config.toml
+# PyPI 走清华镜像
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
