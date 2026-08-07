@@ -30,6 +30,12 @@ ARG TARGETARCH
 WORKDIR /app
 # 中国大陆网络加速: crates 走 rsproxy 稀疏索引
 RUN mkdir -p /root/.cargo && printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /root/.cargo/config.toml
+# github.com 在部分网络环境不可达,这里预置 cargo 的 git 依赖缓存
+# (mysql_async / rust_mysql_common 等),让 cargo 直接用本地缓存、跳过网络抓取。
+COPY .cargo-git-cache /root/.cargo/git
+# github.com 直连不可达时,git 依赖统一走 ghfast.top 代理,并让 cargo 使用 git CLI(遵循 insteadOf)。
+RUN git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/"
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # PyPI 走清华镜像
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN dpkg --add-architecture arm64 \
