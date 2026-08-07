@@ -3,7 +3,9 @@
 # Stage 1: Build frontend (native, no emulation)
 FROM --platform=$BUILDPLATFORM node:22-slim AS frontend
 WORKDIR /app
-RUN npm i -g pnpm
+# 固定与 package.json packageManager 一致的 pnpm 版本,
+# 避免最新 pnpm 对 ignored build scripts 的报错导致构建失败。
+RUN npm i -g pnpm@10.27.0
 # Keep the workspace package available because Vite resolves it directly from source.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/mongo-shell/ packages/mongo-shell/
