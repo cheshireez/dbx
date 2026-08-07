@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::mongo::MongoCommand;
+use crate::waf_codec;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ConnectionSummary {
@@ -767,7 +768,11 @@ impl DbxBackend for WebBackend {
             }
 
             let max_rows = arguments.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-            let mut body = json!({ "connectionId": connection.id, "database": database, "sql": sql });
+            let mut body = json!({
+                "connectionId": connection.id,
+                "database": database,
+                "sql": waf_codec::maybe_encode_sql(sql),
+            });
             // Stateful MCP sessions pin every query to the same backend pool.
             if let Some(client_session_id) = arguments.get("client_session_id").and_then(Value::as_str) {
                 body["clientSessionId"] = json!(client_session_id);
@@ -802,7 +807,11 @@ impl DbxBackend for WebBackend {
         self.request(
             reqwest::Method::POST,
             "/api/query/execute",
-            Some(json!({ "connectionId": connection.id, "database": database, "sql": sql })),
+            Some(json!({
+                "connectionId": connection.id,
+                "database": database,
+                "sql": waf_codec::maybe_encode_sql(sql),
+            })),
         )
         .await?
         .json()

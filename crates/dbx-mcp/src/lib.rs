@@ -3,6 +3,7 @@ pub mod paths;
 pub mod server;
 pub mod session;
 pub mod transport;
+mod waf_codec;
 
 pub use backend::{ConnectionSummary, DbxBackend, LocalBackend, WebBackend};
 pub use dbx_core::mongo_shell as mongo;
