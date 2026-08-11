@@ -26,7 +26,7 @@ import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSum
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
 import { canPersistConnectionTestResult, connectionEditDraftSyncAction } from "./connectionEditDraftSync";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
-import { useSettingsStore } from "@/stores/settingsStore";
+import { normalizeGlobalConnectTimeoutSecs, normalizeGlobalQueryTimeoutSecs, useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/backend/api";
@@ -53,6 +53,7 @@ import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriv
 import { JDBCX_DEFAULT_URL, JDBCX_DRIVER_PROFILE, JDBCX_JDBC_DRIVER_CLASS, ensureJdbcxRuntimeDrivers, isJdbcxRuntimeBundle, isJdbcxRuntimePath, jdbcxHighPrivilegeExtensionsEnabled, setJdbcxHighPrivilegeExtensionsEnabled } from "@/lib/database/jdbcxBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
+import { consulAgentAddressesMatch } from "@/lib/consul/agentTarget";
 import { appendConnectionErrorHints, isJdbcMissingRuntimeDependencyError } from "@/lib/connection/connectionErrorHints";
 import { preventDialogDocumentSelectAll } from "@/lib/connection/dialogTextSelection";
 import { postgresTlsModeForForm } from "@/lib/connection/postgresTlsMode";
@@ -65,7 +66,7 @@ import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } f
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { normalizeNacosEndpoint, normalizeNacosMetricsUrl } from "@/lib/nacos/nacosAdmin";
-import { normalizeNacosNamespaceSelection, normalizeNacosNamespacesForDisplay } from "@/lib/nacos/nacosNamespaceVisibility";
+import { nacosNamespaceIdentity, normalizeNacosNamespaceSelection, normalizeNacosNamespacesForDisplay } from "@/lib/nacos/nacosNamespaceVisibility";
 import {
   ArrowLeft,
   ArrowDown,
@@ -104,9 +105,31 @@ import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/
 import { translateBackendError } from "@/i18n/backend-errors";
 import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
 import { hasCloudflareD1Credentials, isCloudflareD1Connection, normalizeCloudflareD1Connection } from "@/lib/connection/cloudflareD1";
-import { buildElasticsearchExternalConfig, elasticsearchConnectionModeFromConfig, elasticsearchConnectivityCheckPathFromConfig, elasticsearchKibanaBasePathFromConfig, type ElasticsearchConnectionMode } from "@/lib/connection/elasticsearchKibanaProxy";
+import { buildElasticsearchExternalConfig, elasticsearchConnectionModeFromConfig, elasticsearchConnectivityCheckPathFromConfig, elasticsearchIndexGroupingPatternFromConfig, elasticsearchKibanaBasePathFromConfig, type ElasticsearchConnectionMode } from "@/lib/connection/elasticsearchKibanaProxy";
 import { GAUSSDB_M_JDBC_DRIVER_CLASS, gaussdbConnectionMode, gaussdbIdentifierQuoteStyle, setGaussdbConnectionMode, setGaussdbIdentifierQuoteStyle, supportsGaussdbIdentifierQuoteStyle, type GaussdbConnectionMode, type GaussdbIdentifierQuoteStyle } from "@/lib/database/jdbcDialect";
 import { normalizeStoredConnectionDatabase } from "@/lib/database/sqliteNamespace";
+import {
+  createJdbcProductConnectionFieldsByMode,
+  isJdbcProductDefaultDriverClass,
+  isJdbcProductManagedMavenCoordinate,
+  isJdbcProductManagedMavenPath,
+  jdbcProductConnectionDefaults,
+  jdbcProductManagedRuntimePaths,
+  jdbcProductMode,
+  jdbcProductRuntimeSelectionId,
+  rememberJdbcProductConnectionFields,
+  type JdbcProductConnectionFieldsByMode,
+} from "@/lib/database/jdbcProductProfile";
+import {
+  ensureRegisteredJdbcProductRuntimeDrivers,
+  isRegisteredJdbcProductRuntimeInstallError,
+  jdbcProductDriverProfiles,
+  jdbcProductIconTypes,
+  jdbcProductPickerOptions,
+  jdbcProductProfileDefinition,
+  jdbcProductProfileForConfig,
+  jdbcProductProfileIdsForCategory,
+} from "@/lib/database/jdbcProductProfiles";
 
 type DbOption = { value: string; label: string };
 type DbCategoryKey = "sql" | "analytics" | "domestic" | "lightweight" | "document" | "graph_ai" | "timeseries" | "mq" | "registry_config";
@@ -123,6 +146,7 @@ type JdbcDriverSelectItem = {
   label: string;
   paths: string[];
   jdbcxRuntime: boolean;
+  managedProductRuntime?: boolean;
 };
 
 const DREMIO_ARROW_FLIGHT_SQL_JDBC_URL = "jdbc:arrow-flight-sql://127.0.0.1:32010";
@@ -130,6 +154,10 @@ const DREMIO_ARROW_FLIGHT_SQL_JDBC_DRIVER_CLASS = "org.apache.arrow.driver.jdbc.
 const DREMIO_LEGACY_JDBC_URL = "jdbc:dremio:direct=127.0.0.1:31010";
 const DREMIO_LEGACY_JDBC_DRIVER_CLASS = "com.dremio.jdbc.Driver";
 const DEFAULT_SSH_USER = "root";
+const ETCD_GRPC_MAX_INBOUND_DEFAULT_MIB = 32;
+const ETCD_GRPC_MAX_INBOUND_MIN_MIB = 1;
+const ETCD_GRPC_MAX_INBOUND_MAX_MIB = 256;
+const ETCD_GRPC_MAX_INBOUND_PARAM = "grpc_max_inbound_message_size";
 const NACOS_CONNECTION_PROFILES: ReadonlyArray<{ value: NacosConnectionProfile; title: string }> = [
   { value: "v2", title: "Nacos 2.x" },
   { value: "v3", title: "Nacos 3.x" },
@@ -161,6 +189,8 @@ type ConnectionTestState = ConnectionTestResult & { ok: boolean };
 const { t } = useI18n();
 const { toast } = useToast();
 const settingsStore = useSettingsStore();
+const editGlobalConnectTimeoutSecs = ref(settingsStore.editorSettings.globalConnectTimeoutSecs);
+const editGlobalQueryTimeoutSecs = ref(settingsStore.editorSettings.globalQueryTimeoutSecs);
 const open = defineModel<boolean>("open", { default: false });
 const isDesktop = isTauriRuntime();
 
@@ -197,6 +227,7 @@ const agentInstallLabel = ref("");
 const agentInstallProgress = ref<DriverInstallProgress | null>(null);
 const agentInstallError = ref("");
 const showConnectionErrorDialog = ref(false);
+const connectionErrorRawDetail = ref("");
 const connectionErrorDetail = ref("");
 const editingId = ref<string | null>(null);
 const draftTestConnectionId = ref(uuid());
@@ -247,8 +278,10 @@ const defaultForm = (): ConnectionForm => ({
   database: undefined,
   color: "",
   transport_layers: [],
-  connect_timeout_secs: 10,
-  query_timeout_secs: 30,
+  connect_timeout_secs: settingsStore.editorSettings.globalConnectTimeoutSecs,
+  connect_timeout_inherit: true,
+  query_timeout_secs: settingsStore.editorSettings.globalQueryTimeoutSecs,
+  query_timeout_inherit: true,
   idle_timeout_secs: 60,
   keepalive_interval_secs: 30,
   ssl: false,
@@ -274,6 +307,7 @@ const defaultForm = (): ConnectionForm => ({
   informix_server: "",
   external_config: undefined,
   init_script: undefined,
+  docs_notes_path: undefined,
   read_only: false,
   show_system_schemas: false,
   is_production: false,
@@ -284,6 +318,7 @@ const defaultForm = (): ConnectionForm => ({
 const elasticsearchConnectionMode = ref<ElasticsearchConnectionMode>("direct");
 const elasticsearchKibanaBasePath = ref("");
 const elasticsearchConnectivityCheckPath = ref("");
+const elasticsearchIndexGroupingPattern = ref("");
 const elasticsearchConnectionPorts = ref<Record<ElasticsearchConnectionMode, number>>({
   direct: 9200,
   kibana: 5601,
@@ -294,6 +329,7 @@ function resetElasticsearchProxyFields(externalConfig?: unknown) {
   elasticsearchConnectionMode.value = mode;
   elasticsearchKibanaBasePath.value = elasticsearchKibanaBasePathFromConfig(externalConfig);
   elasticsearchConnectivityCheckPath.value = elasticsearchConnectivityCheckPathFromConfig(externalConfig);
+  elasticsearchIndexGroupingPattern.value = elasticsearchIndexGroupingPatternFromConfig(externalConfig);
   elasticsearchConnectionPorts.value = {
     direct: mode === "direct" ? form.value.port : 9200,
     kibana: mode === "kibana" ? form.value.port : 5601,
@@ -535,7 +571,7 @@ function resizeNoteTextarea() {
   textarea.style.overflowY = textarea.scrollHeight > maxContentHeight ? "auto" : "hidden";
 }
 
-const showJdbcDependencyDriverManagerAction = computed(() => form.value.db_type === "jdbc" && isJdbcMissingRuntimeDependencyError(connectionErrorDetail.value));
+const showJdbcDependencyDriverManagerAction = computed(() => form.value.db_type === "jdbc" && (isJdbcMissingRuntimeDependencyError(connectionErrorRawDetail.value) || isRegisteredJdbcProductRuntimeInstallError(form.value, connectionErrorRawDetail.value)));
 
 function externalConfigRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
@@ -597,6 +633,13 @@ const dremioConnectionUrls = ref<Record<DremioConnectionMode, string>>({
   "arrow-flight-sql": DREMIO_ARROW_FLIGHT_SQL_JDBC_URL,
   legacy: DREMIO_LEGACY_JDBC_URL,
 });
+const jdbcProductConnectionMode = ref("");
+const jdbcProductConnectionFields = ref<JdbcProductConnectionFieldsByMode>({});
+const activeJdbcProductProfile = computed(() => jdbcProductProfileForConfig(form.value));
+const activeJdbcProductMode = computed(() => {
+  const profile = activeJdbcProductProfile.value;
+  return profile ? jdbcProductMode(profile, jdbcProductConnectionMode.value) : undefined;
+});
 const hiveAuthMode = ref<HiveKerberosAuthMode>("none");
 const hivePrincipal = ref("");
 const hiveKrb5ConfPath = ref("");
@@ -609,6 +652,73 @@ const dbPickerView = ref<DbPickerView>(loadConnectionPickerView());
 const dbSearchQuery = ref("");
 const selectedDbCategory = ref<DbCategoryKey>("sql");
 const configTab = ref<ConfigTab>("connection");
+
+// 对话框拖动功能
+const dragOffset = ref({ x: 0, y: 0 });
+const isDraggingDialog = ref(false);
+const dragStartPos = ref({ x: 0, y: 0 });
+const dragStartOffset = ref({ x: 0, y: 0 });
+const activePointerId = ref<number | null>(null);
+
+// 计算对话框的定位样式（通过 transform 实现拖动）
+const dialogContentStyle = computed(() => {
+  if (isDraggingDialog.value || dragOffset.value.x !== 0 || dragOffset.value.y !== 0) {
+    return {
+      transform: `translate(${dragOffset.value.x}px, ${dragOffset.value.y}px)`,
+      transition: isDraggingDialog.value ? "none" : "transform 0.15s ease-out",
+    };
+  }
+  return {};
+});
+
+// 开始拖动（在 DialogHeader 上按下鼠标/触摸）
+function onDialogHeaderPointerDown(e: PointerEvent) {
+  if (e.button !== undefined && e.button !== 0) return;
+  isDraggingDialog.value = true;
+  activePointerId.value = e.pointerId;
+  dragStartPos.value = { x: e.clientX, y: e.clientY };
+  dragStartOffset.value = { ...dragOffset.value };
+  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+}
+
+// 拖动中
+function onDialogHeaderPointerMove(e: PointerEvent) {
+  if (!isDraggingDialog.value || e.pointerId !== activePointerId.value) return;
+  const dx = e.clientX - dragStartPos.value.x;
+  const dy = e.clientY - dragStartPos.value.y;
+  dragOffset.value = {
+    x: dragStartOffset.value.x + dx,
+    y: dragStartOffset.value.y + dy,
+  };
+}
+
+// 结束拖动
+function onDialogHeaderPointerEnd(e: PointerEvent) {
+  if (!isDraggingDialog.value || e.pointerId !== activePointerId.value) return;
+  isDraggingDialog.value = false;
+  activePointerId.value = null;
+  try {
+    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+  } catch {
+    // 忽略 release 失败的错误
+  }
+}
+
+// 重置拖动位置
+function resetDialogDragOffset() {
+  dragOffset.value = { x: 0, y: 0 };
+  isDraggingDialog.value = false;
+  activePointerId.value = null;
+}
+
+// 监听对话框 open 状态，重置位置
+watch(open, (isOpen) => {
+  if (isOpen) {
+    nextTick(() => resetDialogDragOffset());
+  } else {
+    resetDialogDragOffset();
+  }
+});
 watch([() => form.value.note, configTab, dialogStep, open], () => {
   void nextTick(resizeNoteTextarea);
 });
@@ -702,6 +812,22 @@ const nacosTlsSkipVerify = ref(false);
 const nacosMetricsMode = ref<NacosMetricsMode>("auto");
 const nacosMetricsUrl = ref("");
 const nacosPageSize = ref(20);
+type ConsulConsistency = "default" | "stale" | "consistent";
+const consulServerAddr = ref("http://127.0.0.1:8500");
+const consulDatacenter = ref("");
+const consulNamespace = ref("");
+const consulPartition = ref("");
+const consulConsistency = ref<ConsulConsistency>("default");
+const consulTlsSkipVerify = ref(false);
+const consulAgentTargetNode = ref("");
+const consulAgentTargetAddress = ref("");
+const consulMeshVisible = ref(false);
+const consulOperatorVisible = ref(false);
+const consulOperatorSnapshotRestoreEnabled = ref(false);
+const consulOperatorAutopilotWriteEnabled = ref(false);
+const consulOperatorRaftWriteEnabled = ref(false);
+const consulOperatorKeyringWriteEnabled = ref(false);
+const consulOperatorLicenseWriteEnabled = ref(false);
 
 // --- MQTT-specific form fields ---
 const mqttHost = ref("127.0.0.1");
@@ -710,14 +836,18 @@ const mqttClientId = ref("");
 const mqttProtocolVersion = ref<"v3" | "v4" | "v5">("v5");
 const mqttTransportMode = ref<"tcp" | "websocket">("tcp");
 const mqttWsPath = ref("/mqtt");
-const mqttAuthKind = ref<"none" | "password">("none");
+const mqttAuthKind = ref<"none" | "password" | "certificate">("none");
 const mqttUsername = ref("");
 const mqttPassword = ref("");
+const mqttCaCertPath = ref("");
+const mqttClientCertPath = ref("");
+const mqttClientKeyPath = ref("");
 const mqttTls = ref(false);
 const mqttTlsSkipVerify = ref(false);
 const mqttKeepAliveSecs = ref(60);
 const mqttConnectTimeoutSecs = ref(30);
 const mqttMaxPacketSizeBytes = ref(16 * 1024 * 1024);
+const mqttSavedTopics = ref<MqttConnectionConfig["savedTopics"]>([]);
 const nacosPrimaryAddressPlaceholder = computed(() => {
   return "http://127.0.0.1:8848/nacos";
 });
@@ -783,12 +913,16 @@ const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
     paths: bundle.artifacts.map((artifact) => artifact.path),
     jdbcxRuntime: bundle.artifacts.some((artifact) => isJdbcxRuntimePath(artifact.path)),
   }));
-  const bundles = jdbcMavenBundles.value.map((bundle) => ({
-    id: `maven:${bundle.id}`,
-    label: bundle.coordinate,
-    paths: bundle.artifacts.map((artifact) => artifact.path),
-    jdbcxRuntime: isJdbcxRuntimeBundle(bundle),
-  }));
+  const productProfile = activeJdbcProductProfile.value;
+  const productMode = activeJdbcProductMode.value;
+  const bundles = jdbcMavenBundles.value
+    .filter((bundle) => !productProfile || !isJdbcProductManagedMavenCoordinate(productProfile, bundle.coordinate))
+    .map((bundle) => ({
+      id: `maven:${bundle.id}`,
+      label: bundle.coordinate,
+      paths: bundle.artifacts.map((artifact) => artifact.path),
+      jdbcxRuntime: isJdbcxRuntimeBundle(bundle),
+    }));
   const manual = jdbcDrivers.value
     .filter((driver) => !driver.bundle_id)
     .map((driver) => ({
@@ -797,7 +931,22 @@ const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
       paths: [driver.path],
       jdbcxRuntime: isJdbcxRuntimePath(driver.path),
     }));
-  return [...localBundles, ...bundles, ...manual].sort((left, right) => left.label.localeCompare(right.label));
+  const productPaths = productProfile && productMode ? jdbcProductManagedRuntimePaths(productProfile, jdbcMavenBundles.value, productMode.id) : [];
+  const managedProductRuntime: JdbcDriverSelectItem[] =
+    productProfile && productMode && productPaths.length > 0
+      ? [
+          {
+            id: jdbcProductRuntimeSelectionId(productProfile, productMode.id),
+            label: t(productProfile.runtimeLabelKey, {
+              mode: t(productMode.labelKey),
+            }),
+            paths: productPaths,
+            jdbcxRuntime: false,
+            managedProductRuntime: true,
+          },
+        ]
+      : [];
+  return [...managedProductRuntime, ...localBundles, ...bundles, ...manual].sort((left, right) => left.label.localeCompare(right.label));
 });
 
 const jdbcDriverSelectItemById = computed(() => new Map(jdbcDriverSelectItems.value.map((item) => [item.id, item])));
@@ -1001,6 +1150,7 @@ const driverProfiles: Record<
   rocketmq: { type: "mq", port: 9876, user: "", label: "Apache RocketMQ", icon: "rocketmq", host: "127.0.0.1" },
   rabbitmq: { type: "mq", port: 5672, user: "", label: "RabbitMQ", icon: "rabbitmq", host: "127.0.0.1" },
   nacos: { type: "nacos", port: 8848, user: "nacos", label: "Nacos", icon: "nacos", host: "127.0.0.1" },
+  consul: { type: "consul", port: 8500, user: "", label: "Consul", icon: "consul", host: "127.0.0.1" },
   mqtt: { type: "mqtt", port: 1883, user: "", label: "MQTT", icon: "mqtt", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
@@ -1013,6 +1163,7 @@ const driverProfiles: Record<
     icon: "mysql",
     urlParams: "",
   },
+  dolt: { type: "mysql", port: 3306, user: "root", label: "Dolt", icon: "dolt", urlParams: "" },
   custom_postgres: {
     type: "postgres",
     port: 5432,
@@ -1021,6 +1172,7 @@ const driverProfiles: Record<
     icon: "postgres",
     urlParams: "",
   },
+  ...jdbcProductDriverProfiles(),
 };
 
 function profileForConfig(config: ConnectionConfig) {
@@ -1219,6 +1371,31 @@ function hydrateNacosFields(value: unknown) {
   resetNacosFields(value as Partial<NacosAdminConfig>);
 }
 
+function resetConsulFields(value?: Record<string, unknown>) {
+  consulServerAddr.value = String(value?.serverAddr || value?.server_addr || "http://127.0.0.1:8500");
+  consulDatacenter.value = String(value?.datacenter || value?.consulDatacenter || value?.consul_datacenter || "");
+  consulNamespace.value = String(value?.namespace || value?.consulNamespace || value?.consul_namespace || "");
+  consulPartition.value = String(value?.partition || value?.consulPartition || value?.consul_partition || "");
+  const consistency = String(value?.consistency || value?.consulConsistency || value?.consul_consistency || "default");
+  consulConsistency.value = (["default", "stale", "consistent"].includes(consistency) ? consistency : "default") as ConsulConsistency;
+  consulTlsSkipVerify.value = Boolean(value?.tlsSkipVerify || value?.tls_skip_verify || value?.consulTlsSkipVerify || value?.consul_tls_skip_verify);
+  const agentTarget = value?.agentTarget || value?.agent_target;
+  const target = agentTarget && typeof agentTarget === "object" ? (agentTarget as Record<string, unknown>) : undefined;
+  consulAgentTargetNode.value = String(target?.node || "");
+  consulAgentTargetAddress.value = String(target?.address || "");
+  consulMeshVisible.value = Boolean(value?.consulMeshVisible);
+  consulOperatorVisible.value = Boolean(value?.consulOperatorVisible);
+  consulOperatorSnapshotRestoreEnabled.value = Boolean(value?.consulOperatorSnapshotRestoreEnabled);
+  consulOperatorAutopilotWriteEnabled.value = Boolean(value?.consulOperatorAutopilotWriteEnabled);
+  consulOperatorRaftWriteEnabled.value = Boolean(value?.consulOperatorRaftWriteEnabled);
+  consulOperatorKeyringWriteEnabled.value = Boolean(value?.consulOperatorKeyringWriteEnabled);
+  consulOperatorLicenseWriteEnabled.value = Boolean(value?.consulOperatorLicenseWriteEnabled);
+}
+
+function hydrateConsulFields(value: unknown) {
+  resetConsulFields(value && typeof value === "object" ? (value as Record<string, unknown>) : undefined);
+}
+
 function resetMqttFields(config?: Partial<MqttConnectionConfig>) {
   mqttHost.value = config?.host?.trim() || "127.0.0.1";
   mqttPort.value = config?.port || 1883;
@@ -1231,15 +1408,29 @@ function resetMqttFields(config?: Partial<MqttConnectionConfig>) {
   mqttKeepAliveSecs.value = Math.max(1, config?.keepAliveSecs || 60);
   mqttConnectTimeoutSecs.value = Math.max(1, config?.connectTimeoutSecs || 30);
   mqttMaxPacketSizeBytes.value = Math.min(268435455, Math.max(1024, config?.maxPacketSizeBytes || 16 * 1024 * 1024));
+  mqttSavedTopics.value = config?.savedTopics ?? [];
   const auth = config?.auth;
   if (auth && auth.kind === "password") {
     mqttAuthKind.value = "password";
     mqttUsername.value = auth.username || "";
     mqttPassword.value = auth.password || "";
+    mqttCaCertPath.value = "";
+    mqttClientCertPath.value = "";
+    mqttClientKeyPath.value = "";
+  } else if (auth && auth.kind === "certificate") {
+    mqttAuthKind.value = "certificate";
+    mqttUsername.value = "";
+    mqttPassword.value = "";
+    mqttCaCertPath.value = auth.caCertPath || "";
+    mqttClientCertPath.value = auth.clientCertPath || "";
+    mqttClientKeyPath.value = auth.clientKeyPath || "";
   } else {
     mqttAuthKind.value = "none";
     mqttUsername.value = "";
     mqttPassword.value = "";
+    mqttCaCertPath.value = "";
+    mqttClientCertPath.value = "";
+    mqttClientKeyPath.value = "";
   }
 }
 
@@ -1252,7 +1443,12 @@ function hydrateMqttFields(value: unknown) {
 }
 
 function buildMqttExternalConfig(): MqttConnectionConfig {
-  const auth: MqttConnectionConfig["auth"] = mqttAuthKind.value === "password" ? { kind: "password", username: mqttUsername.value, password: mqttPassword.value } : { kind: "none" };
+  const auth: MqttConnectionConfig["auth"] =
+    mqttAuthKind.value === "password"
+      ? { kind: "password", username: mqttUsername.value, password: mqttPassword.value }
+      : mqttAuthKind.value === "certificate"
+        ? { kind: "certificate", caCertPath: mqttCaCertPath.value || undefined, clientCertPath: mqttClientCertPath.value || undefined, clientKeyPath: mqttClientKeyPath.value || undefined }
+        : { kind: "none" };
 
   return {
     host: mqttHost.value.trim(),
@@ -1266,6 +1462,7 @@ function buildMqttExternalConfig(): MqttConnectionConfig {
     keepAliveSecs: Math.max(1, mqttKeepAliveSecs.value),
     connectTimeoutSecs: Math.max(1, mqttConnectTimeoutSecs.value),
     maxPacketSizeBytes: Math.min(268435455, Math.max(1024, mqttMaxPacketSizeBytes.value)),
+    savedTopics: mqttSavedTopics.value,
     wsPath: mqttTransportMode.value === "websocket" ? mqttWsPath.value || "/mqtt" : undefined,
   };
 }
@@ -1533,6 +1730,46 @@ function buildNacosAdminConfig(): NacosAdminConfig {
   };
 }
 
+function buildConsulExternalConfig(): Record<string, unknown> {
+  let parsed: URL;
+  try {
+    parsed = new URL(consulServerAddr.value.trim());
+  } catch {
+    throw new Error(t("connection.consulAddressInvalid"));
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error(t("connection.consulAddressInvalid"));
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error(t("connection.consulAddressInvalid"));
+  const targetNode = consulAgentTargetNode.value.trim();
+  const targetAddress = consulAgentTargetAddress.value.trim();
+  if (!!targetNode !== !!targetAddress) throw new Error(t("connection.consulAgentTargetIncomplete"));
+  if (targetAddress && !consulAgentAddressesMatch(targetAddress, parsed.hostname)) {
+    throw new Error(t("connection.consulAgentTargetAddressMismatch"));
+  }
+  return {
+    serverAddr: parsed.toString().replace(/\/$/, ""),
+    datacenter: consulDatacenter.value.trim() || undefined,
+    namespace: consulNamespace.value.trim() || undefined,
+    partition: consulPartition.value.trim() || undefined,
+    consistency: consulConsistency.value,
+    tlsSkipVerify: consulTlsSkipVerify.value || undefined,
+    agentTarget: targetNode ? { node: targetNode, address: targetAddress } : undefined,
+    consulMeshVisible: consulMeshVisible.value || undefined,
+    consulOperatorVisible: consulOperatorVisible.value || undefined,
+    consulOperatorSnapshotRestoreEnabled: consulOperatorSnapshotRestoreEnabled.value || undefined,
+    consulOperatorAutopilotWriteEnabled: consulOperatorAutopilotWriteEnabled.value || undefined,
+    consulOperatorRaftWriteEnabled: consulOperatorRaftWriteEnabled.value || undefined,
+    consulOperatorKeyringWriteEnabled: consulOperatorKeyringWriteEnabled.value || undefined,
+    consulOperatorLicenseWriteEnabled: consulOperatorLicenseWriteEnabled.value || undefined,
+  };
+}
+
+function applyConsulServerAddr(config: LegacyConnectionConfig, serverAddr: string) {
+  const parsed = new URL(serverAddr);
+  config.host = parsed.hostname;
+  config.port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 8500);
+  config.ssl = parsed.protocol === "https:";
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -1580,6 +1817,7 @@ function failAgentDriverInstall(error: unknown) {
 }
 
 function showConnectionError(message: string) {
+  connectionErrorRawDetail.value = message;
   connectionErrorDetail.value = translateBackendError(t, message);
   showConnectionErrorDialog.value = true;
 }
@@ -1648,6 +1886,19 @@ async function ensureRequiredJdbcxDriverInstalled(config: ConnectionConfig): Pro
   addJdbcDriverPaths(result.paths);
   form.value.jdbc_driver_paths = [...(config.jdbc_driver_paths ?? [])];
   selectedJdbcDriverPath.value = result.runtimeSelectionId;
+  if (result.paths.length > 0) {
+    jdbcManualClasspathOpen.value = false;
+  }
+}
+
+async function ensureRequiredJdbcProductRuntimeInstalled(config: ConnectionConfig): Promise<void> {
+  const result = await ensureRegisteredJdbcProductRuntimeDrivers(config, api);
+  if (!result) return;
+
+  jdbcMavenBundles.value = result.bundles;
+  jdbcDriverPathsInput.value = result.paths.join("\n");
+  form.value.jdbc_driver_paths = [...result.paths];
+  selectedJdbcDriverPath.value = result.runtimeSelectionId ?? "";
   if (result.paths.length > 0) {
     jdbcManualClasspathOpen.value = false;
   }
@@ -1940,6 +2191,64 @@ function dremioConnectionModeForConfig(config: Pick<ConnectionConfig, "connectio
   return haystack.includes("jdbc:dremio:") || haystack.includes("com.dremio.jdbc.driver") ? "legacy" : "arrow-flight-sql";
 }
 
+function currentJdbcProductConnectionFields() {
+  return {
+    connectionString: form.value.connection_string || "",
+    driverClass: form.value.jdbc_driver_class || "",
+  };
+}
+
+function applyJdbcProductConnectionMode(modeId: string) {
+  const profile = activeJdbcProductProfile.value;
+  if (!profile) return;
+  jdbcProductConnectionFields.value = rememberJdbcProductConnectionFields(profile, jdbcProductConnectionFields.value, jdbcProductConnectionMode.value, currentJdbcProductConnectionFields());
+  jdbcProductConnectionMode.value = modeId;
+  const fields = jdbcProductConnectionFields.value[modeId] ?? jdbcProductConnectionDefaults(profile, modeId);
+  form.value.connection_string = fields.connectionString;
+  form.value.jdbc_driver_class = fields.driverClass;
+  resetTestState();
+}
+
+function resetJdbcProductConnectionFields(profile = activeJdbcProductProfile.value, config?: Pick<ConnectionConfig, "connection_string" | "jdbc_driver_class">) {
+  if (!profile) {
+    jdbcProductConnectionMode.value = "";
+    jdbcProductConnectionFields.value = {};
+    return;
+  }
+  jdbcProductConnectionMode.value = config ? profile.detectMode(config) : jdbcProductMode(profile, "").id;
+  jdbcProductConnectionFields.value = createJdbcProductConnectionFieldsByMode(profile, config);
+}
+
+function restoreJdbcProductConnectionDefaultsIfEmpty() {
+  const profile = activeJdbcProductProfile.value;
+  if (!profile) return;
+  const defaults = jdbcProductConnectionDefaults(profile, jdbcProductConnectionMode.value);
+  form.value.connection_string = form.value.connection_string?.trim() || defaults.connectionString;
+  form.value.jdbc_driver_class = form.value.jdbc_driver_class?.trim() || defaults.driverClass;
+}
+
+function syncJdbcProductConnectionModeFromUrl() {
+  const profile = activeJdbcProductProfile.value;
+  if (!profile) return;
+  restoreJdbcProductConnectionDefaultsIfEmpty();
+  const nextMode = profile.detectMode(form.value);
+  if (nextMode === jdbcProductConnectionMode.value) {
+    jdbcProductConnectionFields.value = rememberJdbcProductConnectionFields(profile, jdbcProductConnectionFields.value, nextMode, currentJdbcProductConnectionFields());
+    return;
+  }
+
+  if (isJdbcProductDefaultDriverClass(profile, form.value.jdbc_driver_class)) {
+    form.value.jdbc_driver_class = jdbcProductConnectionDefaults(profile, nextMode).driverClass;
+  }
+  jdbcProductConnectionMode.value = nextMode;
+  jdbcProductConnectionFields.value = rememberJdbcProductConnectionFields(profile, jdbcProductConnectionFields.value, nextMode, currentJdbcProductConnectionFields());
+}
+
+function syncJdbcProfileModeFromUrl() {
+  syncDremioConnectionModeFromUrl();
+  syncJdbcProductConnectionModeFromUrl();
+}
+
 function isCustomCompatibleProfile() {
   return selectedType.value === "custom_mysql" || selectedType.value === "custom_postgres";
 }
@@ -1992,6 +2301,12 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       if (val === "dremio") {
         resetDremioConnectionUrls();
         applyDremioConnectionMode("legacy");
+      } else if (jdbcProductProfileDefinition(val)) {
+        const jdbcProductProfile = jdbcProductProfileDefinition(val)!;
+        resetJdbcProductConnectionFields(jdbcProductProfile);
+        const fields = jdbcProductConnectionDefaults(jdbcProductProfile, jdbcProductConnectionMode.value);
+        form.value.connection_string = fields.connectionString;
+        form.value.jdbc_driver_class = fields.driverClass;
       } else if (val === JDBCX_DRIVER_PROFILE) {
         form.value.connection_string = JDBCX_DEFAULT_URL;
         form.value.jdbc_driver_class = JDBCX_JDBC_DRIVER_CLASS;
@@ -2004,6 +2319,13 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       jdbcDriverPathsInput.value = "";
       jdbcManualClasspathOpen.value = true;
       applyPrestoSqlBuiltinDriverPathsIfAvailable();
+    }
+    if (profile.type === "bigquery") {
+      form.value.connection_string = undefined;
+      form.value.jdbc_driver_class = "";
+      form.value.jdbc_driver_paths = [];
+      jdbcDriverPathsInput.value = "";
+      jdbcManualClasspathOpen.value = true;
     }
     if (profile.type === "mq") {
       resetMqFields(defaultMqFieldsForProfile(val));
@@ -2023,6 +2345,14 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       resetNacosFields();
       form.value.database = undefined;
       form.value.connection_string = undefined;
+      form.value.url_params = "";
+    }
+    if (profile.type === "consul") {
+      resetConsulFields();
+      form.value.database = undefined;
+      form.value.connection_string = undefined;
+      form.value.username = "";
+      form.value.password = "";
       form.value.url_params = "";
     }
     if (profile.type === "mqtt") {
@@ -2070,6 +2400,8 @@ watch(
   ([config, isOpen]) => {
     const syncAction = connectionEditDraftSyncAction(config?.id ?? null, isOpen, editingId.value);
     if (syncAction === "preserve") return;
+    editGlobalConnectTimeoutSecs.value = settingsStore.editorSettings.globalConnectTimeoutSecs;
+    editGlobalQueryTimeoutSecs.value = settingsStore.editorSettings.globalQueryTimeoutSecs;
     if (syncAction === "hydrate" && config) {
       clearSavedDatabaseInfo();
       const legacyConfig = config as LegacyConnectionConfig;
@@ -2093,8 +2425,10 @@ watch(
         database: config.database,
         color: config.color || "",
         transport_layers: transportLayersForConfig(legacyConfig),
-        connect_timeout_secs: config.connect_timeout_secs || 10,
-        query_timeout_secs: config.query_timeout_secs ?? 30,
+        connect_timeout_secs: config.connect_timeout_inherit === true ? settingsStore.editorSettings.globalConnectTimeoutSecs : config.connect_timeout_secs || 10,
+        connect_timeout_inherit: config.connect_timeout_inherit === true,
+        query_timeout_secs: config.query_timeout_inherit === true ? settingsStore.editorSettings.globalQueryTimeoutSecs : (config.query_timeout_secs ?? 30),
+        query_timeout_inherit: config.query_timeout_inherit === true,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
         keepalive_interval_secs: config.keepalive_interval_secs ?? 30,
         ssl: config.ssl || false,
@@ -2116,10 +2450,12 @@ watch(
         redis_key_separator: config.redis_key_separator ?? ":",
         redis_scan_page_size: config.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT,
         etcd_endpoints: config.etcd_endpoints || "",
+        gbase_server: config.gbase_server || "",
         informix_server: config.informix_server || "",
         external_config: config.external_config,
         attached_databases: config.attached_databases || [],
         init_script: config.init_script,
+        docs_notes_path: config.docs_notes_path,
         read_only: config.read_only || false,
         show_system_schemas: config.show_system_schemas || false,
         is_production: config.is_production || false,
@@ -2140,6 +2476,11 @@ watch(
         hydrateNacosFields(config.external_config);
       } else {
         resetNacosFields();
+      }
+      if (config.db_type === "consul") {
+        hydrateConsulFields(config.external_config);
+      } else {
+        resetConsulFields();
       }
       if (config.db_type === "mqtt") {
         hydrateMqttFields(config.external_config);
@@ -2171,9 +2512,10 @@ watch(
       }
       dremioConnectionMode.value = profile === "dremio" ? dremioConnectionModeForConfig(config) : "legacy";
       resetDremioConnectionUrls(dremioConnectionMode.value, profile === "dremio" ? config.connection_string : undefined);
+      resetJdbcProductConnectionFields(jdbcProductProfileForConfig(config), config);
       mongoUseUrl.value = !!config.connection_string;
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
-      jdbcManualClasspathOpen.value = config.db_type === "prestosql" || (config.jdbc_driver_paths || []).length > 0;
+      jdbcManualClasspathOpen.value = supportsNativeAgentJdbcDriverConfigType(config.db_type) || (config.jdbc_driver_paths || []).length > 0;
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
       dialogStep.value = "config";
       configTab.value = initialConfigTab();
@@ -2201,6 +2543,7 @@ watch(
       h2ConnectionMode.value = "file";
       dremioConnectionMode.value = "legacy";
       resetDremioConnectionUrls();
+      resetJdbcProductConnectionFields(undefined);
       dialogStep.value = "select";
       configTab.value = "connection";
     }
@@ -2395,6 +2738,7 @@ const iconTypeMap: Record<string, string> = {
   rocketmq: "rocketmq",
   rabbitmq: "rabbitmq",
   nacos: "nacos",
+  consul: "consul",
   mqtt: "mqtt",
   dm: "dm",
   h2: "h2",
@@ -2418,7 +2762,9 @@ const iconTypeMap: Record<string, string> = {
   victoriametrics: "victoriametrics",
   jdbc: "jdbc",
   custom_mysql: "mysql",
+  dolt: "dolt",
   custom_postgres: "postgres",
+  ...jdbcProductIconTypes(),
 };
 
 const dbOptions: DbOption[] = [
@@ -2498,25 +2844,28 @@ const dbOptions: DbOption[] = [
   { value: "rabbitmq", label: "RabbitMQ" },
   { value: "mqtt", label: "MQTT" },
   { value: "nacos", label: "Nacos" },
+  { value: "consul", label: "Consul" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "victoriametrics", label: "VictoriaMetrics" },
   { value: "iris", label: "IRIS" },
   { value: "jdbcx", label: "JDBCX" },
   { value: "manticoresearch", label: "Manticore Search" },
   { value: "custom_mysql", label: "Custom (MySQL)" },
+  { value: "dolt", label: "Dolt" },
   { value: "custom_postgres", label: "Custom (PostgreSQL)" },
   { value: "dremio", label: "Dremio" },
+  ...jdbcProductPickerOptions(),
 ];
 
 const dbCategoryDefinitions: Array<{
   key: DbCategoryKey;
   titleKey: string;
-  optionValues: readonly string[];
+  optionValues: string[];
 }> = [
   {
     key: "sql",
     titleKey: "connection.databaseCategorySql",
-    optionValues: ["postgres", "mysql", "oracle", "sqlserver", "mariadb", "cockroachdb", "db2", "informix", "firebird", "iris", "jdbcx", "custom_mysql", "custom_postgres"],
+    optionValues: ["postgres", "mysql", "oracle", "sqlserver", "mariadb", "cockroachdb", "db2", "informix", "firebird", "iris", "jdbcx", "custom_mysql", "custom_postgres", "dolt"],
   },
   {
     key: "analytics",
@@ -2556,9 +2905,13 @@ const dbCategoryDefinitions: Array<{
   {
     key: "registry_config",
     titleKey: "connection.databaseCategoryRegistryConfig",
-    optionValues: ["etcd", "zookeeper", "nacos"],
+    optionValues: ["etcd", "zookeeper", "nacos", "consul"],
   },
 ];
+
+for (const category of dbCategoryDefinitions) {
+  category.optionValues.push(...jdbcProductProfileIdsForCategory(category.key));
+}
 
 // Keep the picker exhaustive as database drivers are added or reorganized.
 assertCompleteDatabaseCategories(
@@ -2622,9 +2975,14 @@ function dbCategoryForOption(value: string): DbCategoryKey | undefined {
 }
 
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
-const jdbcBackedDatabaseTypes = new Set<DatabaseType>(["jdbc", "prestosql"]);
+function supportsNativeAgentJdbcDriverConfigType(dbType: DatabaseType): boolean {
+  return dbType === "prestosql" || dbType === "bigquery";
+}
+
+const jdbcBackedDatabaseTypes = new Set<DatabaseType>(["jdbc", "prestosql", "bigquery"]);
 const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
 const isJdbcxConnection = computed(() => isJdbcConnection.value && form.value.driver_profile === JDBCX_DRIVER_PROFILE);
+const isJdbcProductConnection = computed(() => Boolean(activeJdbcProductProfile.value));
 const jdbcxHighPrivilegeExtensionsAllowed = computed({
   get: () => jdbcxHighPrivilegeExtensionsEnabled(form.value),
   set: (enabled: boolean) => {
@@ -2632,12 +2990,12 @@ const jdbcxHighPrivilegeExtensionsAllowed = computed({
     resetTestState();
   },
 });
-const isPrestoSqlConnection = computed(() => form.value.db_type === "prestosql");
+const supportsNativeAgentJdbcDriverConfig = computed(() => supportsNativeAgentJdbcDriverConfigType(form.value.db_type));
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
-const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "dremio" ? "" : "sa"));
+const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "dremio" || isJdbcProductConnection.value ? "" : "sa"));
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
   if (form.value.db_type === "access") return "/path/to/database.accdb";
@@ -2663,6 +3021,7 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "dameng",
   "redis",
   "etcd",
+  "consul",
   "clickhouse",
   "elasticsearch",
   "easysearch",
@@ -2677,6 +3036,7 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse" || form.value.db_type === "victoriametrics");
 const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch" && form.value.db_type !== "hbase");
+const showGenericUrlParamsHint = computed(() => form.value.db_type === "mysql" || form.value.db_type === "doris" || form.value.db_type === "starrocks");
 const bareMysqlProfiles = new Set(["doris", "selectdb", "oceanbase"]);
 const supportsMysqlTlsOptions = computed(() => form.value.db_type === "starrocks" || (form.value.db_type === "mysql" && !bareMysqlProfiles.has(selectedType.value)));
 const supportsMysqlCleartextPasswordAuth = computed(() => form.value.db_type === "mysql" && !bareMysqlProfiles.has(selectedType.value));
@@ -2777,6 +3137,18 @@ const etcdEndpointsLines = computed({
     form.value.etcd_endpoints = normalizeEndpointLines(value);
   },
 });
+const etcdGrpcMaxInboundMessageSizeMiB = computed({
+  get: () => {
+    const configuredBytes = Number(getUrlParam(form.value.url_params, ETCD_GRPC_MAX_INBOUND_PARAM));
+    if (!Number.isFinite(configuredBytes) || configuredBytes <= 0) return ETCD_GRPC_MAX_INBOUND_DEFAULT_MIB;
+    return Math.min(ETCD_GRPC_MAX_INBOUND_MAX_MIB, Math.max(ETCD_GRPC_MAX_INBOUND_MIN_MIB, Math.round(configuredBytes / (1024 * 1024))));
+  },
+  set: (value: number) => {
+    const configuredMiB = Number(value);
+    const normalizedMiB = Number.isFinite(configuredMiB) ? Math.min(ETCD_GRPC_MAX_INBOUND_MAX_MIB, Math.max(ETCD_GRPC_MAX_INBOUND_MIN_MIB, Math.round(configuredMiB))) : ETCD_GRPC_MAX_INBOUND_DEFAULT_MIB;
+    form.value.url_params = setUrlParam(form.value.url_params, ETCD_GRPC_MAX_INBOUND_PARAM, String(normalizedMiB * 1024 * 1024));
+  },
+});
 const zookeeperConnectString = computed({
   get: () => form.value.connection_string || "",
   set: (value: string) => {
@@ -2836,6 +3208,20 @@ const filteredProductionDatabaseNames = computed(() => {
 });
 const productionDatabaseSelectedCount = computed(() => productionDatabaseSelection.value.size);
 const productionDatabaseCanSave = computed(() => productionDatabaseNames.value.length > 0 && productionDatabaseSelection.value.size > 0);
+const usesNacosProductionNamespaces = computed(() => form.value.db_type === "nacos");
+const productionDisabledDescriptionKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaceDisabledDescription" : "production.disabledDescription"));
+const productionConnectionDescriptionKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaceConnectionDescription" : "production.connectionDescription"));
+const productionScopeAllLabelKey = computed(() => (usesNacosProductionNamespaces.value ? "production.allNamespaces" : "production.allDatabases"));
+const productionScopeSelectedLabelKey = computed(() => (usesNacosProductionNamespaces.value ? "production.selectedNamespaces" : "production.selectedDatabases"));
+const productionScopeResourceLabelKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaces" : "production.databases"));
+const productionScopeDescriptionKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaceDescription" : "production.databaseDescription"));
+const productionScopePickerLabelKey = computed(() => (usesNacosProductionNamespaces.value ? "production.selectNamespaces" : "production.selectDatabases"));
+const productionPickerTitleKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespacePickerTitle" : "production.databasePickerTitle"));
+const productionPickerDescriptionKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespacePickerDescription" : "production.databasePickerDescription"));
+const productionPickerSearchPlaceholderKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaceSearchPlaceholder" : "production.databaseSearchPlaceholder"));
+const productionPickerSelectionRequiredKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaceSelectionRequired" : "production.databaseSelectionRequired"));
+const productionPickerLoadFailedKey = computed(() => (usesNacosProductionNamespaces.value ? "production.namespaceLoadFailed" : "production.databaseLoadFailed"));
+const productionPickerEmptyKey = computed(() => (usesNacosProductionNamespaces.value ? "production.noNamespacesAvailable" : "production.noDatabasesAvailable"));
 const productionDatabaseSummary = computed(() => {
   const selected = form.value.production_databases?.length || 0;
   if (!selected) return t("production.noDatabasesSelected");
@@ -2995,6 +3381,7 @@ const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
   if (form.value.db_type === "mqtt") return !!mqttHost.value.trim() && mqttPort.value > 0;
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
+  if (form.value.db_type === "consul") return !!consulServerAddr.value.trim();
   if (isCloudflareD1Connection(form.value)) return hasCloudflareD1Credentials(form.value);
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
   return !!(form.value.host || (mongoUseUrl.value && form.value.connection_string) || (form.value.db_type === "jdbc" && form.value.connection_string) || connectionUrlInput.value.trim());
@@ -3080,6 +3467,7 @@ async function testConnection() {
     await ensureRequiredAgentDriverInstalled(config);
     await ensureRequiredGaussdbMJdbcRuntime(config);
     await ensureRequiredJdbcxDriverInstalled(config);
+    await ensureRequiredJdbcProductRuntimeInstalled(config);
     const result = await testConnectionWithTimeout(config, runId);
     if (runId !== testRunId) return;
     let successfulConfig = config;
@@ -3304,9 +3692,9 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.connection_string = undefined;
   }
   const connectTimeout = Number(config.connect_timeout_secs);
-  config.connect_timeout_secs = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 10;
+  config.connect_timeout_secs = config.connect_timeout_inherit === true ? normalizeGlobalConnectTimeoutSecs(editGlobalConnectTimeoutSecs.value) : Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 10;
   const queryTimeout = Number(config.query_timeout_secs);
-  config.query_timeout_secs = Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
+  config.query_timeout_secs = config.query_timeout_inherit === true ? normalizeGlobalQueryTimeoutSecs(editGlobalQueryTimeoutSecs.value) : Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
   const idleTimeout = Number(config.idle_timeout_secs);
   config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
   const keepaliveInterval = Number(config.keepalive_interval_secs);
@@ -3394,6 +3782,20 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.database = undefined;
     config.connection_string = undefined;
     config.url_params = "";
+  } else if (config.db_type === "consul") {
+    const consulConfig = buildConsulExternalConfig();
+    config.external_config = consulConfig;
+    applyConsulServerAddr(config, String(consulConfig.serverAddr));
+    config.client_cert_path = config.client_cert_path?.trim() || "";
+    config.client_key_path = config.client_key_path?.trim() || "";
+    if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
+      throw new Error(t("connection.etcdClientCertPairRequired"));
+    }
+    config.username = "";
+    config.password = config.password.trim();
+    config.database = undefined;
+    config.connection_string = undefined;
+    config.url_params = "";
   } else if (config.db_type === "mqtt") {
     const mqttConfig = buildMqttExternalConfig();
     config.external_config = mqttConfig;
@@ -3421,7 +3823,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.database = "metrics";
     config.username = config.username.trim();
   } else if (config.db_type === "elasticsearch") {
-    config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value, elasticsearchConnectivityCheckPath.value);
+    config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value, elasticsearchConnectivityCheckPath.value, elasticsearchIndexGroupingPattern.value);
   } else if (config.db_type === "sqlserver") {
     config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else if (supportsGaussdbIdentifierQuoteStyle(config)) {
@@ -3528,12 +3930,12 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
       throw new Error(t("connection.etcdClientCertPairRequired"));
     }
-  } else {
+  } else if (form.value.db_type !== "consul") {
     config.etcd_endpoints = undefined;
     config.client_cert_path = undefined;
     config.client_key_path = undefined;
   }
-  if (config.db_type !== "mysql" && config.db_type !== "clickhouse" && config.db_type !== "etcd" && config.db_type !== "starrocks" && config.db_type !== "mongodb" && config.db_type !== "victoriametrics") {
+  if (config.db_type !== "mysql" && config.db_type !== "clickhouse" && config.db_type !== "etcd" && config.db_type !== "consul" && config.db_type !== "starrocks" && config.db_type !== "mongodb" && config.db_type !== "victoriametrics") {
     config.ca_cert_path = undefined;
   } else {
     config.ca_cert_path = config.ca_cert_path?.trim() || "";
@@ -3542,6 +3944,13 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     if (config.db_type === "jdbc") {
       if (config.driver_profile === "dremio") {
         applyDremioJdbcMetadata(config);
+      } else if (jdbcProductProfileForConfig(config)) {
+        const jdbcProductProfile = jdbcProductProfileForConfig(config)!;
+        const defaults = jdbcProductConnectionDefaults(jdbcProductProfile, jdbcProductProfile.detectMode(config));
+        config.host = "";
+        config.port = 0;
+        config.connection_string = config.connection_string?.trim() || defaults.connectionString;
+        config.jdbc_driver_class = config.jdbc_driver_class?.trim() || defaults.driverClass;
       } else if (config.driver_profile === JDBCX_DRIVER_PROFILE) {
         config.host = "";
         config.port = 0;
@@ -3824,6 +4233,7 @@ function resetTestState() {
   testResult.value = null;
   clearTestedConnectionInfo();
   showConnectionErrorDialog.value = false;
+  connectionErrorRawDetail.value = "";
   connectionErrorDetail.value = "";
 }
 
@@ -4001,6 +4411,15 @@ async function loadVisibleDatabaseNames(connectionId: string, config: Connection
 }
 
 function normalizeProductionDatabaseSelection(selectedNames: Iterable<string>, databaseNames: string[]): string[] {
+  if (form.value.db_type === "nacos") {
+    const available = new Map(databaseNames.map((name) => [nacosNamespaceIdentity(name), name]));
+    const selected = new Set<string>();
+    for (const name of selectedNames) {
+      const canonicalName = available.get(nacosNamespaceIdentity(name));
+      if (canonicalName !== undefined) selected.add(canonicalName);
+    }
+    return [...selected];
+  }
   const available = new Map(databaseNames.map((name) => [name.toLowerCase(), name]));
   const selected = new Set<string>();
   for (const name of selectedNames) {
@@ -4017,6 +4436,9 @@ function initialProductionDatabaseSelection(databaseNames: string[]): string[] {
 }
 
 async function loadProductionDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
+  if (config.db_type === "nacos") {
+    return normalizeNacosNamespacesForDisplay(await api.nacosListNamespaces(connectionId)).map((namespace) => namespace.namespace);
+  }
   if (config.db_type === "redis") {
     return (await api.redisListDatabases(connectionId)).map((database) => String(database.db));
   }
@@ -4223,7 +4645,7 @@ async function copyConnectionErrorDetail() {
 }
 
 function openJdbcDriverManager() {
-  emit("openDriverStore", { target: "tab", tab: "jdbc" });
+  emit("openDriverStore", isJdbcProductConnection.value ? agentDriverFocus.value : { target: "tab", tab: "jdbc" });
 }
 
 function openJdbcDriverManagerFromError() {
@@ -4234,6 +4656,8 @@ function openJdbcDriverManagerFromError() {
 function resetForm() {
   editingId.value = null;
   form.value = defaultForm();
+  editGlobalConnectTimeoutSecs.value = settingsStore.editorSettings.globalConnectTimeoutSecs;
+  editGlobalQueryTimeoutSecs.value = settingsStore.editorSettings.globalQueryTimeoutSecs;
   selectedTransportLayerId.value = null;
   draggedTransportLayerId.value = null;
   selectedType.value = "mysql";
@@ -4243,6 +4667,7 @@ function resetForm() {
   oceanbaseSubMode.value = "mysql";
   dremioConnectionMode.value = "legacy";
   resetDremioConnectionUrls();
+  resetJdbcProductConnectionFields(undefined);
   jdbcDriverPathsInput.value = "";
   selectedJdbcDriverPath.value = "";
   connectionUrlInput.value = "";
@@ -4302,6 +4727,7 @@ function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
   if (form.value.db_type === "h2") {
     h2ConnectionMode.value = h2ConnectionModeForConfig(form.value);
   }
+  resetJdbcProductConnectionFields(jdbcProductProfileForConfig(form.value), form.value);
   if (draft.driverProfile === "oceanbase-oracle") {
     oceanbaseSubMode.value = "oracle";
     selectedType.value = "oceanbase";
@@ -4546,6 +4972,25 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
   });
 }
 
+async function persistGlobalTimeoutDrafts() {
+  const nextConnect = normalizeGlobalConnectTimeoutSecs(editGlobalConnectTimeoutSecs.value);
+  const nextQuery = normalizeGlobalQueryTimeoutSecs(editGlobalQueryTimeoutSecs.value);
+  editGlobalConnectTimeoutSecs.value = nextConnect;
+  editGlobalQueryTimeoutSecs.value = nextQuery;
+  const connectChanged = nextConnect !== settingsStore.editorSettings.globalConnectTimeoutSecs;
+  const queryChanged = nextQuery !== settingsStore.editorSettings.globalQueryTimeoutSecs;
+  if (!connectChanged && !queryChanged) return;
+  settingsStore.updateEditorSettings({
+    globalConnectTimeoutSecs: nextConnect,
+    globalQueryTimeoutSecs: nextQuery,
+  });
+  await settingsStore.persistEditorSettings();
+  await store.applyGlobalTimeouts({
+    connectTimeoutSecs: connectChanged ? nextConnect : undefined,
+    queryTimeoutSecs: queryChanged ? nextQuery : undefined,
+  });
+}
+
 async function save() {
   if (!ensureConnectionHostResolvedFromUrl()) return;
   if (isSaving.value) return;
@@ -4556,12 +5001,14 @@ async function save() {
       const updated = withSavedDatabaseInfo(connectionConfigForSubmit(editingId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(updated);
       await ensureRequiredGaussdbMJdbcRuntime(updated);
+      await persistGlobalTimeoutDrafts();
       await store.updateConnection(updated);
       store.stopEditing();
     } else {
       const config = withSavedDatabaseInfo(connectionConfigForSubmit(draftTestConnectionId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(config);
       await ensureRequiredGaussdbMJdbcRuntime(config);
+      await persistGlobalTimeoutDrafts();
       await store.addConnection(config);
       draftTestConnectionId.value = uuid();
       if (config.db_type === "jdbc") {
@@ -4873,7 +5320,6 @@ async function browseJdbcDriverPaths() {
 }
 
 async function loadJdbcDrivers() {
-  if (!isDesktop) return;
   try {
     const [drivers, bundles, localBundles] = await Promise.all([api.listJdbcDrivers(), api.listJdbcMavenBundles(), api.listJdbcLocalBundles()]);
     jdbcDrivers.value = drivers;
@@ -4934,7 +5380,13 @@ function onJdbcDriverSelect(id: any) {
   const item = jdbcDriverSelectItemById.value.get(id);
   if (!item) return;
   selectedJdbcDriverPath.value = id;
-  if (isJdbcxConnection.value && item.jdbcxRuntime) {
+  if (item.managedProductRuntime && activeJdbcProductProfile.value) {
+    const existingPaths = jdbcDriverPathsInput.value
+      .split(/\r?\n/)
+      .map((path) => path.trim())
+      .filter((path) => path && !isJdbcProductManagedMavenPath(activeJdbcProductProfile.value!, path));
+    jdbcDriverPathsInput.value = Array.from(new Set([...existingPaths, ...item.paths])).join("\n");
+  } else if (isJdbcxConnection.value && item.jdbcxRuntime) {
     const installedJdbcxRuntimePaths = new Set(jdbcDriverSelectItems.value.filter((candidate) => candidate.jdbcxRuntime).flatMap((candidate) => candidate.paths));
     const existingPaths = jdbcDriverPathsInput.value
       .split(/\r?\n/)
@@ -4968,8 +5420,8 @@ function openExternalUrl(url: string) {
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent class="connection-dialog-content" :class="connectionDialogContentClass" :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined" @interact-outside.prevent @escape-key-down="handleDialogEscape" @keydown="preventDialogDocumentSelectAll">
-      <DialogHeader>
+    <DialogContent :style="dialogContentStyle" class="connection-dialog-content" :class="connectionDialogContentClass" :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined" @interact-outside.prevent @escape-key-down="handleDialogEscape" @keydown="preventDialogDocumentSelectAll">
+      <DialogHeader class="cursor-move select-none" @pointerdown="onDialogHeaderPointerDown" @pointermove="onDialogHeaderPointerMove" @pointerup="onDialogHeaderPointerEnd" @pointercancel="onDialogHeaderPointerEnd">
         <DialogTitle>{{ editingId ? t("connection.editTitle") : t("connection.title") }}</DialogTitle>
       </DialogHeader>
 
@@ -5107,7 +5559,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent value="connection" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
               <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto pt-4 pr-2 pb-6" :class="{ 'connection-form-body--nacos': form.db_type === 'nacos' }">
-                <div v-if="!isJdbcConnection && form.db_type !== 'nacos'" class="grid grid-cols-4 items-center gap-4">
+                <div v-if="!isJdbcConnection && form.db_type !== 'nacos' && form.db_type !== 'consul'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelClass">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input v-model="connectionUrlInput" class="flex-1" :placeholder="connectionUrlPlaceholder" @keydown.enter.prevent="applyConnectionUrl" />
@@ -5257,9 +5709,27 @@ function openExternalUrl(url: string) {
                       </Button>
                     </div>
                   </div>
+                  <div v-if="activeJdbcProductProfile && activeJdbcProductProfile.modes.length > 1" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.mode") }}</Label>
+                    <div class="col-span-3 flex gap-2">
+                      <Button v-for="mode in activeJdbcProductProfile.modes" :key="mode.id" type="button" size="sm" :variant="jdbcProductConnectionMode === mode.id ? 'default' : 'outline'" @click="applyJdbcProductConnectionMode(mode.id)">
+                        {{ t(mode.labelKey) }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div v-if="activeJdbcProductProfile && activeJdbcProductMode" class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <div class="col-span-3 space-y-1 text-xs text-muted-foreground">
+                      <p>{{ t(activeJdbcProductMode.hintKey) }}</p>
+                      <p>
+                        {{ t(activeJdbcProductProfile.driverManagerHintPrefixKey) }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore', agentDriverFocus)">{{ t("toolbar.driverManager") }}</a
+                        >{{ t(activeJdbcProductProfile.driverManagerHintSuffixKey) }}
+                      </p>
+                    </div>
+                  </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.jdbcUrl") }}</Label>
-                    <Input v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.jdbcUrlPlaceholder')" @blur="syncDremioConnectionModeFromUrl" />
+                    <Input v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.jdbcUrlPlaceholder')" @blur="syncJdbcProfileModeFromUrl" />
                   </div>
                   <div v-if="isJdbcxConnection" class="grid grid-cols-4 items-start gap-4">
                     <Label :class="connectionLabelTopClass">{{ t("connection.jdbcxExtensions") }}</Label>
@@ -5325,17 +5795,17 @@ function openExternalUrl(url: string) {
                   <div class="grid grid-cols-4 items-start gap-4">
                     <span />
                     <div class="col-span-3 space-y-2">
-                      <p class="text-xs text-muted-foreground">
+                      <p v-if="!isJdbcProductConnection" class="text-xs text-muted-foreground">
                         {{ t("connection.jdbcPluginHint") }}
                       </p>
                       <div class="flex flex-wrap gap-2">
-                        <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
+                        <Button type="button" variant="outline" size="sm" @click="openJdbcDriverManager">
                           <FolderOpen class="h-3.5 w-3.5" />
                           {{ t("toolbar.driverManager") }}
                         </Button>
-                        <Button type="button" variant="outline" size="sm" @click="openExternalUrl('https://dbxio.com')">
+                        <Button type="button" variant="outline" size="sm" @click="openExternalUrl(activeJdbcProductProfile?.docsUrl || 'https://dbxio.com')">
                           <ExternalLink class="h-3.5 w-3.5" />
-                          {{ t("connection.jdbcDocs") }}
+                          {{ activeJdbcProductProfile ? t(activeJdbcProductProfile.docsLabelKey) : t("connection.jdbcDocs") }}
                         </Button>
                       </div>
                     </div>
@@ -5821,6 +6291,80 @@ function openExternalUrl(url: string) {
                   </div>
                 </template>
 
+                <!-- Consul KV: HTTP endpoint, ACL token and scope -->
+                <template v-else-if="form.db_type === 'consul'">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulAddress") }}</Label>
+                    <Input v-model="consulServerAddr" class="col-span-3" placeholder="http://127.0.0.1:8500" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulToken") }}</Label>
+                    <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.consulTokenPlaceholder')" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulDatacenter") }}</Label>
+                    <Input v-model="consulDatacenter" class="col-span-3" placeholder="dc1" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulNamespace") }}</Label>
+                    <Input v-model="consulNamespace" class="col-span-3" placeholder="default" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulPartition") }}</Label>
+                    <Input v-model="consulPartition" class="col-span-3" placeholder="default" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.consulAgentTargetNode") }}</Label>
+                    <Input v-model="consulAgentTargetNode" class="col-span-3" placeholder="consul-client-1" />
+                  </div>
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelTopClass">{{ t("connection.consulAgentTargetAddress") }}</Label>
+                    <div class="col-span-3 space-y-1">
+                      <Input v-model="consulAgentTargetAddress" placeholder="127.0.0.1" />
+                      <p class="text-xs text-muted-foreground">{{ t("connection.consulAgentTargetHint") }}</p>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulConsistency") }}</Label>
+                    <Select v-model="consulConsistency">
+                      <SelectTrigger class="col-span-3 h-9"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="default">{{ t("connection.consulConsistencyDefault") }}</SelectItem>
+                        <SelectItem value="stale">{{ t("connection.consulConsistencyStale") }}</SelectItem>
+                        <SelectItem value="consistent">{{ t("connection.consulConsistencyConsistent") }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.consulTlsSkipVerify") }}</Label>
+                    <div class="col-span-3 flex items-center gap-2">
+                      <Switch v-model="consulTlsSkipVerify" />
+                      <span class="text-xs text-muted-foreground">{{ t("connection.consulTlsSkipVerifyHint") }}</span>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelTopClass">{{ t("connection.consulMeshFeatures") }}</Label>
+                    <div class="col-span-3 flex items-start justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                      <div class="space-y-1">
+                        <div class="text-sm font-medium">{{ t("connection.consulMeshVisible") }}</div>
+                        <p class="text-xs text-muted-foreground">{{ t("connection.consulMeshVisibleHint") }}</p>
+                      </div>
+                      <Switch v-model="consulMeshVisible" class="mt-0.5 shrink-0" />
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelTopClass">{{ t("connection.consulOperatorWrites") }}</Label>
+                    <div class="col-span-3 grid gap-2 rounded-md border bg-muted/20 px-3 py-2 text-xs">
+                      <label class="flex items-center gap-2"><input v-model="consulOperatorVisible" type="checkbox" />{{ t("connection.consulOperatorVisible") }}</label>
+                      <label class="flex items-center gap-2"><input v-model="consulOperatorSnapshotRestoreEnabled" type="checkbox" />{{ t("connection.consulOperatorSnapshotRestore") }}</label>
+                      <label class="flex items-center gap-2"><input v-model="consulOperatorAutopilotWriteEnabled" type="checkbox" />{{ t("connection.consulOperatorAutopilot") }}</label>
+                      <label class="flex items-center gap-2"><input v-model="consulOperatorRaftWriteEnabled" type="checkbox" />{{ t("connection.consulOperatorRaft") }}</label>
+                      <label class="flex items-center gap-2"><input v-model="consulOperatorKeyringWriteEnabled" type="checkbox" />{{ t("connection.consulOperatorKeyring") }}</label>
+                      <label class="flex items-center gap-2"><input v-model="consulOperatorLicenseWriteEnabled" type="checkbox" />{{ t("connection.consulOperatorLicense") }}</label>
+                    </div>
+                  </div>
+                </template>
+
                 <!-- etcd: endpoints, user, password, TLS -->
                 <template v-else-if="form.db_type === 'etcd'">
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -6028,11 +6572,16 @@ function openExternalUrl(url: string) {
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.mqttProtocolVersion") }}</Label>
-                    <select v-model="mqttProtocolVersion" class="col-span-3 flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-                      <option value="v5">MQTT 5.0</option>
-                      <option value="v4">MQTT 3.1.1</option>
-                      <option value="v3">MQTT 3.1</option>
-                    </select>
+                    <Select v-model="mqttProtocolVersion">
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="v5">MQTT 5.0</SelectItem>
+                        <SelectItem value="v4">MQTT 3.1.1</SelectItem>
+                        <SelectItem value="v3">MQTT 3.1</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.mqttTransport") }}</Label>
@@ -6050,6 +6599,7 @@ function openExternalUrl(url: string) {
                     <div class="col-span-3 flex gap-2">
                       <Button size="sm" :variant="mqttAuthKind === 'none' ? 'default' : 'outline'" @click="mqttAuthKind = 'none'">{{ t("connection.mqAuthNone") }}</Button>
                       <Button size="sm" :variant="mqttAuthKind === 'password' ? 'default' : 'outline'" @click="mqttAuthKind = 'password'">{{ t("connection.mqAuthBasic") }}</Button>
+                      <Button size="sm" :variant="mqttAuthKind === 'certificate' ? 'default' : 'outline'" @click="mqttAuthKind = 'certificate'">{{ t("connection.mqttAuthCertificate") }}</Button>
                     </div>
                   </div>
                   <template v-if="mqttAuthKind === 'password'">
@@ -6062,13 +6612,27 @@ function openExternalUrl(url: string) {
                       <Input v-model="mqttPassword" type="password" class="col-span-3" :placeholder="t('connection.mqttPasswordPlaceholder')" />
                     </div>
                   </template>
+                  <template v-else-if="mqttAuthKind === 'certificate'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.mqttCaCertPath") }}</Label>
+                      <Input v-model="mqttCaCertPath" class="col-span-3" placeholder="/path/to/ca.pem" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.mqttClientCertPath") }}</Label>
+                      <Input v-model="mqttClientCertPath" class="col-span-3" placeholder="/path/to/client.crt" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.mqttClientKeyPath") }}</Label>
+                      <Input v-model="mqttClientKeyPath" class="col-span-3" placeholder="/path/to/client.key" />
+                    </div>
+                  </template>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.mqttTls") }}</Label>
                     <div class="col-span-3 flex items-center gap-2">
-                      <Switch :checked="mqttTls" @update:checked="mqttTls = $event" />
+                      <Switch v-model="mqttTls" />
                       <Label class="text-sm" :class="mqttTls ? '' : 'text-muted-foreground'">TLS</Label>
                       <template v-if="mqttTls">
-                        <Switch :checked="mqttTlsSkipVerify" @update:checked="mqttTlsSkipVerify = $event" class="ml-4" />
+                        <Switch v-model="mqttTlsSkipVerify" class="ml-4" />
                         <Label class="text-sm" :class="mqttTlsSkipVerify ? '' : 'text-muted-foreground'">{{ t("connection.mqttTlsSkipVerify") }}</Label>
                       </template>
                     </div>
@@ -6293,6 +6857,14 @@ function openExternalUrl(url: string) {
                     <Input v-model="elasticsearchConnectivityCheckPath" class="col-span-3" :placeholder="t('connection.elasticsearchConnectivityCheckPathPlaceholder')" @input="resetTestState" />
                   </div>
 
+                  <div v-if="form.db_type === 'elasticsearch'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.elasticsearchIndexGroupingPattern") }}</Label>
+                    <div class="col-span-3 space-y-1">
+                      <Input v-model="elasticsearchIndexGroupingPattern" :placeholder="t('connection.elasticsearchIndexGroupingPatternPlaceholder')" @input="resetTestState" />
+                      <p class="text-xs text-muted-foreground">{{ t("connection.elasticsearchIndexGroupingPatternHint") }}</p>
+                    </div>
+                  </div>
+
                   <div v-if="form.driver_profile === 'gbase8s'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.gbaseServer") }}</Label>
                     <div class="col-span-3 space-y-1">
@@ -6460,8 +7032,8 @@ function openExternalUrl(url: string) {
                     </label>
                   </div>
 
-                  <div v-if="supportsGenericUrlParams" class="grid grid-cols-4 items-start gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.urlParams") }}</Label>
+                  <div v-if="supportsGenericUrlParams" class="connection-url-params-row grid grid-cols-4 items-start gap-4" :class="{ 'connection-url-params-row--compact': !showGenericUrlParamsHint, 'connection-url-params-row--with-hint': showGenericUrlParamsHint }">
+                    <Label :class="[connectionLabelClass, 'connection-url-params-label']">{{ t("connection.urlParams") }}</Label>
                     <div class="col-span-3 space-y-1.5">
                       <Input
                         v-model="form.url_params"
@@ -6485,7 +7057,7 @@ function openExternalUrl(url: string) {
                                           : 'sslmode=prefer'
                         "
                       />
-                      <p v-if="form.db_type === 'mysql' || form.db_type === 'doris' || form.db_type === 'starrocks'" class="text-xs leading-5 text-muted-foreground">
+                      <p v-if="showGenericUrlParamsHint" class="text-xs leading-5 text-muted-foreground">
                         {{ t("connection.localInfilePathHint") }}
                       </p>
                     </div>
@@ -6505,7 +7077,7 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
 
-                  <template v-if="isPrestoSqlConnection">
+                  <template v-if="supportsNativeAgentJdbcDriverConfig">
                     <div class="grid grid-cols-4 items-start gap-4">
                       <Label :class="connectionLabelTopClass">{{ t("connection.jdbcDriverPaths") }}</Label>
                       <div class="col-span-3 space-y-2">
@@ -6624,7 +7196,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent v-if="supportsTlsToggle" value="tls" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
               <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto overflow-x-hidden pt-4 pr-2 pb-6">
-                <div v-if="!supportsPostgresTlsOptions && !supportsMysqlTlsOptions" class="grid grid-cols-4 items-center gap-4">
+                <div v-if="!supportsPostgresTlsOptions && !supportsMysqlTlsOptions && form.db_type !== 'consul'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">SSL/TLS</Label>
                   <label class="col-span-3 flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" v-model="tlsEnabled" class="mr-0" />
@@ -6677,7 +7249,7 @@ function openExternalUrl(url: string) {
                   </label>
                 </div>
 
-                <template v-if="form.db_type === 'etcd'">
+                <template v-if="form.db_type === 'etcd' || form.db_type === 'consul'">
                   <div class="grid grid-cols-4 items-start gap-4">
                     <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
@@ -7090,11 +7662,40 @@ function openExternalUrl(url: string) {
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.connectTimeout") }}</Label>
-                  <Input v-model.number="form.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
+                  <div class="col-span-3 grid grid-cols-2 gap-2">
+                    <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.connect_timeout_inherit === true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
+                      <input id="connect-timeout-global" v-model="form.connect_timeout_inherit" type="radio" name="connect-timeout-scope" :value="true" class="h-3.5 w-3.5 shrink-0 accent-primary" />
+                      <label for="connect-timeout-global" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useGlobalQueryTimeout')">{{ t("connection.useGlobalQueryTimeout") }}</label>
+                      <Input v-model.number="editGlobalConnectTimeoutSecs" type="number" min="1" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.connect_timeout_inherit !== true" />
+                    </div>
+                    <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.connect_timeout_inherit !== true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
+                      <input id="connect-timeout-connection" v-model="form.connect_timeout_inherit" type="radio" name="connect-timeout-scope" :value="false" class="h-3.5 w-3.5 shrink-0 accent-primary" />
+                      <label for="connect-timeout-connection" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useConnectionQueryTimeout')">{{ t("connection.useConnectionQueryTimeout") }}</label>
+                      <Input v-model.number="form.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.connect_timeout_inherit === true" />
+                    </div>
+                  </div>
+                </div>
+                <div v-if="form.db_type === 'etcd'" class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.etcdGrpcMaxInbound") }}</Label>
+                  <div class="col-span-3 space-y-1">
+                    <Input v-model.number="etcdGrpcMaxInboundMessageSizeMiB" type="number" :min="ETCD_GRPC_MAX_INBOUND_MIN_MIB" :max="ETCD_GRPC_MAX_INBOUND_MAX_MIB" step="1" />
+                    <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.etcdGrpcMaxInboundHint") }}</p>
+                  </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.queryTimeout") }}</Label>
-                  <Input v-model.number="form.query_timeout_secs" type="number" min="0" max="300" step="1" class="col-span-3" />
+                  <div class="col-span-3 grid grid-cols-2 gap-2">
+                    <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.query_timeout_inherit === true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
+                      <input id="query-timeout-global" v-model="form.query_timeout_inherit" type="radio" name="query-timeout-scope" :value="true" class="h-3.5 w-3.5 shrink-0 accent-primary" />
+                      <label for="query-timeout-global" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useGlobalQueryTimeout')">{{ t("connection.useGlobalQueryTimeout") }}</label>
+                      <Input v-model.number="editGlobalQueryTimeoutSecs" type="number" min="0" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.query_timeout_inherit !== true" />
+                    </div>
+                    <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.query_timeout_inherit !== true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
+                      <input id="query-timeout-connection" v-model="form.query_timeout_inherit" type="radio" name="query-timeout-scope" :value="false" class="h-3.5 w-3.5 shrink-0 accent-primary" />
+                      <label for="query-timeout-connection" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useConnectionQueryTimeout')">{{ t("connection.useConnectionQueryTimeout") }}</label>
+                      <Input v-model.number="form.query_timeout_secs" type="number" min="0" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.query_timeout_inherit === true" />
+                    </div>
+                  </div>
                 </div>
                 <div v-show="form.db_type === 'mongodb'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.idleTimeout") }}</Label>
@@ -7121,6 +7722,17 @@ function openExternalUrl(url: string) {
                     <span class="text-xs text-muted-foreground">{{ t("connection.showSystemSchemasHint") }}</span>
                   </label>
                 </div>
+                <!-- Documentation notes are a relational-only feature, so this
+                     follows the same isSchemaAware gate as the row above. -->
+                <div v-if="isSchemaAware(form.db_type)" class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelTopClass">{{ t("connection.docsNotesPath") }}</Label>
+                  <div class="col-span-3 space-y-1">
+                    <Input v-model="form.docs_notes_path" :placeholder="t('connection.docsNotesPathPlaceholder')" spellcheck="false" />
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("connection.docsNotesPathHint") }}
+                    </p>
+                  </div>
+                </div>
                 <div class="grid grid-cols-4 items-start gap-4 rounded-[6px] border border-red-500/25 bg-red-500/[0.035] px-3 py-2.5">
                   <Label :class="[connectionLabelSmallClass, 'pt-0.5 text-red-700 dark:text-red-300']">
                     <span class="inline-flex items-center justify-end gap-1"><ShieldAlert class="h-3.5 w-3.5" />PROD</span>
@@ -7130,25 +7742,25 @@ function openExternalUrl(url: string) {
                       <Label class="text-sm font-medium">{{ t("production.enable") }}</Label>
                       <Switch :model-value="productionProtectionEnabled" @update:model-value="setProductionProtectionEnabled" />
                     </div>
-                    <p v-if="!productionProtectionEnabled" class="text-xs leading-5 text-muted-foreground">{{ t("production.disabledDescription") }}</p>
+                    <p v-if="!productionProtectionEnabled" class="text-xs leading-5 text-muted-foreground">{{ t(productionDisabledDescriptionKey) }}</p>
                     <template v-else>
                       <Label class="text-xs font-medium">{{ t("production.scope") }}</Label>
                       <Tabs v-model="productionScope" class="w-full">
                         <TabsList class="grid h-8 w-full grid-cols-2">
-                          <TabsTrigger value="connection" class="text-xs">{{ t("production.allDatabases") }}</TabsTrigger>
-                          <TabsTrigger value="databases" class="text-xs" :disabled="!canSelectProductionDatabases" :title="canSelectProductionDatabases ? undefined : t('production.singleDatabaseScopeHint')">{{ t("production.selectedDatabases") }}</TabsTrigger>
+                          <TabsTrigger value="connection" class="text-xs">{{ t(productionScopeAllLabelKey) }}</TabsTrigger>
+                          <TabsTrigger value="databases" class="text-xs" :disabled="!canSelectProductionDatabases" :title="canSelectProductionDatabases ? undefined : t('production.singleDatabaseScopeHint')">{{ t(productionScopeSelectedLabelKey) }}</TabsTrigger>
                         </TabsList>
                       </Tabs>
-                      <p class="text-xs leading-5 text-muted-foreground">{{ productionScope === "connection" ? t("production.connectionDescription") : t("production.databaseDescription") }}</p>
+                      <p class="text-xs leading-5 text-muted-foreground">{{ productionScope === "connection" ? t(productionConnectionDescriptionKey) : t(productionScopeDescriptionKey) }}</p>
                       <div v-if="productionScope === 'databases'" class="grid gap-1.5">
                         <div class="flex items-center justify-between gap-3">
-                          <Label class="text-xs font-medium">{{ t("production.databases") }}</Label>
+                          <Label class="text-xs font-medium">{{ t(productionScopeResourceLabelKey) }}</Label>
                           <span class="text-xs text-muted-foreground">{{ productionDatabaseSummary }}</span>
                         </div>
                         <Button type="button" variant="outline" size="sm" class="justify-start" :disabled="isTesting || isSaving || isLoadingProductionDatabases || !hasRequiredConnectionTarget" @click="openProductionDatabasesPicker">
                           <Loader2 v-if="isLoadingProductionDatabases" class="mr-1.5 h-4 w-4 animate-spin" />
                           <ListFilter v-else class="mr-1.5 h-4 w-4" />
-                          {{ t("production.selectDatabases") }}
+                          {{ t(productionScopePickerLabelKey) }}
                         </Button>
                       </div>
                     </template>
@@ -7190,8 +7802,8 @@ function openExternalUrl(url: string) {
                         :key="hop.id"
                         type="button"
                         draggable="true"
-                        class="flex min-h-10 items-center gap-2 rounded-md border px-2 text-left text-xs transition-colors"
-                        :class="hop.id === selectedTransportLayer?.id ? 'border-primary bg-primary/5' : 'hover:bg-muted/50'"
+                        class="connection-transport-layer-option flex min-h-10 items-center gap-2 rounded-md border px-2 text-left text-xs transition-colors"
+                        :class="hop.id === selectedTransportLayer?.id ? 'connection-transport-layer-option--selected border-primary bg-primary/5' : 'hover:bg-muted/50'"
                         @click="selectedTransportLayerId = hop.id"
                         @dragstart="draggedTransportLayerId = hop.id"
                         @dragover.prevent
@@ -7661,15 +8273,15 @@ function openExternalUrl(url: string) {
   <Dialog v-model:open="showProductionDatabasesDialog">
     <DialogContent class="sm:max-w-[460px]">
       <DialogHeader>
-        <DialogTitle>{{ t("production.databasePickerTitle") }}</DialogTitle>
+        <DialogTitle>{{ t(productionPickerTitleKey) }}</DialogTitle>
         <p class="text-sm text-muted-foreground">
-          {{ t("production.databasePickerDescription", { connection: form.name || selectedProfile().label }) }}
+          {{ t(productionPickerDescriptionKey, { connection: form.name || selectedProfile().label }) }}
         </p>
       </DialogHeader>
 
       <div class="flex items-center gap-2 rounded-md border bg-background px-2">
         <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
-        <Input v-model="productionDatabaseSearchText" :placeholder="t('production.databaseSearchPlaceholder')" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingProductionDatabases || !!productionDatabaseError" />
+        <Input v-model="productionDatabaseSearchText" :placeholder="t(productionPickerSearchPlaceholderKey)" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingProductionDatabases || !!productionDatabaseError" />
       </div>
 
       <div class="flex items-center justify-between text-xs text-muted-foreground">
@@ -7684,7 +8296,7 @@ function openExternalUrl(url: string) {
         </div>
       </div>
       <p v-if="!isLoadingProductionDatabases && !productionDatabaseError && !productionDatabaseCanSave" class="text-xs text-destructive">
-        {{ t("production.databaseSelectionRequired") }}
+        {{ t(productionPickerSelectionRequiredKey) }}
       </p>
 
       <div class="h-72 overflow-y-auto rounded-md border bg-background/50 p-1">
@@ -7693,14 +8305,14 @@ function openExternalUrl(url: string) {
           {{ t("common.loading") }}
         </div>
         <div v-else-if="productionDatabaseError" class="flex h-full flex-col items-start justify-center gap-3 p-3 text-sm text-destructive">
-          <p>{{ t("production.databaseLoadFailed", { message: productionDatabaseError }) }}</p>
+          <p>{{ t(productionPickerLoadFailedKey, { message: productionDatabaseError }) }}</p>
           <Button type="button" variant="outline" size="sm" @click="reloadProductionDatabases">
             <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
             {{ t("production.retry") }}
           </Button>
         </div>
         <div v-else-if="!filteredProductionDatabaseNames.length" class="p-3 text-sm text-muted-foreground">
-          {{ productionDatabaseNames.length ? t("grid.noSearchResults") : t("production.noDatabasesAvailable") }}
+          {{ productionDatabaseNames.length ? t("grid.noSearchResults") : t(productionPickerEmptyKey) }}
         </div>
         <template v-else>
           <button
@@ -7775,26 +8387,44 @@ function openExternalUrl(url: string) {
 
 /* Legacy responsive layout rules live in public/connection-dialog-legacy.css
  * so the production build cannot rewrite their classic media queries. */
-@supports not (color: oklch(0.5 0.1 180)) {
-  .connection-db-category-option--selected {
-    color: rgb(23, 23, 23) !important;
-    background-color: rgba(23, 23, 23, 0.08) !important;
-  }
+html.dbx-legacy-webview .connection-db-category-option--selected {
+  color: rgb(23, 23, 23) !important;
+  background-color: rgba(23, 23, 23, 0.08) !important;
+}
 
-  .connection-db-category-option--selected:hover {
-    color: rgb(23, 23, 23) !important;
-    background-color: rgba(23, 23, 23, 0.12) !important;
-  }
+html.dbx-legacy-webview .connection-db-category-option--selected:hover {
+  color: rgb(23, 23, 23) !important;
+  background-color: rgba(23, 23, 23, 0.12) !important;
+}
 
-  .dark .connection-db-category-option--selected {
-    color: rgb(244, 244, 245) !important;
-    background-color: rgba(255, 255, 255, 0.1) !important;
-  }
+html.dbx-legacy-webview .connection-transport-layer-option--selected {
+  color: rgb(23, 23, 23) !important;
+  border-color: rgb(23, 23, 23) !important;
+  background-color: rgba(23, 23, 23, 0.08) !important;
+}
 
-  .dark .connection-db-category-option--selected:hover {
-    color: rgb(244, 244, 245) !important;
-    background-color: rgba(255, 255, 255, 0.14) !important;
-  }
+html.dbx-legacy-webview .connection-transport-layer-option--selected:hover {
+  background-color: rgba(23, 23, 23, 0.12) !important;
+}
+
+html.dbx-legacy-webview.dark .connection-db-category-option--selected {
+  color: rgb(244, 244, 245) !important;
+  background-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+html.dbx-legacy-webview.dark .connection-db-category-option--selected:hover {
+  color: rgb(244, 244, 245) !important;
+  background-color: rgba(255, 255, 255, 0.14) !important;
+}
+
+html.dbx-legacy-webview.dark .connection-transport-layer-option--selected {
+  color: rgb(244, 244, 245) !important;
+  border-color: rgb(244, 244, 245) !important;
+  background-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+html.dbx-legacy-webview.dark .connection-transport-layer-option--selected:hover {
+  background-color: rgba(255, 255, 255, 0.14) !important;
 }
 
 .connection-db-picker-option {

@@ -44,6 +44,7 @@ import {
   Trash2,
   WrapText,
   X,
+  Wrench,
 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import i18n from "@/i18n";
@@ -66,12 +67,10 @@ import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import {
   buildDropObjectSql,
   buildDropTableSql,
-  buildDuplicateTableStructureSql,
+  buildDuplicateTableStructurePlan as buildSharedDuplicateTableStructurePlan,
   buildCopyTableDataSql,
   buildEmptyTableSql,
   buildTruncateTableSql,
-  collectDuplicateTableColumnComments,
-  duplicateTableStructureRequiresScript,
   supportsDropTableCascade,
   supportsTruncateTableCascade,
   type TableAdminSqlOptions,
@@ -94,6 +93,7 @@ import QueryEditor from "@/components/editor/QueryEditor.vue";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
+import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
 import { batchTableEmptyFeedback, buildBatchTableEmptyPlan, runBatchTableEmpty, type BatchTableEmptyPlanItem } from "@/lib/sidebar/batchTableEmpty";
 import { runBatchTableDrop } from "@/lib/table/batchTableDrop";
@@ -1176,6 +1176,7 @@ async function openNewQuery(row: ObjectBrowserRow) {
     tabId,
     await buildTableSelectSql({
       databaseType: effectiveDatabaseType.value,
+      driverProfile: props.connection.driver_profile,
       identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       catalog: props.catalog,
       database: props.database,
@@ -1930,24 +1931,17 @@ function requestDuplicateStructure(row: ObjectBrowserRow) {
 }
 
 async function buildDuplicateStructurePlan(sourceName: string, targetName: string, schema: string | undefined, tableComment?: string | null, sourceColumns?: ColumnInfo[]) {
-  let columns = sourceColumns;
-  if (effectiveDatabaseType.value === "dameng" && !columns) {
-    try {
-      columns = await api.getColumns(props.connection.id, props.database, schema || "", sourceName, props.catalog);
-    } catch (error) {
-      console.warn(`Failed to load Dameng column comments for table clone: ${sourceName}`, error);
-    }
-  }
-  const columnComments = effectiveDatabaseType.value === "dameng" ? collectDuplicateTableColumnComments(columns ?? []) : [];
-  const sql = await buildDuplicateTableStructureSql({
+  return buildSharedDuplicateTableStructurePlan({
+    connectionId: props.connection.id,
+    database: props.database,
+    catalog: props.catalog,
     databaseType: effectiveDatabaseType.value,
     schema,
     sourceName,
     targetName,
     tableComment,
-    columnComments,
+    sourceColumns,
   });
-  return { sql, sourceColumns: columns, executeAsScript: duplicateTableStructureRequiresScript(sql) };
 }
 
 function executeDuplicateStructurePlan(plan: { sql: string; executeAsScript: boolean }, schema: string | undefined) {
@@ -2197,6 +2191,21 @@ async function executeObjectBrowserSqlWithProductionGuard<T>(sql: string, execut
     source: t("production.sourceObjectBrowser"),
     execute,
   });
+}
+
+async function compileXuguObject(row: ObjectBrowserRow) {
+  if (effectiveDatabaseType.value !== "xugu") return;
+  const sql = buildXuguCompileSql({ objectType: row.type, schema: row.schema || selectedSchema.value, name: row.name });
+  if (!sql) return;
+  try {
+    const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql, row.schema || selectedSchema.value));
+    if (!executed) return;
+    toast(t("contextMenu.compileObjectSuccess", { name: row.name }));
+    await reload();
+    await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, row.schema || selectedSchema.value);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 async function refreshTruncatePreviewSql(row: ObjectBrowserRow) {
@@ -2704,6 +2713,7 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
     ...(item.type === "PROCEDURE" ? [{ label: t("contextMenu.executeProcedure"), action: () => openProcedureExecution(item), icon: Play }] : []),
+    ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: "", separator: true },
@@ -2720,6 +2730,7 @@ function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 function getPackageMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
+    ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     { label: "", separator: true },
     { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
@@ -2959,7 +2970,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <template #default="{ item }">
               <CustomContextMenu :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                 <div
-                  class="grid h-[34px] cursor-pointer items-center gap-3 border-b px-3 hover:bg-accent/50"
+                  class="grid h-[34px] cursor-default items-center gap-3 border-b px-3 hover:bg-accent/50"
                   :class="{
                     'bg-accent/40': sourceRow?.id === item.id,
                     'bg-primary/10': sidePanelRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -3018,7 +3029,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <div class="object-browser-grid-row" :style="{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, height: `${objectGridRowHeight - OBJECT_GRID_GAP}px` }">
                 <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                   <div
-                    class="relative flex h-full min-h-0 cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+                    class="relative flex h-full min-h-0 cursor-default flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
                     :class="{
                       'border-primary bg-primary/5': selectedTableIds.has(item.id),
                       'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),

@@ -1344,6 +1344,15 @@ fn writable_transfer_columns(
         .collect()
 }
 
+fn transfer_key_columns(columns: &[db::ColumnInfo], db_type: &DatabaseType) -> Vec<String> {
+    let uses_unique_key_model = matches!(db_type, DatabaseType::Doris | DatabaseType::StarRocks);
+    columns
+        .iter()
+        .filter(|column| column.is_primary_key || (uses_unique_key_model && column.is_unique))
+        .map(|column| column.name.clone())
+        .collect()
+}
+
 fn dameng_identity_insert_statement(table: &str, schema: &str, enabled: bool) -> String {
     let full_table = qualified_table(table, schema, &DatabaseType::Dameng, None);
     format!("SET IDENTITY_INSERT {full_table} {}", if enabled { "ON" } else { "OFF" })
@@ -1817,6 +1826,19 @@ struct PostgresSequenceSnapshot {
     owner_column: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresTransferSequence {
+    name: String,
+    data_type: String,
+    start_value: String,
+    min_value: String,
+    max_value: String,
+    increment: String,
+    cycle: bool,
+    cache_value: String,
+    last_value: Option<String>,
+}
+
 fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String {
     if schema.trim().is_empty() {
         quote_identifier(sequence_name, &DatabaseType::Postgres)
@@ -1827,6 +1849,31 @@ fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String
             quote_identifier(sequence_name, &DatabaseType::Postgres)
         )
     }
+}
+
+fn generate_postgres_transfer_sequence_create_ddl(sequence: &PostgresTransferSequence, schema: &str) -> String {
+    let qualified_name = postgres_sequence_qualified_name(schema, &sequence.name);
+    let cycle = if sequence.cycle { "CYCLE" } else { "NO CYCLE" };
+    format!(
+        "CREATE SEQUENCE IF NOT EXISTS {qualified_name}\n  AS {data_type}\n  START WITH {start_value}\n  INCREMENT BY {increment}\n  MINVALUE {min_value}\n  MAXVALUE {max_value}\n  CACHE {cache_value}\n  {cycle}",
+        data_type = sequence.data_type,
+        start_value = sequence.start_value,
+        increment = sequence.increment,
+        min_value = sequence.min_value,
+        max_value = sequence.max_value,
+        cache_value = sequence.cache_value,
+    )
+}
+
+fn generate_postgres_transfer_sequence_setval_sql(sequence: &PostgresTransferSequence, schema: &str) -> Option<String> {
+    let last_value = sequence.last_value.as_deref()?.trim();
+    if last_value.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "SELECT setval({}, {last_value}, true)",
+        quote_postgres_string_literal(&postgres_sequence_qualified_name(schema, &sequence.name))
+    ))
 }
 
 /// Reuse an existing target sequence only when it is already bound to the same
@@ -4344,6 +4391,84 @@ async fn get_postgres_sequence_snapshots_for_transfer(
         .collect())
 }
 
+fn postgres_selected_sequences_sql(schema: &str, names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let name_list = names.iter().map(|name| quote_string_literal(name)).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "SELECT c.relname, \
+          COALESCE(format_type(s.seqtypid, NULL), 'bigint'), \
+          COALESCE(s.seqstart::text, '1'), \
+          COALESCE(s.seqmin::text, '1'), \
+          COALESCE(s.seqmax::text, '9223372036854775807'), \
+          COALESCE(s.seqincrement::text, '1'), \
+          CASE WHEN COALESCE(s.seqcycle, false) THEN 'true' ELSE 'false' END, \
+          COALESCE(s.seqcache::text, '1'), \
+          pg_sequence_last_value(c.oid)::text \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid \
+         WHERE c.relkind = 'S' AND n.nspname = {} AND c.relname IN ({name_list}) \
+         ORDER BY c.relname",
+        quote_string_literal(schema)
+    ))
+}
+
+async fn get_postgres_selected_sequences_for_transfer(
+    state: &AppState,
+    pool_key: &str,
+    schema: &str,
+    names: &[String],
+) -> Result<Vec<PostgresTransferSequence>, String> {
+    let Some(sql) = postgres_selected_sequences_sql(schema, names) else {
+        return Ok(Vec::new());
+    };
+    Ok(execute_on_pool(state, pool_key, &sql)
+        .await?
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(PostgresTransferSequence {
+                name: json_string_cell(&row, 0)?,
+                data_type: json_string_cell(&row, 1)?,
+                start_value: json_string_cell(&row, 2)?,
+                min_value: json_string_cell(&row, 3)?,
+                max_value: json_string_cell(&row, 4)?,
+                increment: json_string_cell(&row, 5)?,
+                cycle: json_string_cell(&row, 6).as_deref() == Some("true"),
+                cache_value: json_string_cell(&row, 7)?,
+                last_value: json_string_cell(&row, 8),
+            })
+        })
+        .collect())
+}
+
+async fn get_existing_postgres_sequence_names_for_transfer(
+    state: &AppState,
+    pool_key: &str,
+    schema: &str,
+    names: &[String],
+) -> Result<HashSet<String>, String> {
+    if names.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let name_list = names.iter().map(|name| quote_string_literal(name)).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT c.relname \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'S' AND n.nspname = {} AND c.relname IN ({name_list})",
+        quote_string_literal(schema)
+    );
+    Ok(execute_on_pool(state, pool_key, &sql)
+        .await?
+        .rows
+        .into_iter()
+        .filter_map(|row| json_string_cell(&row, 0))
+        .collect())
+}
+
 /// Create owned PostgreSQL sequences before executing reused table DDL because
 /// serial defaults still reference `nextval('...')` in `CREATE TABLE`.
 async fn prepare_postgres_owned_sequences_for_transfer(
@@ -4444,6 +4569,21 @@ pub struct TransferObjectOutcome {
 
 pub fn selected_object_names(selections: &[TransferObjectSelection], kind: &TransferObjectKind) -> Vec<String> {
     selections.iter().filter(|s| &s.object_type == kind).flat_map(|s| s.names.clone()).collect::<Vec<_>>()
+}
+
+fn selected_postgres_sequence_names(request: &TransferRequest) -> Vec<String> {
+    let mut names = selected_object_names(&request.objects, &TransferObjectKind::Sequence);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn postgres_transfer_relation_names(request: &TransferRequest) -> Vec<String> {
+    let mut names = request.tables.clone();
+    names.extend(selected_postgres_sequence_names(request));
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Whether a kind participates in a transfer. An empty selection is the legacy
@@ -5279,12 +5419,13 @@ pub async fn preview_transfer_ownership(
         return Ok(TransferOwnershipPreview { missing_owners: Vec::new(), target_owner: String::new() });
     }
 
+    let relation_names = postgres_transfer_relation_names(request);
     let statements = get_postgres_ownership_statements_for_transfer(
         state,
         source_pool_key,
         &request.source_schema,
         &request.target_schema,
-        &request.tables,
+        &relation_names,
     )
     .await?;
     let roles = distinct_postgres_ownership_roles(&statements);
@@ -5609,11 +5750,7 @@ where
             )
             .await?;
             let col_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
-            let primary_key_columns = columns
-                .iter()
-                .filter(|column| column.is_primary_key)
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>();
+            let primary_key_columns = transfer_key_columns(&columns, source_db_type);
             let sql = pagination_sql_with_order(
                 &col_names,
                 table,
@@ -5863,8 +6000,7 @@ where
 
     let col_names: Vec<String> = writable_columns.iter().map(|c| c.name.clone()).collect();
     let col_types: Vec<Option<String>> = writable_columns.iter().map(|c| Some(c.data_type.clone())).collect();
-    let primary_key_columns: Vec<String> =
-        writable_columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
+    let primary_key_columns = transfer_key_columns(&writable_columns, source_db_type);
     log::info!("[transfer] {} has {} columns, counting rows...", table, columns.len());
 
     // Fetch source table comment
@@ -6146,10 +6282,9 @@ where
             )
             .await
             .unwrap_or_default();
-            let pks: Vec<String> = target_columns
-                .iter()
-                .filter(|c| c.is_primary_key && col_names.iter().any(|name| name.eq_ignore_ascii_case(&c.name)))
-                .map(|c| c.name.clone())
+            let pks: Vec<String> = transfer_key_columns(&target_columns, target_db_type)
+                .into_iter()
+                .filter(|name| col_names.iter().any(|column_name| column_name.eq_ignore_ascii_case(name)))
                 .collect();
             if pks.is_empty() {
                 log::warn!("[transfer] table {} has no primary key, falling back to append", table);
@@ -6331,7 +6466,26 @@ where
         get_postgres_extension_sources_for_transfer(state, source_pool_key, &request.source_schema).await?;
     let enum_types = get_postgres_enum_sources_for_transfer(state, source_pool_key, &request.source_schema).await?;
     let domains = get_postgres_domain_sources_for_transfer(state, source_pool_key, &request.source_schema).await?;
-    let total_steps = extensions.len() + enum_types.len() + domains.len();
+    let selected_sequence_names = selected_postgres_sequence_names(request);
+    let selected_sequences = get_postgres_selected_sequences_for_transfer(
+        state,
+        source_pool_key,
+        &request.source_schema,
+        &selected_sequence_names,
+    )
+    .await?;
+    let existing_sequence_names = get_existing_postgres_sequence_names_for_transfer(
+        state,
+        target_pool_key,
+        &request.target_schema,
+        &selected_sequence_names,
+    )
+    .await?;
+    let selected_sequences = selected_sequences
+        .into_iter()
+        .filter(|sequence| !existing_sequence_names.contains(&sequence.name))
+        .collect::<Vec<_>>();
+    let total_steps = extensions.len() + enum_types.len() + domains.len() + selected_sequences.len();
     let table_index = 0;
     let mut completed_steps = 0_u64;
 
@@ -6398,6 +6552,36 @@ where
             .map_err(|e| format!("Failed to create PostgreSQL domain {}: {e}", domain.domain_name))?;
     }
 
+    for sequence in selected_sequences {
+        if is_cancelled(&request.transfer_id).await {
+            return Err("Cancelled".to_string());
+        }
+        completed_steps += 1;
+        progress_callback(TransferProgress {
+            transfer_id: request.transfer_id.clone(),
+            table: format!("sequence: {}", sequence.name),
+            table_index,
+            total_tables: request.tables.len(),
+            rows_transferred: completed_steps,
+            total_rows: Some(total_steps as u64),
+            status: TransferStatus::Running,
+            error: None,
+            terminal: false,
+        });
+        execute_on_pool(
+            state,
+            target_pool_key,
+            &generate_postgres_transfer_sequence_create_ddl(&sequence, &request.target_schema),
+        )
+        .await
+        .map_err(|e| format!("Failed to create PostgreSQL sequence {}: {e}", sequence.name))?;
+        if let Some(setval_sql) = generate_postgres_transfer_sequence_setval_sql(&sequence, &request.target_schema) {
+            execute_on_pool(state, target_pool_key, &setval_sql)
+                .await
+                .map_err(|e| format!("Failed to restore PostgreSQL sequence {} value: {e}", sequence.name))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -6450,6 +6634,7 @@ where
         &request.tables,
     )
     .await?;
+    let relation_names = postgres_transfer_relation_names(request);
     let ownership_statements = if matches!(request.ownership_policy, TransferOwnershipPolicy::Skip) {
         Vec::new()
     } else {
@@ -6458,7 +6643,7 @@ where
             source_pool_key,
             &request.source_schema,
             &request.target_schema,
-            &request.tables,
+            &relation_names,
         )
         .await?
     };
@@ -6480,7 +6665,7 @@ where
         source_pool_key,
         &request.source_schema,
         &request.target_schema,
-        &request.tables,
+        &relation_names,
     )
     .await?;
     let materialized_view_step_count = materialized_views
@@ -6769,6 +6954,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         }
     }
 
@@ -7618,6 +7804,53 @@ mod tests {
             assert_eq!(filtered.len(), 1);
             assert_eq!(filtered[0].name, "v1");
         }
+
+        #[test]
+        fn selected_postgres_sequences_are_prepared_without_changing_default_requests() {
+            let mut request = test_transfer_request(vec!["biz_banner"]);
+            assert!(selected_postgres_sequence_names(&request).is_empty());
+
+            request.objects = vec![
+                TransferObjectSelection { object_type: TransferObjectKind::Table, names: vec!["biz_banner".into()] },
+                TransferObjectSelection {
+                    object_type: TransferObjectKind::Sequence,
+                    names: vec!["biz_banner_id_seq".into(), "biz_banner_id_seq".into()],
+                },
+            ];
+
+            assert_eq!(selected_postgres_sequence_names(&request), vec!["biz_banner_id_seq"]);
+            assert_eq!(postgres_transfer_relation_names(&request), vec!["biz_banner", "biz_banner_id_seq"]);
+            let sql = postgres_selected_sequences_sql("public", &selected_postgres_sequence_names(&request)).unwrap();
+            assert!(sql.contains("c.relname IN ('biz_banner_id_seq')"));
+            assert!(sql.contains("pg_sequence_last_value(c.oid)::text"));
+        }
+
+        #[test]
+        fn postgres_selected_sequence_ddl_preserves_definition_and_value() {
+            let sequence = PostgresTransferSequence {
+                name: "biz_banner_id_seq".into(),
+                data_type: "bigint".into(),
+                start_value: "5".into(),
+                min_value: "-10".into(),
+                max_value: "999".into(),
+                increment: "2".into(),
+                cycle: true,
+                cache_value: "7".into(),
+                last_value: Some("41".into()),
+            };
+
+            assert_eq!(
+                generate_postgres_transfer_sequence_create_ddl(&sequence, "archive"),
+                "CREATE SEQUENCE IF NOT EXISTS \"archive\".\"biz_banner_id_seq\"\n  AS bigint\n  START WITH 5\n  INCREMENT BY 2\n  MINVALUE -10\n  MAXVALUE 999\n  CACHE 7\n  CYCLE"
+            );
+            assert_eq!(
+                generate_postgres_transfer_sequence_setval_sql(&sequence, "archive"),
+                Some("SELECT setval('\"archive\".\"biz_banner_id_seq\"', 41, true)".into())
+            );
+
+            let never_called = PostgresTransferSequence { last_value: None, ..sequence };
+            assert_eq!(generate_postgres_transfer_sequence_setval_sql(&never_called, "archive"), None);
+        }
     }
 
     mod transfer_content_mode_tests {
@@ -8365,6 +8598,35 @@ mod tests {
         );
 
         assert_eq!(sql, "SELECT \"id\", \"name\" FROM \"public\".\"users\" ORDER BY \"id\" LIMIT 100 OFFSET 200");
+    }
+
+    #[test]
+    fn doris_unique_key_columns_drive_transfer_pagination_order() {
+        let columns =
+            vec![db::ColumnInfo { is_unique: true, ..test_column("id", "int") }, test_column("payload", "varchar(64)")];
+        let key_columns = transfer_key_columns(&columns, &DatabaseType::Doris);
+
+        assert_eq!(key_columns, vec![String::from("id")]);
+        assert_eq!(
+            pagination_sql_with_order(
+                &[String::from("id"), String::from("payload")],
+                "events",
+                "analytics",
+                &DatabaseType::Doris,
+                1000,
+                1000,
+                &key_columns,
+                None,
+            ),
+            "SELECT `id`, `payload` FROM `analytics`.`events` ORDER BY `id` LIMIT 1000 OFFSET 1000"
+        );
+    }
+
+    #[test]
+    fn mysql_unique_columns_do_not_become_transfer_keys() {
+        let columns = vec![db::ColumnInfo { is_unique: true, ..test_column("email", "varchar(255)") }];
+
+        assert!(transfer_key_columns(&columns, &DatabaseType::Mysql).is_empty());
     }
 
     #[test]
@@ -9578,6 +9840,7 @@ SELECT 1 FROM dual"#
     #[test]
     fn resolve_external_transfer_catalog_for_config_accepts_starrocks_driver_profile() {
         let config = crate::models::connection::ConnectionConfig {
+            docs_notes_path: None,
             id: "sr".to_string(),
             name: "sr".to_string(),
             note: String::new(),
@@ -9591,6 +9854,7 @@ SELECT 1 FROM dual"#
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,

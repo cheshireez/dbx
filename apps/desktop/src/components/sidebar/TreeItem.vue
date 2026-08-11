@@ -35,6 +35,7 @@ import {
   Archive,
   Square,
   X,
+  CircleX,
   RefreshCw,
 } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -48,7 +49,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
-import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
 import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
@@ -61,6 +62,7 @@ import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelToo
 import { treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebar/sidebarTreeSelection";
 import { isSidebarDatabaseOpenForVisual } from "@/lib/sidebar/sidebarDatabaseOpenState";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
+import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { isWindows } from "@/lib/backend/platform";
 import { flattenTree } from "@/composables/useFlatTree";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -70,6 +72,7 @@ import { useDragSort } from "@/composables/useDragSort";
 import { sidebarTreeRuntimeKey } from "@/lib/sidebar/sidebarTreeRuntime";
 import { treeNodePinKey } from "@/lib/app/pinnedItems";
 import { isTreeGroupNodeType } from "@/lib/sidebar/treeNodeGroup";
+import { shouldActivateTreeNodeOnSingleClick } from "@/lib/sidebar/treeNodeClick";
 
 const { t } = useI18n();
 
@@ -263,7 +266,10 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "etcd-access-control":
       return { icon: ShieldCheck, colorClass: "text-sky-500" };
     case "zookeeper-root":
+    case "consul-root":
       return { icon: Database, colorClass: "text-blue-500" };
+    case "consul-overview":
+      return { icon: Gauge, colorClass: "text-blue-500" };
     case "mongo-db":
       return { icon: Database, colorClass: "text-yellow-500" };
     case "mongo-gridfs":
@@ -363,6 +369,8 @@ type DetailTooltipRow = {
   multiline?: boolean;
   /** When set, renders each value on its own line (e.g. one host per line) */
   values?: string[];
+  action?: () => void;
+  actionLabel?: string;
 };
 
 function cleanTooltipValue(value: string | number | null | undefined): string {
@@ -419,6 +427,16 @@ const detailTooltip = computed(() => {
           .map((h) => h.trim())
           .filter(Boolean)
       : [];
+    const visibleFilterSummary = connectionCanConfigureSidebarVisibleDatabases(config.db_type) || config.db_type === "nacos" ? connectionStore.getSidebarVisibleFilterSummary(node.connectionId) : null;
+    const visibleFilterRow: DetailTooltipRow | null =
+      visibleFilterSummary?.selected != null && visibleFilterSummary.total != null
+        ? {
+            label: t(visibleFilterSummary.mode === "namespace" ? "nacos.nacosVisibleNamespacesDetailLabel" : visibleFilterSummary.mode === "schema" ? "visibleSchemas.detailLabel" : "visibleDatabases.detailLabel"),
+            value: `${visibleFilterSummary.selected}/${visibleFilterSummary.total}`,
+            action: () => treeRuntime.openPrimaryVisibleFilter(node),
+            actionLabel: t(visibleFilterSummary.mode === "namespace" ? "nacos.nacosVisibleNamespacesDetailActionLabel" : visibleFilterSummary.mode === "schema" ? "visibleSchemas.detailActionLabel" : "visibleDatabases.detailActionLabel", { connection: config.name }),
+          }
+        : null;
     const rows: DetailTooltipRow[] = [
       { label: t("connection.name"), value: cleanTooltipValue(config.name) },
       { label: "URL", value: connectionTooltipUrl(config), multiline: true },
@@ -428,9 +446,28 @@ const detailTooltip = computed(() => {
       { label: t("connection.user"), value: cleanTooltipValue(config.username) },
       { label: t("connection.type"), value: config.driver_label || config.driver_profile || config.db_type },
       { label: t("connection.databaseInfo.productVersion"), value: cleanTooltipValue(config.database_info?.productVersion) },
+      ...(visibleFilterRow ? [visibleFilterRow] : []),
       { label: t("connection.note"), value: cleanTooltipValue(config.note), multiline: true },
     ].filter((row) => row.value);
     return { rows };
+  }
+  if (node.type === "trigger" && node.meta && node.connectionId && effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) === "xugu") {
+    const trigger = node.meta as TriggerInfo;
+    const hasXuguDetails = trigger.level != null || trigger.condition != null || trigger.language != null || trigger.enabled != null || trigger.valid != null || trigger.created_at != null || trigger.comment != null;
+    if (!hasXuguDetails) return null;
+    const rows: DetailTooltipRow[] = [
+      { label: t("objects.name"), value: visibleLabel(node) },
+      { label: t("objects.triggerTiming"), value: cleanTooltipValue(trigger.timing) },
+      { label: t("objects.triggerEvent"), value: cleanTooltipValue(trigger.event) },
+      { label: t("objects.triggerLevel"), value: cleanTooltipValue(trigger.level) },
+      { label: t("objects.triggerStatus"), value: trigger.enabled == null ? "" : t(trigger.enabled ? "objects.enabled" : "objects.disabled") },
+      { label: t("objects.validity"), value: trigger.valid == null ? "" : t(trigger.valid ? "objects.valid" : "objects.invalid") },
+      { label: t("objects.triggerCondition"), value: cleanTooltipValue(trigger.condition), multiline: true },
+      { label: t("objects.triggerLanguage"), value: cleanTooltipValue(trigger.language) },
+      { label: t("objects.createdAt"), value: cleanTooltipValue(trigger.created_at) },
+      { label: t("objects.comment"), value: cleanTooltipValue(trigger.comment), multiline: true },
+    ].filter((row) => row.value);
+    return rows.length ? { rows } : null;
   }
   const comment = node.type === "column" && node.meta && "comment" in node.meta ? (node.meta as ColumnInfo).comment : node.comment;
   if (!comment || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
@@ -539,6 +576,7 @@ const canExpand = computed(() =>
   canTreeNodeShowExpander({
     type: activeNode.value.type,
     childCount: activeNode.value.children?.length ?? 0,
+    explicitContainer: (activeNode.value.type === "package" && activeNode.value.children !== undefined) || activeNode.value.xuguTypeMembersExpandable === true,
   }),
 );
 
@@ -551,6 +589,9 @@ const isNodeDefaultDatabase = computed(
     typeof activeNode.value.database === "string" &&
     connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database),
 );
+function isNodeDefaultSchema(): boolean {
+  return activeNode.value.type === "schema" && !!activeNode.value.connectionId && !!activeNode.value.schema && connectionStore.isDefaultSchema(activeNode.value.connectionId, activeNode.value.schema);
+}
 
 const trailingComment = computed(() => {
   if (!settingsStore.editorSettings.sidebarObjectInfoMode.startsWith("comment-")) return null;
@@ -692,7 +733,7 @@ const rowStyle = computed(() => {
     paddingLeft: paddingLeft.value,
     paddingRight: trailingComment.value ? "12px" : undefined,
     "--tree-connection-row-bg": backgroundColor,
-    "--tree-connection-row-hover-bg": hexToRgba(color, isActiveConnectionScope.value ? 0.18 : 0.12),
+    "--tree-connection-row-hover-bg": hexToRgba(color, isActiveConnectionScope.value ? 0.2 : 0.16),
     "--tree-connection-active-bg": hexToRgba(color, 0.18),
     "--tree-connection-active-focus-bg": hexToRgba(color, 0.22),
   };
@@ -1051,7 +1092,7 @@ function onClick(event: MouseEvent) {
   }
   selectSingleTreeNode(props.node);
   rowRef.value?.focus({ preventScroll: true });
-  if (settingsStore.editorSettings.sidebarActivation === "double" && props.node.type !== "load-more") return;
+  if (!shouldActivateTreeNodeOnSingleClick(props.node.type, settingsStore.editorSettings.sidebarActivation) && props.node.type !== "load-more") return;
   treeRuntime.handleRowClick(props.node, event.detail);
 }
 
@@ -1102,10 +1143,10 @@ function onKeydown(event: KeyboardEvent) {
   </div>
 
   <div v-else @contextmenu="onTreeItemContextMenu">
-    <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="30" :surface="detailTooltip ? 'popover' : 'foreground'">
+    <LightTooltip :text="visibleLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="30" :surface="detailTooltip ? 'popover' : 'foreground'">
       <div
         ref="rowRef"
-        class="group flex items-center gap-2 py-1 px-2 cursor-pointer relative outline-none"
+        class="group flex cursor-default items-center gap-2 py-1 px-2 relative outline-none"
         style="contain: layout style"
         :class="[
           rowWidthClass,
@@ -1115,7 +1156,7 @@ function onKeydown(event: KeyboardEvent) {
             'opacity-50': dragVisual.dragging,
             'tree-item-connection-tint': connectionColor,
             'hover:bg-accent': node.type !== 'connection',
-            'hover:bg-secondary/60': node.type === 'connection',
+            'hover:bg-sidebar-accent': node.type === 'connection',
             rounded: !selectionVisual.rowSelected,
             'tree-item-active': selectionVisual.rowSelected,
             'tree-item-active--selection-set': selectionVisual.usesSelectionSetHighlight && selectionVisual.rowSelected,
@@ -1145,9 +1186,12 @@ function onKeydown(event: KeyboardEvent) {
           </button>
         </template>
         <span v-else class="w-3.5 h-3.5 shrink-0" />
-        <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
-        <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
-        <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="databaseOpenVisual.iconClass" />
+        <span class="relative flex h-3.5 w-3.5 shrink-0" :class="{ 'overflow-visible': node.valid === false }">
+          <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
+          <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
+          <component v-else :is="getIconInfo(node)?.icon || Database" class="h-3.5 w-3.5 shrink-0" :class="databaseOpenVisual.iconClass" />
+          <CircleX v-if="node.valid === false" data-invalid-object-indicator="true" class="pointer-events-none absolute -right-1 -bottom-1 h-2.5 w-2.5 rounded-full bg-background text-destructive stroke-[3]" aria-hidden="true" />
+        </span>
         <div ref="trailingCommentLayoutRef" :class="hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents'">
           <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
             <input
@@ -1193,6 +1237,9 @@ function onKeydown(event: KeyboardEvent) {
             >
             <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
               {{ t("editor.defaultDatabase") }}
+            </Badge>
+            <Badge v-if="isNodeDefaultSchema()" variant="secondary" class="h-4 px-1.5 text-[10px]">
+              {{ t("editor.defaultSchema") }}
             </Badge>
           </div>
           <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
@@ -1244,6 +1291,16 @@ function onKeydown(event: KeyboardEvent) {
                   <span v-for="(v, vi) in row.values" :key="vi" class="break-all">{{ v }}</span>
                 </div>
               </template>
+              <button
+                v-else-if="row.action"
+                type="button"
+                class="w-fit rounded bg-primary/10 px-1 font-mono text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                :aria-label="row.actionLabel"
+                :title="row.actionLabel"
+                @click.stop="row.action()"
+              >
+                {{ row.value }}
+              </button>
               <span v-else-if="row.multiline" class="max-h-20 overflow-hidden whitespace-pre-wrap break-words text-foreground/90">
                 {{ row.value }}
               </span>

@@ -2,6 +2,7 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -68,7 +69,7 @@ pub fn database_info_from_protocol_value(value: &Value) -> Option<DatabaseConnec
     serde_json::from_value::<DatabaseInfoEnvelope>(value.clone()).ok()?.database_info
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct ConnectionConfig {
     pub id: String,
     pub name: String,
@@ -89,6 +90,8 @@ pub struct ConnectionConfig {
     pub password: String,
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_databases: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
@@ -102,6 +105,10 @@ pub struct ConnectionConfig {
     pub init_script: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
+    /// Path to this connection's documentation notes file. Set by the
+    /// desktop app; the CLI takes an explicit `--notes` path instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_notes_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transport_layers: Vec<TransportLayerConfig>,
     #[serde(default = "default_connect_timeout_secs")]
@@ -174,6 +181,42 @@ pub struct ConnectionConfig {
     /// Metadata captured from the latest successful connection test for this saved config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_info: Option<DatabaseConnectionInfo>,
+}
+
+impl fmt::Debug for ConnectionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut value = serde_json::to_value(self).map_err(|_| fmt::Error)?;
+        redact_connection_debug_value(&mut value);
+        formatter.debug_tuple("ConnectionConfig").field(&value).finish()
+    }
+}
+
+fn redact_connection_debug_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+                if key.contains("password")
+                    || key.contains("passphrase")
+                    || key.contains("token")
+                    || key.contains("secret")
+                    || key.contains("apikey")
+                    || key == "connectionstring"
+                    || key == "initscript"
+                {
+                    *value = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_connection_debug_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_connection_debug_value(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +573,7 @@ pub enum DatabaseType {
     #[serde(rename = "zookeeper")]
     ZooKeeper,
     Nacos,
+    Consul,
     #[serde(rename = "iris")]
     Iris,
     #[serde(rename = "turso")]
@@ -574,6 +618,8 @@ struct ConnectionConfigData {
     pub password: String,
     pub database: Option<String>,
     #[serde(default)]
+    pub default_schema: Option<String>,
+    #[serde(default)]
     pub visible_databases: Option<Vec<String>>,
     #[serde(default)]
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
@@ -585,6 +631,8 @@ struct ConnectionConfigData {
     pub init_script: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
+    #[serde(default)]
+    pub docs_notes_path: Option<String>,
     #[serde(default)]
     pub transport_layers: Vec<TransportLayerConfig>,
     #[serde(default = "default_connect_timeout_secs")]
@@ -669,12 +717,14 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             username: data.username,
             password: data.password,
             database: data.database,
+            default_schema: data.default_schema,
             visible_databases: data.visible_databases,
             visible_schemas: data.visible_schemas,
             show_system_schemas: data.show_system_schemas,
             attached_databases: data.attached_databases,
             init_script: data.init_script,
             color: data.color,
+            docs_notes_path: data.docs_notes_path,
             transport_layers: data.transport_layers,
             connect_timeout_secs: data.connect_timeout_secs,
             query_timeout_secs: data.query_timeout_secs,
@@ -1111,6 +1161,7 @@ impl ConnectionConfig {
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
             DatabaseType::Mqtt => self.mqtt_broker_url(),
             DatabaseType::Nacos => self.nacos_admin_url(),
+            DatabaseType::Consul => self.consul_api_url(),
         }
     }
 
@@ -1353,6 +1404,7 @@ impl ConnectionConfig {
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
             DatabaseType::Mqtt => self.mqtt_broker_url(),
             DatabaseType::Nacos => self.nacos_admin_url(),
+            DatabaseType::Consul => self.consul_api_url(),
         }
     }
 
@@ -1387,6 +1439,20 @@ impl ConnectionConfig {
             .filter(|value| !value.is_empty())
             .unwrap_or("nacos://")
             .to_string()
+    }
+
+    fn consul_api_url(&self) -> String {
+        self.external_config
+            .as_ref()
+            .and_then(|value| value.get("serverAddr").or_else(|| value.get("server_addr")))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{}:{}", bracket_ipv6(&self.host), self.port)
+            })
     }
 
     fn mqtt_broker_url(&self) -> String {
@@ -2275,8 +2341,31 @@ mod tests {
         assert_eq!(database_info_from_protocol_value(&serde_json::json!({ "ok": true })), None);
     }
 
+    #[test]
+    fn default_schema_is_optional_and_round_trips() {
+        let base = serde_json::json!({
+            "id": "id",
+            "name": "PostgreSQL",
+            "db_type": "postgres",
+            "host": "localhost",
+            "port": 5432,
+            "username": "postgres",
+            "password": "",
+            "database": "app"
+        });
+        let legacy: ConnectionConfig = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.default_schema, None);
+
+        let mut configured = base;
+        configured["default_schema"] = serde_json::json!("archive");
+        let parsed: ConnectionConfig = serde_json::from_value(configured).unwrap();
+        assert_eq!(parsed.default_schema.as_deref(), Some("archive"));
+        assert_eq!(serde_json::to_value(parsed).unwrap()["default_schema"], "archive");
+    }
+
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "id".to_string(),
             name: "name".to_string(),
             note: String::new(),
@@ -2290,6 +2379,7 @@ mod tests {
             username: username.to_string(),
             password: password.to_string(),
             database: database.map(str::to_string),
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -2333,6 +2423,24 @@ mod tests {
     }
 
     #[test]
+    fn connection_debug_redacts_passwords_tokens_and_nested_secrets() {
+        let mut config = mysql_config("root", "database-password", Some("app"));
+        config.connection_string = Some("server=db;password=inline-secret".into());
+        config.init_script = Some("CREATE SECRET leaked".into());
+        config.external_config = Some(serde_json::json!({
+            "consulToken": "consul-secret",
+            "nested": { "OIDCClientSecret": "oidc-secret", "visible": "safe" }
+        }));
+
+        let output = format!("{config:?}");
+        for secret in ["database-password", "inline-secret", "CREATE SECRET leaked", "consul-secret", "oidc-secret"] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains("safe"));
+    }
+
+    #[test]
     fn legacy_mcp_access_is_ignored_and_not_serialized() {
         let legacy: ConnectionConfig = serde_json::from_value(serde_json::json!({
             "id": "legacy",
@@ -2348,6 +2456,40 @@ mod tests {
         .unwrap();
         assert!(serde_json::to_value(&legacy).unwrap().get("mcp_access").is_none());
         assert!(!legacy.read_only);
+    }
+
+    #[test]
+    fn docs_notes_path_defaults_to_none_and_round_trips() {
+        // A connection stored before this field existed must still load.
+        let legacy: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "name": "local",
+            "db_type": "postgres",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "username": "postgres",
+            "password": "",
+            "database": null
+        }))
+        .expect("legacy config must still parse");
+        assert_eq!(legacy.docs_notes_path, None);
+
+        // And a stored path must actually survive a load — this is the half
+        // that fails if the field is added to ConnectionConfig only, without
+        // ConnectionConfigData and the From impl.
+        let with_path: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "name": "local",
+            "db_type": "postgres",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "username": "postgres",
+            "password": "",
+            "database": null,
+            "docs_notes_path": "docs/dbx-docs.json"
+        }))
+        .expect("config with a notes path must parse");
+        assert_eq!(with_path.docs_notes_path.as_deref(), Some("docs/dbx-docs.json"));
     }
 
     #[test]

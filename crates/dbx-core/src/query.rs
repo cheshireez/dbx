@@ -34,7 +34,7 @@ pub const QUERY_CANCELED: &str = "Query canceled";
 /// Fallback when a Mongo connection hits the generic SQL executor instead of the shell path.
 /// Wording must match packages/mongo-shell `MONGO_SHELL_COMMAND_HINT`
 /// (desktop/CLI diagnose first; this is only the Rust SQL-executor backstop).
-const MONGO_SHELL_COMMAND_HINT: &str = "Use MongoDB shell-style commands, for example: db.collection.find({}).limit(100), db.collection.aggregate([]), db.collection.aggregate([], { explain: true }), db.version(), db.collection.countDocuments({}), db.collection.distinct(\"field\"), db.collection.getIndexes(), db.collection.createIndex({...}), or db.collection.insertOne({...}).";
+const MONGO_SHELL_COMMAND_HINT: &str = "Use MongoDB shell-style commands, for example: db.collection.find({}).limit(100), db.collection.aggregate([]), db.collection.aggregate([], { explain: true }), db.version(), db.collection.countDocuments({}), db.collection.distinct(\"field\"), db.collection.getIndexes(), db.collection.createIndex({...}), db.createUser({...}), or db.collection.insertOne({...}).";
 const SQL_OMITTED_ERROR_CONTEXT: &str =
     "SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.";
 
@@ -1669,6 +1669,7 @@ async fn do_execute_typed(
             .map(|result| truncate_result_with_max_rows(result, max_rows))
         }
         PoolKind::HBase(_) => Err("SQL execution is not supported for HBase connections".to_string()),
+        PoolKind::Consul(_) => Err("SQL execution is not supported for Consul connections".to_string()),
     };
     result
         .map(normalize_query_result_for_js)
@@ -2484,6 +2485,7 @@ fn error_query_result(message: String) -> db::QueryResult {
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -2501,6 +2503,7 @@ fn empty_query_result(execution_time_ms: u128) -> db::QueryResult {
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -2731,6 +2734,7 @@ pub async fn execute_statements(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -2849,6 +2853,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::Agent(_) => true,
         PoolKind::MessageQueue
         | PoolKind::Nacos
+        | PoolKind::Consul(_)
         | PoolKind::HBase(_)
         | PoolKind::DuckDbWorker(_)
         | PoolKind::Redis(_)
@@ -3092,7 +3097,7 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
                 TxPath::Explicit
             }
             PoolKind::Agent(client) => TxPath::Agent(client.clone()),
-            PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::HBase(_) => TxPath::None,
+            PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) => TxPath::None,
             #[cfg(feature = "mq-admin")]
             PoolKind::Mqtt(_) => TxPath::None,
             PoolKind::DuckDbWorker(_)
@@ -3232,6 +3237,7 @@ async fn exec_tx_pg_inner(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         }),
         (Err(e), Ok(_)) => Err(e),
         (Ok(_), Err(reset_err)) => Err(reset_err),
@@ -3324,6 +3330,7 @@ async fn exec_tx_mysql_inner(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3390,6 +3397,7 @@ async fn exec_tx_sqlite_inner(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         })
     })
@@ -3464,6 +3472,7 @@ async fn exec_tx_explicit_inner(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3531,6 +3540,7 @@ async fn exec_tx_none_inner(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3674,6 +3684,63 @@ async fn begin_transaction_session(
 
     log::info!("[query][manual_txn:begin] session_id={}", txn_session_id);
     Ok(txn_session_id)
+}
+
+pub struct ManualTransactionKeepAlive {
+    task: tokio::task::JoinHandle<()>,
+    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, TransactionSession>>>,
+    txn_session_id: String,
+}
+
+impl Drop for ManualTransactionKeepAlive {
+    fn drop(&mut self) {
+        self.task.abort();
+        spawn_txn_idle_watcher_for_sessions(Arc::clone(&self.sessions), self.txn_session_id.clone());
+    }
+}
+
+/// Keep an existing transaction session alive while a caller prepares work for
+/// that session. The caller must retain the returned guard for the full period;
+/// dropping it restores the normal five-minute idle rollback behavior.
+pub async fn keep_manual_transaction_alive(
+    state: &AppState,
+    txn_session_id: &str,
+) -> Result<ManualTransactionKeepAlive, String> {
+    {
+        let mut sessions = state.transaction_sessions.write().await;
+        let session = sessions.get_mut(txn_session_id).ok_or_else(|| {
+            "Transaction session not found or expired; it may have been auto-rolled back due to inactivity".to_string()
+        })?;
+        if !session.busy {
+            session.last_activity = std::time::Instant::now();
+        }
+    }
+
+    let sessions = Arc::clone(&state.transaction_sessions);
+    let keep_alive_sessions = Arc::clone(&sessions);
+    let txn_session_id = txn_session_id.to_string();
+    let keep_alive_txn_session_id = txn_session_id.clone();
+    let task = tokio::spawn(async move {
+        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+            let should_continue = {
+                let mut guard = sessions.write().await;
+                if let Some(session) = guard.get_mut(&keep_alive_txn_session_id) {
+                    if !session.busy {
+                        session.last_activity = std::time::Instant::now();
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if !should_continue {
+                break;
+            }
+        }
+    });
+    Ok(ManualTransactionKeepAlive { task, sessions: keep_alive_sessions, txn_session_id })
 }
 
 /// Execute SQL within an existing manual transaction session.
@@ -3950,6 +4017,13 @@ async fn rollback_manual_txn_connection(conn: &mut TxnConnection) -> Result<(), 
 /// will see a missing session or a non-expired one and exit harmlessly.
 fn spawn_txn_idle_watcher(state: &AppState, txn_session_id: String) {
     let sessions = Arc::clone(&state.transaction_sessions);
+    spawn_txn_idle_watcher_for_sessions(sessions, txn_session_id);
+}
+
+fn spawn_txn_idle_watcher_for_sessions(
+    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, TransactionSession>>>,
+    txn_session_id: String,
+) {
     tokio::spawn(async move {
         const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         tokio::time::sleep(TXN_IDLE_TIMEOUT).await;
@@ -3997,6 +4071,7 @@ async fn execute_manual_txn_postgres_statement(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     }
 }
@@ -4039,6 +4114,7 @@ async fn execute_manual_txn_mysql_statement(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     } else {
         let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
@@ -4057,6 +4133,7 @@ async fn execute_manual_txn_mysql_statement(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     }
 }
@@ -4092,6 +4169,7 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -4119,6 +4197,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -4414,6 +4493,7 @@ for line in sys.stdin:
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "conn-1".to_string(),
             name: "Connection".to_string(),
             note: String::new(),
@@ -4427,6 +4507,7 @@ for line in sys.stdin:
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -4907,6 +4988,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
         let mut executor = FakeMysqlBatchExecutor {
             outcomes: std::collections::VecDeque::from([
@@ -5434,6 +5516,7 @@ for line in sys.stdin:
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         })
         .await;
@@ -5458,6 +5541,7 @@ for line in sys.stdin:
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         })
         .await;
@@ -5742,6 +5826,7 @@ for line in sys.stdin:
     #[test]
     fn external_driver_query_params_include_database_and_schema_context() {
         let config = ConnectionConfig {
+            docs_notes_path: None,
             id: "jdbc-1".to_string(),
             name: "JDBC".to_string(),
             note: String::new(),
@@ -5755,6 +5840,7 @@ for line in sys.stdin:
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -6149,6 +6235,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let normalized = normalize_query_result_for_js(result);

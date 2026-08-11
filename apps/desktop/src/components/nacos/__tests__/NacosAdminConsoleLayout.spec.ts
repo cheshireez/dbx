@@ -46,6 +46,16 @@ describe("NacosAdminConsole config workbench layout", () => {
     expect(source).toContain("await Promise.all([loadServiceDetail(), loadInstances()]);");
   });
 
+  it("keeps configuration list responses scoped to the latest filters", () => {
+    expect(source).toContain("const configListRequestGuard = createNacosLatestRequestGuard();");
+    expect(source).toContain("const requestId = configListRequestGuard.begin();");
+    expect(source).toContain("if (!isCurrentRequest()) return false;");
+    expect(source).toContain("if (configListRequestGuard.isCurrent(requestId)) configLoading.value = false;");
+    expect(source).toContain("const current = await loadConfigs(page);");
+    expect(source).toContain("if (!current || !isConnectionNotFoundError(configError.value)");
+    expect(source.match(/configListRequestGuard\.invalidate\(\);/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("keeps instance weight edits as drafts until the explicit save action", () => {
     expect(source).toContain("instanceWeightDrafts.value[instanceIdentity(instance)] = String(value);");
     expect(source).toContain('@click="requestInstanceWeightUpdate(instance)"');
@@ -84,10 +94,41 @@ describe("NacosAdminConsole config workbench layout", () => {
     expect(source).not.toContain('v-if="serviceCluster"\n                  size="sm"');
   });
 
+  it("adds icon-only clear controls to populated configuration and service filters", () => {
+    for (const [filter, clear] of [
+      ["configDataId", "clearConfigFilter('dataId')"],
+      ["configGroup", "clearConfigFilter('group')"],
+      ["configAppName", "clearConfigFilter('appName')"],
+      ["serviceName", "clearServiceFilter('name')"],
+      ["serviceGroup", "clearServiceFilter('group')"],
+    ]) {
+      expect(source).toContain(`v-if="${filter}"`);
+      expect(source).toContain(`@click="${clear}"`);
+    }
+    expect(source).toContain("void loadConfigsWithRetry(1);");
+    expect(source).toContain("void loadServicesWithRetry(1);");
+    expect(source.match(/groupContains: true/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(source.match(/:aria-label="t\('nacos\.clear'\)"/g)?.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("uses green outlined styling for healthy instances and red styling for unhealthy instances", () => {
+    expect(source).toContain("instance.healthy === false ? 'border-destructive/50 text-destructive' : 'border-emerald-500/50 text-emerald-700 dark:text-emerald-300'");
+  });
+
   it("separates the service header, filtering controls, and management actions", () => {
     expect(source).toContain('<header class="shrink-0 border-b bg-background">');
     expect(source).toContain('class="flex flex-wrap items-center gap-x-4 gap-y-2 border-t bg-muted/30 px-4 py-2"');
     expect(source).toContain('t("nacos.serviceSettings")');
     expect(source).toContain('t("nacos.registerInstance")');
+  });
+
+  it("gates every Nacos mutation behind the shared production confirmation", () => {
+    expect(source).toContain('import { executeWithProductionContextGuard } from "@/lib/database/productionExecutionGuard";');
+    expect(source).toContain("async function confirmNacosMutation");
+    expect(source).toContain('<ProductionContextBadge v-if="nacosProductionContext.active" compact />');
+    expect(source.match(/await confirmNacosMutation\(/g)?.length).toBeGreaterThanOrEqual(9);
+    for (const apiCall of ["nacosApplyConfigImport", "nacosApplyConfigTransfer", "nacosRollbackConfig", "nacosPublishConfig", "nacosDeleteConfig", "nacosUpdateInstance", "nacosCreateService", "nacosDeleteService", "nacosRegisterInstance", "nacosDeregisterInstance"]) {
+      expect(source).toContain(apiCall);
+    }
   });
 });

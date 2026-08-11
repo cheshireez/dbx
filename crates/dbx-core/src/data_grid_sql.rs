@@ -139,7 +139,9 @@ pub enum DataGridContextFilterMode {
     Like,
     NotLike,
     LessThan,
+    LessThanOrEqual,
     GreaterThan,
+    GreaterThanOrEqual,
     In,
     NotIn,
     Between,
@@ -520,8 +522,16 @@ pub fn build_data_grid_context_filter_condition(options: DataGridContextFilterCo
             "{column} < {}",
             format_grid_sql_literal(value, options.database_type, options.column_info.as_ref())
         )),
+        DataGridContextFilterMode::LessThanOrEqual => Some(format!(
+            "{column} <= {}",
+            format_grid_sql_literal(value, options.database_type, options.column_info.as_ref())
+        )),
         DataGridContextFilterMode::GreaterThan => Some(format!(
             "{column} > {}",
+            format_grid_sql_literal(value, options.database_type, options.column_info.as_ref())
+        )),
+        DataGridContextFilterMode::GreaterThanOrEqual => Some(format!(
+            "{column} >= {}",
             format_grid_sql_literal(value, options.database_type, options.column_info.as_ref())
         )),
         DataGridContextFilterMode::In => build_data_grid_context_membership_filter_condition(
@@ -1793,6 +1803,11 @@ pub fn format_grid_sql_literal(
             return literal;
         }
     }
+    if is_postgres_binary_literal_column(database_type, column_info) {
+        if let Some(literal) = format_postgres_binary_literal_text(&text) {
+            return literal;
+        }
+    }
     if is_oracle_raw_literal_column(database_type, column_info) {
         if let Some(literal) = format_oracle_raw_literal_text(&text) {
             return literal;
@@ -2126,6 +2141,24 @@ fn format_mysql_binary_literal_text(text: &str) -> Option<String> {
     let hex = trimmed.strip_prefix("0x")?;
     if hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
         Some(if hex.is_empty() { "X''".to_string() } else { trimmed.to_string() })
+    } else {
+        None
+    }
+}
+
+fn is_postgres_binary_literal_column(
+    database_type: Option<DatabaseType>,
+    column_info: Option<&DataGridColumnInfo>,
+) -> bool {
+    database_type == Some(DatabaseType::Postgres)
+        && column_info.is_some_and(|column| column.data_type.trim().eq_ignore_ascii_case("bytea"))
+}
+
+fn format_postgres_binary_literal_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
+    if hex.len() % 2 == 0 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(format!("decode('{hex}', 'hex')"))
     } else {
         None
     }
@@ -3508,6 +3541,25 @@ mod tests {
             .as_deref(),
             Some("`file_name` = '34-B-0048'")
         );
+        for (mode, expected) in [
+            (DataGridContextFilterMode::GreaterThanOrEqual, "`score` >= 80"),
+            (DataGridContextFilterMode::LessThanOrEqual, "`score` <= 80"),
+        ] {
+            assert_eq!(
+                build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+                    database_type: Some(DatabaseType::Mysql),
+                    identifier_quote: None,
+                    column_name: "score".to_string(),
+                    mode,
+                    value: json!(80),
+                    values: Vec::new(),
+                    end_value: None,
+                    column_info: Some(column("score", "int", false, None)),
+                })
+                .as_deref(),
+                Some(expected)
+            );
+        }
         assert_eq!(
             build_data_grid_column_value_filter_condition(DataGridColumnValueFilterConditionOptions {
                 database_type: Some(DatabaseType::Kingbase),
@@ -5372,6 +5424,23 @@ mod tests {
             r#"E'{"json_raw":"{\\"foo\\":1,\\"bar\\":\\"sometext\\"}"}'"#
         );
         assert_eq!(format_grid_sql_literal(&json!("it's"), Some(DatabaseType::Postgres), None), "'it''s'");
+    }
+
+    #[test]
+    fn postgres_bytea_literals_decode_prefixed_hex_values() {
+        let bytea = column("payload", "bytea", true, None);
+        let text = column("label", "text", true, None);
+
+        assert_eq!(
+            format_grid_sql_literal(&json!("0x00aBff"), Some(DatabaseType::Postgres), Some(&bytea)),
+            "decode('00aBff', 'hex')"
+        );
+        assert_eq!(
+            format_grid_sql_literal(&json!("0x"), Some(DatabaseType::Postgres), Some(&bytea)),
+            "decode('', 'hex')"
+        );
+        assert_eq!(format_grid_sql_literal(&json!("0xabc"), Some(DatabaseType::Postgres), Some(&bytea)), "'0xabc'");
+        assert_eq!(format_grid_sql_literal(&json!("0x00ab"), Some(DatabaseType::Postgres), Some(&text)), "'0x00ab'");
     }
 
     #[test]

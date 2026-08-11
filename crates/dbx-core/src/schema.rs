@@ -605,6 +605,11 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
     let pool = connections.get(connection_id).ok_or("Connection not found")?;
 
     match pool {
+        PoolKind::Mysql(p, mode)
+            if *mode != MysqlMode::OceanBaseOracle && db_config.as_ref().is_some_and(db::dolt::is_config) =>
+        {
+            db::dolt::list_databases(p).await
+        }
         PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
             db::mysql::list_databases_show(p)
                 .await
@@ -1783,6 +1788,20 @@ async fn agent_object_statistics_query(
         .await
 }
 
+#[cfg(feature = "mq-admin")]
+fn message_queue_topic_tables(topics: Vec<crate::mq::TopicInfo>) -> Vec<db::TableInfo> {
+    topics
+        .into_iter()
+        .map(|topic| db::TableInfo {
+            name: topic.name,
+            table_type: "TOPIC".to_string(),
+            comment: None,
+            parent_schema: topic.namespace,
+            parent_name: None,
+        })
+        .collect()
+}
+
 async fn list_tables_once(
     state: &AppState,
     connection_id: &str,
@@ -1798,6 +1817,25 @@ async fn list_tables_once(
     let pool_key =
         state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await?;
     let db_config = connection_config(state, connection_id).await;
+
+    #[cfg(feature = "mq-admin")]
+    if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::MessageQueue) {
+        let topics = crate::mq::service::mq_list_topics_core(
+            state,
+            connection_id,
+            crate::mq::NamespaceRef { tenant: database.to_string(), namespace: schema.to_string() },
+            crate::mq::ListTopicsOpts::default(),
+        )
+        .await?;
+        return Ok(filter_table_infos(
+            message_queue_topic_tables(topics),
+            filter,
+            limit,
+            offset,
+            object_types,
+            table_name_filter,
+        ));
+    }
 
     {
         let connections = state.connections.read().await;
@@ -2350,6 +2388,8 @@ async fn external_driver_presto_like_objects(
             updated_at: None,
             parent_schema: table.parent_schema,
             parent_name: table.parent_name,
+            trigger: None,
+            xugu_type_members_expandable: None,
         })
         .collect())
 }
@@ -2657,6 +2697,7 @@ mod tests {
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "test".to_string(),
             name: "test".to_string(),
             note: String::new(),
@@ -2670,6 +2711,7 @@ mod tests {
             username: "user".to_string(),
             password: "secret".to_string(),
             database: Some("demo".to_string()),
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -2814,6 +2856,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         assert_eq!(mysql_external_driver_ddl_from_query_result(result).unwrap(), "CREATE TABLE `users` (`id` bigint);");
@@ -2834,6 +2877,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         assert_eq!(
@@ -3167,6 +3211,26 @@ for line in sys.stdin:
         }
     }
 
+    #[cfg(feature = "mq-admin")]
+    #[test]
+    fn message_queue_topics_are_exposed_as_table_metadata() {
+        let tables = super::message_queue_topic_tables(vec![crate::mq::TopicInfo {
+            name: "orders".to_string(),
+            short_name: "orders".to_string(),
+            partitioned: true,
+            partitions: Some(3),
+            persistent: true,
+            internal: false,
+            message_type: None,
+            namespace: Some("default".to_string()),
+        }]);
+
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "orders");
+        assert_eq!(tables[0].table_type, "TOPIC");
+        assert_eq!(tables[0].parent_schema.as_deref(), Some("default"));
+    }
+
     fn test_object_info(name: &str, object_type: &str) -> super::db::ObjectInfo {
         super::db::ObjectInfo {
             name: name.to_string(),
@@ -3179,6 +3243,8 @@ for line in sys.stdin:
             updated_at: None,
             parent_schema: None,
             parent_name: None,
+            trigger: None,
+            xugu_type_members_expandable: None,
         }
     }
 
@@ -3518,6 +3584,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let tables = presto_like_tables_from_query_result(&result);
@@ -3565,6 +3632,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let columns = presto_like_columns_from_query_result(&result);
@@ -3736,6 +3804,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         assert_eq!(oracle_table_comment_from_query_result(result).unwrap().as_deref(), Some("Customer table"));
@@ -3753,6 +3822,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         assert_eq!(oracle_table_comment_from_query_result(empty).unwrap(), None);
@@ -3788,6 +3858,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let comments = table_comments_from_query_result(result);
@@ -3910,6 +3981,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let columns = oracle_columns_from_query_result(result);
@@ -4014,6 +4086,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let stats = oracle_object_statistics_from_query_result(result);
@@ -4070,6 +4143,8 @@ for line in sys.stdin:
                 updated_at: None,
                 parent_schema: None,
                 parent_name: None,
+                trigger: None,
+                xugu_type_members_expandable: None,
             },
             super::db::ObjectInfo {
                 name: "ORDERS_VIEW".to_string(),
@@ -4082,6 +4157,8 @@ for line in sys.stdin:
                 updated_at: None,
                 parent_schema: None,
                 parent_name: None,
+                trigger: None,
+                xugu_type_members_expandable: None,
             },
             super::db::ObjectInfo {
                 name: "REFRESH_ORDERS".to_string(),
@@ -4094,6 +4171,8 @@ for line in sys.stdin:
                 updated_at: None,
                 parent_schema: None,
                 parent_name: None,
+                trigger: None,
+                xugu_type_members_expandable: None,
             },
         ];
 
@@ -4775,6 +4854,8 @@ async fn list_objects_once(
                         updated_at: None,
                         parent_schema: table.parent_schema,
                         parent_name: table.parent_name,
+                        trigger: None,
+                        xugu_type_members_expandable: None,
                     })
                     .collect(),
             ))
@@ -7033,6 +7114,8 @@ async fn oracle_agent_list_objects(
                 updated_at: None,
                 parent_schema: None,
                 parent_name: None,
+                trigger: None,
+                xugu_type_members_expandable: None,
             })
         })
         .collect();
