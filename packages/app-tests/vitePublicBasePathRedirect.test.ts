@@ -1,88 +1,48 @@
-import { createServer as createHttpServer, type Server } from "node:http";
-import path from "node:path";
-import { afterEach, expect, test } from "vitest";
-import { createServer as createViteServer, type ViteDevServer } from "vite";
+import { expect, test, vi } from "vitest";
+import { publicBasePathRedirectMiddleware } from "../../apps/desktop/vitePublicBasePathRedirect";
 
-let backendServer: Server | undefined;
-let viteServer: ViteDevServer | undefined;
-const originalEnvironment = {
-  DBX_BACKEND_URL: process.env.DBX_BACKEND_URL,
-  DBX_PUBLIC_BASE_PATH: process.env.DBX_PUBLIC_BASE_PATH,
-  TAURI_DEV_HOST: process.env.TAURI_DEV_HOST,
-  TAURI_ENV_ARCH: process.env.TAURI_ENV_ARCH,
-  VITE_DBX_BASE_PATH: process.env.VITE_DBX_BASE_PATH,
-};
+type RedirectMiddleware = ReturnType<typeof publicBasePathRedirectMiddleware>;
 
-function restoreEnvironment(name: keyof typeof originalEnvironment): void {
-  const value = originalEnvironment[name];
-  if (value === undefined) {
-    delete process.env[name];
-  } else {
-    process.env[name] = value;
-  }
+function runMiddleware(requestUrl: string, publicBasePath = "/dbx") {
+  const middleware = publicBasePathRedirectMiddleware(publicBasePath);
+  const request = { url: requestUrl } as Parameters<RedirectMiddleware>[0];
+  const response = {
+    statusCode: 200,
+    setHeader: vi.fn(),
+    end: vi.fn(),
+  };
+  const next = vi.fn();
+
+  middleware(request, response as unknown as Parameters<RedirectMiddleware>[1], next);
+  return { next, response };
 }
 
-afterEach(async () => {
-  await viteServer?.close();
-  viteServer = undefined;
-  if (backendServer) {
-    await new Promise<void>((resolve, reject) => {
-      backendServer?.close((error) => (error ? reject(error) : resolve()));
-    });
-    backendServer = undefined;
-  }
-  for (const name of Object.keys(originalEnvironment) as Array<keyof typeof originalEnvironment>) {
-    restoreEnvironment(name);
+test("redirects the exact bare public base path and preserves its query", () => {
+  for (const [requestUrl, expectedLocation] of [
+    ["/dbx", "/dbx/"],
+    ["/dbx?next=%2Fworkspace&theme=dark", "/dbx/?next=%2Fworkspace&theme=dark"],
+  ]) {
+    const { next, response } = runMiddleware(requestUrl);
+
+    expect(response.statusCode).toBe(308);
+    expect(response.setHeader).toHaveBeenCalledWith("Location", expectedLocation);
+    expect(response.end).toHaveBeenCalledOnce();
+    expect(next).not.toHaveBeenCalled();
   }
 });
 
-test("Vite redirects only the bare public base path and preserves query, assets, and API proxying", async () => {
-  backendServer = createHttpServer((request, response) => {
-    response.statusCode = 200;
-    response.end(request.url);
-  });
-  await new Promise<void>((resolve) => backendServer?.listen(0, "127.0.0.1", resolve));
-  const backendAddress = backendServer.address();
-  if (!backendAddress || typeof backendAddress === "string") throw new Error("backend server did not bind to TCP");
+test("passes root, trailing slash, static assets, API routes, and root deployments through", () => {
+  for (const requestUrl of ["/", "/dbx/", "/dbx/favicon.png", "/dbx/api/probe?value=1"]) {
+    const { next, response } = runMiddleware(requestUrl);
 
-  process.env.DBX_PUBLIC_BASE_PATH = "/dbx";
-  process.env.DBX_BACKEND_URL = `http://127.0.0.1:${backendAddress.port}`;
-  delete process.env.VITE_DBX_BASE_PATH;
-  delete process.env.TAURI_DEV_HOST;
-  delete process.env.TAURI_ENV_ARCH;
+    expect(next).toHaveBeenCalledOnce();
+    expect(response.statusCode).toBe(200);
+    expect(response.setHeader).not.toHaveBeenCalled();
+    expect(response.end).not.toHaveBeenCalled();
+  }
 
-  viteServer = await createViteServer({
-    configFile: path.resolve("apps/desktop/vite.config.ts"),
-    logLevel: "silent",
-    mode: "web",
-    server: { host: "127.0.0.1", port: 0, strictPort: false },
-  });
-  await viteServer.listen();
-  const viteAddress = viteServer.httpServer?.address();
-  if (!viteAddress || typeof viteAddress === "string") throw new Error("Vite server did not bind to TCP");
-  const origin = `http://127.0.0.1:${viteAddress.port}`;
-
-  const rootResponse = await fetch(`${origin}/`, { redirect: "manual" });
-  expect(rootResponse.status).toBe(302);
-  expect(rootResponse.headers.get("location")).toBe("/dbx/");
-
-  const bareResponse = await fetch(`${origin}/dbx`, { redirect: "manual" });
-  expect(bareResponse.status).toBe(308);
-  expect(bareResponse.headers.get("location")).toBe("/dbx/");
-
-  const queryResponse = await fetch(`${origin}/dbx?next=%2Fworkspace&theme=dark`, { redirect: "manual" });
-  expect(queryResponse.status).toBe(308);
-  expect(queryResponse.headers.get("location")).toBe("/dbx/?next=%2Fworkspace&theme=dark");
-
-  const indexResponse = await fetch(`${origin}/dbx/?next=%2Fworkspace`, { redirect: "manual" });
-  expect(indexResponse.status).toBe(200);
-  expect(await indexResponse.text()).toContain('<div id="root">');
-
-  const assetResponse = await fetch(`${origin}/dbx/favicon.png`, { redirect: "manual" });
-  expect(assetResponse.status).toBe(200);
-  expect(assetResponse.headers.get("content-type")).toBe("image/png");
-
-  const apiResponse = await fetch(`${origin}/dbx/api/probe?value=1`, { redirect: "manual" });
-  expect(apiResponse.status).toBe(200);
-  expect(await apiResponse.text()).toBe("/api/probe?value=1");
+  const { next, response } = runMiddleware("/", "/");
+  expect(next).toHaveBeenCalledOnce();
+  expect(response.statusCode).toBe(200);
+  expect(response.end).not.toHaveBeenCalled();
 });

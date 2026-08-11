@@ -1,4 +1,4 @@
-import type { Plugin } from "vite";
+import type { Connect, Plugin } from "vite";
 
 export function publicBasePathRedirectLocation(requestUrl: string | undefined, publicBasePath: string): string | null {
   if (!requestUrl || !publicBasePath || publicBasePath === "/") return null;
@@ -11,21 +11,25 @@ export function publicBasePathRedirectLocation(requestUrl: string | undefined, p
   return `${publicBasePath}/${query}`;
 }
 
+export function publicBasePathRedirectMiddleware(publicBasePath: string): Connect.NextHandleFunction {
+  return (request, response, next) => {
+    const location = publicBasePathRedirectLocation(request.url, publicBasePath);
+    if (!location) {
+      next();
+      return;
+    }
+
+    response.statusCode = 308;
+    response.setHeader("Location", location);
+    response.end();
+  };
+}
+
 export function publicBasePathRedirectPlugin(publicBasePath: string): Plugin {
   return {
     name: "dbx-public-base-path-redirect",
     configureServer(server) {
-      server.middlewares.use((request, response, next) => {
-        const location = publicBasePathRedirectLocation(request.url, publicBasePath);
-        if (!location) {
-          next();
-          return;
-        }
-
-        response.statusCode = 308;
-        response.setHeader("Location", location);
-        response.end();
-      });
+      server.middlewares.use(publicBasePathRedirectMiddleware(publicBasePath));
     },
   };
 }
