@@ -14,6 +14,7 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
+use axum::response::Redirect;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use dbx_core::connection::AppState;
@@ -99,6 +100,25 @@ fn normalize_public_base_path(value: Option<String>) -> String {
     } else {
         format!("/{trimmed}")
     }
+}
+
+fn add_public_base_path_redirect<S>(app: Router<S>, public_base_path: &str) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if public_base_path == "/" {
+        return app;
+    }
+
+    // Derive the target from the configured base path so single- and multi-segment prefixes both work.
+    let redirect_target = format!("{public_base_path}/");
+    app.route(
+        public_base_path,
+        get(move || {
+            let redirect_target = redirect_target.clone();
+            async move { Redirect::permanent(&redirect_target) }
+        }),
+    )
 }
 
 #[cfg(feature = "mq-admin")]
@@ -912,6 +932,7 @@ async fn main() {
 
     if public_base_path != "/" {
         app = Router::new().nest(&public_base_path, app);
+        app = add_public_base_path_redirect(app, &public_base_path);
         // axum 的 nest 不匹配“子路径根目录”(带尾斜杠,如 /dbx/),导致子路径部署时首页 404。
         // 在 nest 外层显式把根目录挂到 index.html,浏览器地址栏保持 /dbx/ 不变,
         // 相对资源与前端路径推断都依赖这个 URL 形态。见 issue #5518。
@@ -951,10 +972,14 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_public_base_path, web_agent_dir_from_env, web_compression_predicate, XLSX_CONTENT_TYPE};
+    use super::{
+        add_public_base_path_redirect, normalize_public_base_path, web_agent_dir_from_env, web_compression_predicate,
+        XLSX_CONTENT_TYPE,
+    };
     use axum::body::Body;
     use axum::http::header::CONTENT_TYPE;
     use axum::http::Response;
+    use axum::Router;
     use tower_http::compression::predicate::Predicate;
 
     fn compression_response(content_type: &str) -> Response<Body> {
@@ -1003,5 +1028,32 @@ mod tests {
             web_agent_dir_from_env(&data_dir, Some("/custom/agents".to_string())),
             std::path::PathBuf::from("/custom/agents")
         );
+    }
+
+    #[tokio::test]
+    async fn public_base_path_redirects_bare_path_to_trailing_slash() {
+        let client =
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().expect("build test client");
+
+        // Representative examples only: /dbx (single segment) and /xxxx/rsu (multi segment).
+        // The redirect target is derived from the configured base path, never hardcoded.
+        for public_base_path in ["/dbx", "/xxxx/rsu"] {
+            let router = add_public_base_path_redirect(Router::new(), public_base_path);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+            let address = listener.local_addr().expect("test listener address");
+            tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("serve test router");
+            });
+
+            let expected_target = format!("{public_base_path}/");
+            let response =
+                client.get(format!("http://{address}{public_base_path}")).send().await.expect("GET bare base path");
+
+            assert_eq!(response.status(), reqwest::StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response.headers().get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok()),
+                Some(expected_target.as_str())
+            );
+        }
     }
 }
