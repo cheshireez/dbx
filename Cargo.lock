@@ -2253,8 +2253,10 @@ dependencies = [
 name = "dbx-mcp"
 version = "0.4.91"
 dependencies = [
+ "aes-gcm 0.10.3",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "dbx-core",
  "dirs",
@@ -2267,6 +2269,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlparser",
  "tempfile",
  "tokio",
