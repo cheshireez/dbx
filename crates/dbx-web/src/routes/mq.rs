@@ -763,6 +763,18 @@ pub async fn enrich_subscriptions(
     Ok(Json(result))
 }
 
+pub async fn get_kafka_consumer_group_snapshot(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<ConnReq>,
+) -> Result<Json<dbx_core::mq::KafkaConsumerGroupSnapshot>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mq::service::mq_get_kafka_consumer_group_snapshot_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn create_subscription(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -1574,6 +1586,7 @@ mod tests {
             read_only: false,
             allow_dangerous_sql: true,
             allowed_connection_ids: Some(vec![connection_id.to_string()]),
+            ..Default::default()
         }
     }
 

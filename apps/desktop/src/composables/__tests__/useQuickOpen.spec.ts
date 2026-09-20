@@ -1,8 +1,8 @@
 import { nextTick } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useQuickOpen } from "@/composables/useQuickOpen";
+import { matchQuickOpenText, useQuickOpen } from "@/composables/useQuickOpen";
 import * as api from "@/lib/backend/api";
-import { getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
+import { getSqlFileFilter, getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 
@@ -22,6 +22,7 @@ vi.mock("@/lib/backend/api", () => ({
 vi.mock("@/lib/sqlFile/sqlFileFolders", async () => {
   const { ref } = await import("vue");
   return {
+    getSqlFileFilter: vi.fn(() => "*.sql"),
     getSqlFileFolderPaths: vi.fn(),
     sqlFileFoldersVersion: ref(0),
   };
@@ -68,7 +69,7 @@ describe("useQuickOpen", () => {
 
       const { filteredItems, loadExternalSqlFiles, setQuery } = useQuickOpen();
       const initialLoad = loadExternalSqlFiles();
-      expect(api.listSqlFilesInFolder).toHaveBeenCalledWith("/old");
+      expect(api.listSqlFilesInFolder).toHaveBeenCalledWith("/old", getSqlFileFilter());
 
       sqlFileFoldersVersion.value++;
       await nextTick();
@@ -76,7 +77,7 @@ describe("useQuickOpen", () => {
       await initialLoad;
 
       expect(api.listSqlFilesInFolder).toHaveBeenCalledTimes(2);
-      expect(api.listSqlFilesInFolder).toHaveBeenLastCalledWith("/new");
+      expect(api.listSqlFilesInFolder).toHaveBeenLastCalledWith("/new", getSqlFileFilter());
       setQuery(".sql");
       expect(filteredItems.value.map((item) => item.label)).toContain("new.sql");
       expect(filteredItems.value.map((item) => item.label)).not.toContain("old.sql");
@@ -84,6 +85,92 @@ describe("useQuickOpen", () => {
   });
 
   describe("fuzzyMatch function", () => {
+    it("ranks exact names, initials, prefixes, substrings, and fuzzy matches in order", () => {
+      const exact = matchQuickOpenText("shop", "shop");
+      const initials = matchQuickOpenText("gafi", "groupon_apply_finance_invoice");
+      const prefix = matchQuickOpenText("shop", "shop_attribute");
+      const substring = matchQuickOpenText("shop", "sale_payway_shop");
+      const fuzzy = matchQuickOpenText("gafi", "giftcard_define_item");
+
+      expect([exact?.kind, initials?.kind, prefix?.kind, substring?.kind, fuzzy?.kind]).toEqual(["exact", "initials", "prefix", "substring", "fuzzy"]);
+      expect(exact!.score).toBeLessThan(initials!.score);
+      expect(initials!.score).toBeLessThan(prefix!.score);
+      expect(prefix!.score).toBeLessThan(substring!.score);
+      expect(substring!.score).toBeLessThan(fuzzy!.score);
+      expect(initials?.indices).toEqual([0, 8, 14, 22]);
+    });
+
+    it("matches multi-word prefix combinations and highlights their source characters", () => {
+      const label = "giftcard_define_shop_log";
+
+      expect(matchQuickOpenText("gdsl", label)?.kind).toBe("initials");
+      for (const query of ["giftdsl", "gdshopl", "gdesl"]) {
+        const match = matchQuickOpenText(query, label);
+        expect(match?.kind).toBe("word-prefix");
+        expect(match?.indices.map((index) => label[index]).join("")).toBe(query);
+      }
+      expect(matchQuickOpenText("giftcard", label)?.kind).toBe("prefix");
+      expect(matchQuickOpenText("define", label)?.kind).toBe("substring");
+      expect(matchQuickOpenText("shop", label)?.kind).toBe("substring");
+      expect(matchQuickOpenText("cardshoplog", label)?.kind).toBe("fuzzy");
+    });
+
+    it("matches Chinese table names by pinyin initials (issue #7912)", () => {
+      // Reported: 全局搜索中文表名输入首字母模糊搜索搜不出来
+      expect(matchQuickOpenText("zzj", "总租金")?.kind).toBe("initials");
+      expect(matchQuickOpenText("yhmx", "用户明细")?.kind).toBe("initials");
+    });
+
+    it("matches Chinese table names by a non-contiguous pinyin-initials subsequence", () => {
+      const match = matchQuickOpenText("zj", "总租金");
+      expect(match?.kind).toBe("fuzzy");
+      expect(match?.indices.map((index) => "总租金"[index]).join("")).toBe("总租金".slice(0, 1) + "总租金".slice(2, 3));
+    });
+
+    it("keeps pinyin-initials highlight indices aligned across unmapped supplementary-plane characters", () => {
+      const match = matchQuickOpenText("bx", "𠮷表x");
+      expect(match?.kind).toBe("fuzzy");
+      expect(match?.indices).toEqual([2, 3]);
+    });
+
+    it("prefers a literal prefix match over pinyin-initials for mixed Han+Latin names", () => {
+      const literal = matchQuickOpenText("abc", "abc表");
+      expect(literal?.kind).toBe("prefix");
+      expect(literal?.score).toBeLessThan(250);
+    });
+
+    it("puts the exact shop result before prefixed and containing names", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [
+          { id: "contains", name: "sale_payway_shop", type: "mssql" },
+          { id: "prefix", name: "shop_attribute", type: "mssql" },
+          { id: "exact", name: "shop", type: "mssql" },
+        ],
+        treeNodes: [],
+      } as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+      setQuery("shop");
+
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["shop", "shop_attribute", "sale_payway_shop"]);
+    });
+
+    it("puts an exact identifier acronym before loose fuzzy matches", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [
+          { id: "fuzzy", name: "giftcard_define_item", type: "mssql" },
+          { id: "initials", name: "groupon_apply_finance_invoice", type: "mssql" },
+        ],
+        treeNodes: [],
+      } as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+      setQuery("gafi");
+
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["groupon_apply_finance_invoice", "giftcard_define_item"]);
+      expect(filteredItems.value[0].matchIndices).toEqual([0, 8, 14, 22]);
+    });
+
     it("should return exact substring match with score 1", () => {
       // Mock store with test data
       const mockStore = {
@@ -186,6 +273,66 @@ describe("useQuickOpen", () => {
   });
 
   describe("filtering and searching", () => {
+    it("keeps database-object highlight indices relative to the visible label", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [{ id: "conn1", name: "Test TiDB", db_type: "mysql" }],
+        treeNodes: [
+          {
+            id: "conn1",
+            connectionId: "conn1",
+            type: "connection",
+            label: "Test TiDB",
+            children: [
+              {
+                id: "conn1:retail_mps",
+                connectionId: "conn1",
+                type: "database",
+                database: "retail_mps",
+                label: "retail_mps",
+                children: [
+                  {
+                    id: "table1",
+                    connectionId: "conn1",
+                    type: "table",
+                    database: "retail_mps",
+                    label: "groupon_apply_finance_invoice",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      } as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+      setQuery("gafi");
+
+      const table = filteredItems.value.find((item) => item.type === "table");
+      expect(table?.label).toBe("groupon_apply_finance_invoice");
+      expect(table?.matchIndices).toEqual([0, 8, 14, 22]);
+    });
+
+    it("does not highlight the label when only connection metadata matches", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [{ id: "conn1", name: "ProdConnection", db_type: "mysql" }],
+        treeNodes: [
+          {
+            connectionId: "conn1",
+            type: "database",
+            database: "UserDB",
+            label: "UserDB",
+          },
+        ],
+      } as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+      setQuery("Prod");
+
+      const database = filteredItems.value.find((item) => item.type === "database");
+      expect(database?.matchIndices).toEqual([]);
+      expect(database?.matchScore).toBeGreaterThan(1000);
+    });
+
     it("indexes database objects under connection groups", () => {
       const mockStore = {
         connections: [{ id: "conn1", name: "Grouped PG", db_type: "postgres" }],
@@ -503,6 +650,23 @@ describe("useQuickOpen", () => {
   });
 
   describe("reset and query setting", () => {
+    it("resets selection when v-model changes the search query directly", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [
+          { id: "conn1", name: "Connection1", type: "mssql" },
+          { id: "conn2", name: "Connection2", type: "mssql" },
+        ],
+        treeNodes: [],
+      } as any);
+
+      const { searchQuery, selectNext, selectedIndex } = useQuickOpen();
+      selectNext();
+      expect(selectedIndex.value).toBe(1);
+
+      searchQuery.value = "Connection";
+      expect(selectedIndex.value).toBe(0);
+    });
+
     it("should reset selection to 0 when setQuery is called", () => {
       const mockStore = {
         connections: [

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
+import { structurePreviewHasOceanBase } from "./sidebarTreeDialogState";
 import { computed, toRefs, watch } from "vue";
 import { AlertTriangle, Check, Loader2, Clipboard, Plus, Trash2, Upload } from "@lucide/vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -7,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { SidebarMongoIndexManagerDialog } from "./sidebarAsyncDialogs";
 
 const props = defineProps<{ controller: Record<string, any> }>();
 const emit = defineEmits<{ closed: [] }>();
@@ -22,9 +25,14 @@ const {
   moveToNewGroupName,
   confirmMoveToNewGroup,
   showDeleteGroupConfirm,
+  deleteConnectionsWithGroup,
+  connectionGroupDeleteConfirmMessage,
+  connectionGroupDeleteMenuLabel,
+  deletingConnectionGroups,
   confirmDeleteGroup,
   showRenameObjectDialog,
   renameObjectName,
+  renameObjectDialogTitle,
   renameObjectPreviewSql,
   renameObjectError,
   confirmRenameObject,
@@ -90,6 +98,9 @@ const {
   editNacosNamespaceDesc,
   editNacosNamespaceLoading,
   confirmEditNacosNamespace,
+  showDeleteNacosNamespaceConfirm,
+  deleteNacosNamespaceLoading,
+  confirmDeleteNacosNamespace,
   showRenameMongoCollectionDialog,
   renameMongoCollectionName,
   renameMongoCollectionError,
@@ -102,6 +113,12 @@ const {
   cloneMongoCollectionLoading,
   confirmCloneMongoCollection,
   showCreateMongoIndexDialog,
+  showCreateMeilisearchIndexDialog,
+  meilisearchCreateIndexUid,
+  meilisearchCreateIndexPrimaryKey,
+  meilisearchCreateIndexError,
+  meilisearchCreateIndexLoading,
+  confirmCreateMeilisearchIndex,
   mongoCreateIndexForm,
   mongoCreateIndexFieldOptions,
   mongoCreateIndexError,
@@ -112,6 +129,7 @@ const {
   addMongoCreateIndexField,
   removeMongoCreateIndexField,
   confirmCreateMongoIndex,
+  showMongoIndexManagerDialog,
   showRedisDatabaseAliasDialog,
   redisDatabaseAliasInput,
   redisDatabaseAliasSaving,
@@ -121,6 +139,9 @@ const {
   createSchemaName,
   confirmCreateSchema,
   showEditSchemaCommentDialog,
+  showCompileErrorDialog,
+  compileErrorTitle,
+  compileErrorMessage,
   schemaCommentText,
   schemaCommentLoading,
   schemaCommentPreviewSql,
@@ -157,6 +178,15 @@ function closeCreateDatabaseResult() {
   showCreateDatabasePreviewDialog.value = false;
 }
 
+function updateDeleteGroupDialogOpen(open: boolean) {
+  if (!open && deletingConnectionGroups.value) return;
+  showDeleteGroupConfirm.value = open;
+}
+
+function preventDeleteGroupDialogDismiss(event: Event) {
+  if (deletingConnectionGroups.value) event.preventDefault();
+}
+
 const mongoIndexCollectionName = computed(() => node.value.tableName || node.value.label);
 
 function mongoIndexTypeLabel(type: string): string {
@@ -180,12 +210,16 @@ watch(
     showEditDatabasePropertiesDialog,
     showCreateNacosNamespaceDialog,
     showEditNacosNamespaceDialog,
+    showDeleteNacosNamespaceConfirm,
     showRenameMongoCollectionDialog,
     showCloneMongoCollectionDialog,
     showCreateMongoIndexDialog,
+    showCreateMeilisearchIndexDialog,
+    showMongoIndexManagerDialog,
     showRedisDatabaseAliasDialog,
     showCreateSchemaDialog,
     showEditSchemaCommentDialog,
+    showCompileErrorDialog,
   ],
   (open) => {
     if (open.every((value) => !value)) emit("closed");
@@ -229,17 +263,24 @@ watch(
     </DialogContent>
   </Dialog>
 
-  <Dialog v-model:open="showDeleteGroupConfirm">
-    <DialogContent class="sm:max-w-[400px]">
+  <Dialog :open="showDeleteGroupConfirm" @update:open="updateDeleteGroupDialogOpen">
+    <DialogContent class="sm:max-w-[400px]" :show-close-button="!deletingConnectionGroups" @escape-key-down="preventDeleteGroupDialogDismiss" @interact-outside="preventDeleteGroupDialogDismiss">
       <DialogHeader>
         <DialogTitle>{{ t("connectionGroup.deleteGroupConfirmTitle") }}</DialogTitle>
       </DialogHeader>
       <p class="text-sm text-muted-foreground">
-        {{ t("connectionGroup.deleteGroupConfirmMessage", { name: node.label }) }}
+        {{ connectionGroupDeleteConfirmMessage() }}
       </p>
+      <label class="flex items-start gap-2 rounded-md border border-border/70 px-3 py-2 text-sm" :class="deletingConnectionGroups ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'">
+        <input v-model="deleteConnectionsWithGroup" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-primary" :disabled="deletingConnectionGroups" />
+        <span>{{ t("connectionGroup.deleteConnectionsWithGroup") }}</span>
+      </label>
       <DialogFooter>
-        <Button variant="outline" @click="showDeleteGroupConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
-        <Button variant="destructive" @click="confirmDeleteGroup">{{ t("connectionGroup.deleteGroup") }}</Button>
+        <Button variant="outline" :disabled="deletingConnectionGroups" @click="showDeleteGroupConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button variant="destructive" :disabled="deletingConnectionGroups" @click="confirmDeleteGroup">
+          <Loader2 v-if="deletingConnectionGroups" class="mr-2 h-4 w-4 animate-spin" />
+          {{ connectionGroupDeleteMenuLabel() }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
@@ -247,12 +288,12 @@ watch(
   <Dialog v-model:open="showRenameObjectDialog">
     <DialogContent class="sm:max-w-[420px]">
       <DialogHeader>
-        <DialogTitle>{{ t("contextMenu.renameObjectTitle") }}</DialogTitle>
+        <DialogTitle>{{ renameObjectDialogTitle }}</DialogTitle>
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameObjectName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" @keydown.enter.prevent="confirmRenameObject" />
-        <pre v-if="renameObjectPreviewSql" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
-        <p v-if="renameObjectError" class="text-sm text-destructive">{{ renameObjectError }}</p>
+        <pre v-if="renameObjectPreviewSql" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
+        <p v-if="renameObjectError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameObjectError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" @click="showRenameObjectDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -270,8 +311,8 @@ watch(
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameMongoCollectionName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" :disabled="renameMongoCollectionLoading" @keydown.enter.prevent="confirmRenameMongoCollection" />
-        <pre v-if="renameMongoCollectionPreview" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
-        <p v-if="renameMongoCollectionError" class="text-sm text-destructive">{{ renameMongoCollectionError }}</p>
+        <pre v-if="renameMongoCollectionPreview" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
+        <p v-if="renameMongoCollectionError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameMongoCollectionError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" :disabled="renameMongoCollectionLoading" @click="showRenameMongoCollectionDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -367,6 +408,33 @@ watch(
     </DialogContent>
   </Dialog>
 
+  <Dialog v-model:open="showCreateMeilisearchIndexDialog">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("meilisearch.createIndex") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-3">
+        <label class="grid gap-1.5 text-sm font-medium">
+          {{ t("meilisearch.createIndexUid") }}
+          <Input v-model="meilisearchCreateIndexUid" :disabled="meilisearchCreateIndexLoading" :placeholder="t('meilisearch.createIndexUidPlaceholder')" @keydown.enter.prevent="confirmCreateMeilisearchIndex" />
+        </label>
+        <label class="grid gap-1.5 text-sm font-medium">
+          {{ t("meilisearch.createIndexPrimaryKey") }}
+          <Input v-model="meilisearchCreateIndexPrimaryKey" :disabled="meilisearchCreateIndexLoading" :placeholder="t('meilisearch.createIndexPrimaryKeyPlaceholder')" />
+          <span class="text-xs font-normal text-muted-foreground">{{ t("meilisearch.createIndexPrimaryKeyHelp") }}</span>
+        </label>
+        <p v-if="meilisearchCreateIndexError" class="text-sm text-destructive">{{ meilisearchCreateIndexError }}</p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="meilisearchCreateIndexLoading" @click="showCreateMeilisearchIndexDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="meilisearchCreateIndexLoading || !meilisearchCreateIndexUid.trim()" @click="confirmCreateMeilisearchIndex">
+          <Loader2 v-if="meilisearchCreateIndexLoading" class="mr-2 h-4 w-4 animate-spin" />
+          {{ t("meilisearch.createIndex") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
   <Dialog v-model:open="showRedisDatabaseAliasDialog">
     <DialogContent class="sm:max-w-[420px]">
       <DialogHeader>
@@ -401,6 +469,7 @@ watch(
         <pre v-else class="max-h-[56vh] min-h-64 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(structurePreviewSql)"></pre>
       </div>
       <DialogFooter>
+        <DdlStorageToggle :database-type="structurePreviewHasOceanBase ? 'oceanbase-oracle' : undefined" :disabled="isLoadingStructurePreview || !!structurePreviewError" class="mr-auto" />
         <Button variant="outline" @click="showStructurePreviewDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button variant="outline" :disabled="isLoadingStructurePreview || !structurePreviewSql" @click="copyStructurePreview">
           <Clipboard class="h-4 w-4" />
@@ -510,7 +579,9 @@ watch(
             </template>
           </SearchableSelect>
         </div>
-        <div class="grid gap-1.5">
+        <!-- The gbase8s locale path has no collations; only show the picker when the selected
+             charset actually has collation options (MySQL always does). -->
+        <div v-if="createDatabaseCollationOptionsForCharset(createDatabaseCharset, createDatabaseCollationsByCharset).length > 0" class="grid gap-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ t("contextMenu.createDatabaseCollation") }}</label>
           <SearchableSelect
             v-model="createDatabaseCollation"
@@ -563,21 +634,23 @@ watch(
   </Dialog>
 
   <Dialog :open="showCreateDatabasePreviewDialog" @update:open="updateCreateDatabasePreviewDialog">
-    <DialogContent class="sm:max-w-[720px]">
+    <DialogContent class="sm:max-w-[720px] grid-rows-[auto_minmax(0,1fr)_auto]">
       <DialogHeader>
         <DialogTitle>{{ t("contextMenu.createDatabaseSqlPreview") }}</DialogTitle>
       </DialogHeader>
-      <pre class="max-h-[48vh] min-h-44 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
-      <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid gap-2 rounded-md border p-3">
-        <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
-          <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
-          <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
-          <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
-          <span class="min-w-0">
-            <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
-            <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
-            <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
-          </span>
+      <div class="grid min-h-0 max-h-full min-w-0 gap-3 overflow-hidden" :class="createDatabaseAuthorizationResults.length > 0 ? 'h-[70vh] grid-rows-[minmax(0,1fr)_minmax(0,1fr)]' : 'h-[48vh] grid-rows-[minmax(0,1fr)]'">
+        <pre class="min-h-0 min-w-0 overflow-auto overscroll-contain whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
+        <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid min-h-0 min-w-0 content-start gap-2 overflow-y-auto overscroll-contain rounded-md border p-3">
+          <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
+            <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
+            <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+            <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
+            <span class="min-w-0">
+              <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
+              <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
+              <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
+            </span>
+          </div>
         </div>
       </div>
       <DialogFooter>
@@ -718,6 +791,26 @@ watch(
     </DialogContent>
   </Dialog>
 
+  <Dialog v-model:open="showDeleteNacosNamespaceConfirm">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("nacos.deleteNamespace") }}</DialogTitle>
+      </DialogHeader>
+      <div class="flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+        <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        <p class="min-w-0 break-words text-muted-foreground [overflow-wrap:anywhere]">
+          {{ t("nacos.deleteNamespaceDescription", { name: node.nacosNamespaceName || node.label, id: node.nacosNamespace || "public" }) }}
+        </p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="deleteNacosNamespaceLoading" @click="showDeleteNacosNamespaceConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button variant="destructive" :disabled="deleteNacosNamespaceLoading" @click="confirmDeleteNacosNamespace">
+          {{ deleteNacosNamespaceLoading ? t("nacos.deletingNamespace") : t("dangerDialog.confirm") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
   <Dialog v-model:open="showCreateSchemaDialog">
     <DialogContent class="sm:max-w-[400px]">
       <DialogHeader>
@@ -755,4 +848,18 @@ watch(
       </DialogFooter>
     </DialogContent>
   </Dialog>
+
+  <Dialog v-model:open="showCompileErrorDialog">
+    <DialogContent class="sm:max-w-[560px]">
+      <DialogHeader>
+        <DialogTitle>{{ compileErrorTitle }}</DialogTitle>
+      </DialogHeader>
+      <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-destructive/5 p-3 text-sm text-destructive">{{ compileErrorMessage }}</pre>
+      <DialogFooter>
+        <Button @click="showCompileErrorDialog = false">{{ t("common.close") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <SidebarMongoIndexManagerDialog v-if="showMongoIndexManagerDialog" :controller="controller" />
 </template>

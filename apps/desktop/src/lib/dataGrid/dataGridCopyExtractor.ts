@@ -1,7 +1,7 @@
 import type { DatabaseType } from "@/types/database";
 import type { DataGridCopyInsertMode, DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 
-export const DATA_GRID_COPY_EXTRACTOR_IDS = ["raw", "tsv", "tsv-with-headers", "csv", "csv-with-headers", "pipe-separated", "dsv", "json", "json-lines", "one-row", "sql-in-list", "sql-inserts", "sql-updates", "where-clause", "markdown", "html", "xml", "pretty"] as const;
+export const DATA_GRID_COPY_EXTRACTOR_IDS = ["raw", "tsv", "tsv-with-headers", "csv", "csv-with-headers", "pipe-separated", "dsv", "json", "json-lines", "one-row", "sql-in-list", "sql-inserts", "sql-updates", "sql-select", "where-clause", "markdown", "html", "xml", "pretty"] as const;
 
 export type DataGridCopyExtractorId = (typeof DATA_GRID_COPY_EXTRACTOR_IDS)[number];
 export type DataGridCopyPreference = "smart" | Exclude<DataGridCopyExtractorId, "raw">;
@@ -29,6 +29,7 @@ export const DATA_GRID_DEFAULT_COPY_PREFERENCES: readonly DataGridCopyPreference
 ];
 
 export const DATA_GRID_EXTRACTOR_CONTRACT_VERSION = 1 as const;
+export const DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION = 1 as const;
 
 export const DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS: Record<DataGridCopyExtractorId, { category: DataGridExtractorCategory; separatorBefore?: boolean }> = {
   raw: { category: "raw" },
@@ -44,6 +45,7 @@ export const DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS: Record<DataGridCopyExtractorI
   "sql-in-list": { category: "sql", separatorBefore: true },
   "sql-inserts": { category: "sql" },
   "sql-updates": { category: "sql" },
+  "sql-select": { category: "sql" },
   "where-clause": { category: "sql" },
   markdown: { category: "document", separatorBefore: true },
   html: { category: "document" },
@@ -65,7 +67,7 @@ const NO_WHERE_CLAUSE_DATABASE_TYPES: ReadonlyArray<string> = ["neo4j", "tdengin
 export function extractorUnavailableForDatabase(extractor: DataGridCopyExtractorId, databaseType: string | undefined | null): boolean {
   const db = databaseType ?? "";
   if (extractor === "sql-updates") return NO_SQL_UPDATE_DATABASE_TYPES.includes(db);
-  if (extractor === "where-clause") return NO_WHERE_CLAUSE_DATABASE_TYPES.includes(db);
+  if (extractor === "where-clause" || extractor === "sql-select") return NO_WHERE_CLAUSE_DATABASE_TYPES.includes(db);
   return false;
 }
 
@@ -86,8 +88,12 @@ export interface DataGridExtractorOptions {
     skipGeneratedColumns: boolean;
     insertMode: DataGridCopyInsertMode;
     excludePrimaryKeysFromInsert: boolean;
+    includeDatabaseName: boolean;
   };
-  json: { pretty: boolean };
+  json: {
+    pretty: boolean;
+    camelCaseFieldNames: boolean;
+  };
 }
 
 export interface DataGridExtractColumn {
@@ -100,6 +106,7 @@ export interface DataGridExtractRequest {
   version: typeof DATA_GRID_EXTRACTOR_CONTRACT_VERSION;
   extractor: DataGridCopyExtractorId;
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   tableMeta?: DataGridTableMeta;
   columns: DataGridExtractColumn[];
   selectedColumnIndexes: number[];
@@ -131,7 +138,7 @@ export const DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS: DataGridExtractorOptions = {
   dsv: {
     columnSeparator: ",",
     rowSeparator: "\n",
-    nullText: "NULL",
+    nullText: "",
     quote: '"',
     quotePolicy: "minimal",
     includeColumnHeader: false,
@@ -142,8 +149,9 @@ export const DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS: DataGridExtractorOptions = {
     skipGeneratedColumns: true,
     insertMode: "merged",
     excludePrimaryKeysFromInsert: false,
+    includeDatabaseName: true,
   },
-  json: { pretty: true },
+  json: { pretty: true, camelCaseFieldNames: false },
 };
 
 function unicodeCodePointLength(value: string): number {
@@ -172,8 +180,12 @@ export function normalizeDataGridExtractorOptions(value: unknown): DataGridExtra
       skipGeneratedColumns: sql.skipGeneratedColumns !== false,
       insertMode: sql.insertMode === "row-by-row" ? "row-by-row" : "merged",
       excludePrimaryKeysFromInsert: sql.excludePrimaryKeysFromInsert === true,
+      includeDatabaseName: sql.includeDatabaseName !== false,
     },
-    json: { pretty: json.pretty !== false },
+    json: {
+      pretty: json.pretty !== false,
+      camelCaseFieldNames: json.camelCaseFieldNames === true,
+    },
   };
 }
 

@@ -5,7 +5,10 @@ import type { QueryTab, TreeNodeType } from "@/types/database";
 export type DataTabOpenMode = "default" | "new-tab";
 export type { DataTabReuseMode };
 
-type DataTabLike = Pick<QueryTab, "id" | "mode" | "connectionId" | "database" | "catalog" | "schema" | "title" | "tableMeta" | "tableMetaUpdatedAt" | "pinned" | "isExecuting" | "isCancelling" | "isExplaining" | "txnSessionId" | "pendingDataChangeCount" | "hasPendingDataEditorDraft">;
+type DataTabLike = Pick<
+  QueryTab,
+  "id" | "mode" | "connectionId" | "database" | "catalog" | "schema" | "title" | "tableMeta" | "tableMetaUpdatedAt" | "tableMetaGeneration" | "pinned" | "isExecuting" | "isCancelling" | "isExplaining" | "txnSessionId" | "pendingDataChangeCount" | "hasPendingDataEditorDraft"
+>;
 
 export interface DataTabTarget {
   connectionId: string;
@@ -31,8 +34,8 @@ export function dataTabOpenModeFromTreeClick(type: TreeNodeType, event: Omit<Sho
   return matchesModifierOnlyShortcut(event, shortcut) ? "new-tab" : "default";
 }
 
-function isSameDatabase(tab: DataTabLike, target: Pick<DataTabTarget, "connectionId" | "database">): boolean {
-  return tab.mode === "data" && tab.connectionId === target.connectionId && tab.database === target.database;
+function isSameDatabase(tab: DataTabLike, target: Pick<DataTabTarget, "connectionId" | "database">, mode: "data" | "mongo" = "data"): boolean {
+  return tab.mode === mode && tab.connectionId === target.connectionId && tab.database === target.database;
 }
 
 function dataTabCatalog(tab: DataTabLike): string {
@@ -44,8 +47,16 @@ function isSameTable(tab: DataTabLike, target: DataTabTarget): boolean {
   return isSameDatabase(tab, target) && dataTabCatalog(tab) === (target.catalog || "") && tabSchema === (target.schema || "") && (tab.tableMeta?.tableName || tab.title) === target.tableName;
 }
 
+function canReuseActiveTableTab(tab: DataTabLike | undefined, target: DataTabTarget, mode: "data" | "mongo"): boolean {
+  return tab !== undefined && isSameDatabase(tab, target, mode) && dataTabCatalog(tab) === (target.catalog || "") && !tab.pinned && !tab.isExecuting && !tab.isCancelling && !tab.isExplaining && !tab.txnSessionId && !tab.pendingDataChangeCount && !tab.hasPendingDataEditorDraft;
+}
+
 export function canReuseActiveDataTab(tab: DataTabLike | undefined, target: DataTabTarget): boolean {
-  return tab !== undefined && isSameDatabase(tab, target) && dataTabCatalog(tab) === (target.catalog || "") && !tab.pinned && !tab.isExecuting && !tab.isCancelling && !tab.isExplaining && !tab.txnSessionId && !tab.pendingDataChangeCount && !tab.hasPendingDataEditorDraft;
+  return canReuseActiveTableTab(tab, target, "data");
+}
+
+export function canReuseActiveMongoTab(tab: DataTabLike | undefined, target: DataTabTarget): boolean {
+  return canReuseActiveTableTab(tab, target, "mongo");
 }
 
 export function canApplyDataTabMetadata(tab: DataTabLike | undefined, target: DataTabTarget, signal?: AbortSignal): boolean {
@@ -55,6 +66,16 @@ export function canApplyDataTabMetadata(tab: DataTabLike | undefined, target: Da
 export function dataTabMetadataNeedsRefresh(tab: DataTabLike, maxAgeMs: number, now = Date.now()): boolean {
   if (!tab.tableMeta?.columns.length || tab.tableMetaUpdatedAt === undefined) return true;
   return now - tab.tableMetaUpdatedAt >= maxAgeMs;
+}
+
+/**
+ * Connection-lifetime freshness: a data tab is cold when it has no freshness
+ * stamp or its recorded generation no longer matches the current
+ * connection/database generation. TTL only applies inside the same generation.
+ * Missing columns remain a separate cold-cache case handled by callers.
+ */
+export function isDataTabMetadataLifecycleStale(tab: Pick<DataTabLike, "tableMetaUpdatedAt" | "tableMetaGeneration">, currentGeneration: number): boolean {
+  return tab.tableMetaUpdatedAt === undefined || (tab.tableMetaGeneration ?? -1) !== currentGeneration;
 }
 
 export function findExistingDataTabCandidate<T extends DataTabLike>(tabs: T[], target: DataTabTarget, options: { openMode: DataTabOpenMode; reuseMode: DataTabReuseMode; activeTabId?: string | null }): ExistingDataTabCandidate<T> | undefined {

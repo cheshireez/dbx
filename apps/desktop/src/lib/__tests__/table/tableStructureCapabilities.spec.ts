@@ -38,6 +38,22 @@ describe("tableStructureCapabilities", () => {
     expect(getTableStructureCapabilities("sqlserver", "sqlserver", "10.0").indexInclude).toBe(true);
   });
 
+  it("enables concurrent index creation only for PostgreSQL", () => {
+    // PostgreSQL (including pre-11 versions that disable INCLUDE) advertises it.
+    expect(getTableStructureCapabilities("postgres", "postgres").indexConcurrent).toBe(true);
+    expect(getTableStructureCapabilities("postgres", "postgres", "10.15").indexConcurrent).toBe(true);
+
+    // PostgreSQL-family engines sharing the Postgres dialect stay off until verified.
+    for (const databaseType of ["kingbase", "gaussdb", "opengauss", "highgo", "uxdb", "vastbase", "kwdb", "firebird"] as const) {
+      expect(getTableStructureCapabilities(databaseType, databaseType).indexConcurrent).toBe(false);
+    }
+
+    // Unrelated engines never advertise it.
+    for (const databaseType of ["mysql", "sqlite", "sqlserver", "oracle", "dameng", "duckdb", "questdb"] as const) {
+      expect(getTableStructureCapabilities(databaseType, databaseType).indexConcurrent).toBe(false);
+    }
+  });
+
   it("removes unsupported included columns before SQL generation", () => {
     const index = {
       id: "new:index",
@@ -77,10 +93,21 @@ describe("tableStructureCapabilities", () => {
     expect(getTableStructureCapabilities("dameng", "dameng").comment).toBe(true);
   });
 
-  it("enables alter primary key for Dameng without enabling it for Oracle", () => {
-    expect(getTableStructureCapabilities("dameng", "dameng").alterPrimaryKey).toBe(true);
-    expect(getTableStructureCapabilities("oracle", "oracle").alterPrimaryKey).toBe(false);
-    expect(getTableStructureCapabilities("oceanbase-oracle", "oceanbase-oracle").alterPrimaryKey).toBe(false);
+  it("separates adding a primary key from replacing an existing one", () => {
+    expect(getTableStructureCapabilities("dameng", "dameng")).toMatchObject({
+      addPrimaryKey: true,
+      alterPrimaryKey: true,
+    });
+    expect(getTableStructureCapabilities("oracle", "oracle")).toMatchObject({
+      addPrimaryKey: true,
+      alterPrimaryKey: false,
+    });
+    for (const databaseType of ["oceanbase-oracle", "iris"] as const) {
+      expect(getTableStructureCapabilities(databaseType, databaseType)).toMatchObject({
+        addPrimaryKey: false,
+        alterPrimaryKey: false,
+      });
+    }
   });
 
   it("uses local-only column reordering for editable databases without physical reorder support", () => {

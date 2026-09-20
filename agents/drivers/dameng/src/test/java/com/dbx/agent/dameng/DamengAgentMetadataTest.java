@@ -1,6 +1,8 @@
 package com.dbx.agent.dameng;
 
 import com.dbx.agent.ColumnInfo;
+import com.dbx.agent.DatabaseInfo;
+import com.dbx.agent.IndexInfo;
 import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
@@ -22,9 +24,77 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 class DamengAgentMetadataTest {
+    @Test
+    void detectsLegacyDamengMetadataFromDatabaseVersion() {
+        Assertions.assertTrue(DamengAgent.usesLegacyJdbcMetadata(versionConnection(6, "6.0.2.79")));
+        Assertions.assertFalse(DamengAgent.usesLegacyJdbcMetadata(versionConnection(8, "8.1.5.45")));
+        Assertions.assertTrue(DamengAgent.usesLegacyJdbcMetadata(versionConnection(0, "DM Database Server x64 V6.0.2.79")));
+    }
+
+    @Test
+    void legacyDamengUsesJdbcMetadataWithoutQueryingDm8CatalogViews() {
+        DamengAgent agent = new DamengAgent();
+        List<String> metadataCalls = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, legacyMetadataConnection(metadataCalls));
+        setLegacyJdbcMetadata(agent, true);
+
+        List<DatabaseInfo> databases = agent.listDatabases();
+        List<String> schemas = agent.listSchemas();
+        List<TableInfo> tables = agent.listTables("DBX_TEST");
+
+        Assertions.assertEquals(List.of("DBX_TEST", "SYSDBA"), databases.stream().map(DatabaseInfo::getName).toList());
+        Assertions.assertEquals(List.of("DBX_TEST", "SYSDBA"), schemas);
+        Assertions.assertEquals(List.of("CONNECTION_SMOKE"), tables.stream().map(TableInfo::getName).toList());
+        Assertions.assertTrue(metadataCalls.contains("getSchemas"), metadataCalls.toString());
+        Assertions.assertTrue(metadataCalls.contains("getTables:DBX\\_TEST"), metadataCalls.toString());
+    }
+
+    @Test
+    void listDatabasesPrefersFullSchemaCatalogOverPrivilegeFilteredAllUsers() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, databaseListConnection(sqls, null, null));
+
+        List<DatabaseInfo> databases = agent.listDatabases();
+
+        Assertions.assertEquals(List.of("APP", "E2E_NORMAL", "SYSDBA"), databases.stream().map(DatabaseInfo::getName).toList());
+        Assertions.assertEquals(1, sqls.size(), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.get(0).contains("SYS.SYSOBJECTS"), sqls.get(0));
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("ALL_USERS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void listDatabasesFallsBackToAllUsersWithoutSysObjectsPrivilege() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, databaseListConnection(sqls, "no SYS.SYSOBJECTS privilege", null));
+
+        List<DatabaseInfo> databases = agent.listDatabases();
+
+        // 无 SOI 角色的普通用户：ALL_USERS 受自主访问控制过滤，只能看到自己，按权限返回属正确行为。
+        Assertions.assertEquals(List.of("E2E_NORMAL"), databases.stream().map(DatabaseInfo::getName).toList());
+        Assertions.assertEquals(2, sqls.size(), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.get(0).contains("SYS.SYSOBJECTS"), sqls.get(0));
+        Assertions.assertTrue(sqls.get(1).contains("ALL_USERS"), sqls.get(1));
+    }
+
+    @Test
+    void listDatabasesPreservesCatalogErrorWhenAllUsersFails() {
+        DamengAgent agent = new DamengAgent();
+        SQLException usersError = new SQLException("ALL_USERS query failed");
+        TestSupport.setPrivateConnection(agent, databaseListConnection(new ArrayList<>(), "no SYS.SYSOBJECTS privilege", usersError));
+
+        RuntimeException error = Assertions.assertThrows(RuntimeException.class, agent::listDatabases);
+
+        Assertions.assertEquals("no SYS.SYSOBJECTS privilege", error.getCause().getMessage());
+        Assertions.assertEquals(1, error.getCause().getSuppressed().length);
+        Assertions.assertSame(usersError, error.getCause().getSuppressed()[0]);
+    }
+
     @Test
     void usesColumnCommentsMetadataQuery() {
         DamengAgent agent = new DamengAgent();
@@ -53,6 +123,53 @@ class DamengAgentMetadataTest {
             .findFirst()
             .orElseThrow();
         Assertions.assertTrue(indexesSql.startsWith("SELECT /*+ PARALLEL(1) */"), indexesSql);
+    }
+
+    @Test
+    void identifiesUniqueConstraintBackingIndexesInIndexMetadataQuery() {
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, JdbcMetadataSqlFake.connection());
+
+        agent.listIndexes("APP", "USERS");
+
+        String indexesSql = JdbcMetadataSqlFake.statements.stream()
+            .filter(sql -> sql.contains("ALL_INDEXES") && sql.contains("ALL_CONSTRAINTS"))
+            .findFirst()
+            .orElseThrow();
+        Assertions.assertTrue(indexesSql.contains("AND c.CONSTRAINT_TYPE IN ('P', 'U')"), indexesSql);
+        Assertions.assertTrue(indexesSql.contains("AS CONSTRAINT_BACKED"), indexesSql);
+        Assertions.assertTrue(indexesSql.contains("CASE WHEN c.CONSTRAINT_TYPE = 'P' THEN 1 ELSE 0 END AS IS_PK"), indexesSql);
+    }
+
+    @Test
+    void marksOnlyConstraintBackedIndexesAsConstraintBacked() {
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, indexMetadataConnection(List.of(
+            // UNIQUE constraint (虚索引) / standalone CREATE UNIQUE INDEX (实索引) / plain index.
+            Arrays.asList("UX_USERS_EMAIL", "EMAIL", "UNIQUE", "0", "NORMAL", "1"),
+            Arrays.asList("UX_USERS_CODE", "CODE", "UNIQUE", "0", "NORMAL", "0"),
+            Arrays.asList("IDX_USERS_NAME", "NAME", "NONUNIQUE", "0", "NORMAL", "0"),
+            Arrays.asList("PK_USERS", "ID", "UNIQUE", "1", "NORMAL", "1")
+        )));
+
+        List<IndexInfo> indexes = agent.listIndexes("APP", "USERS");
+
+        Assertions.assertEquals(
+            List.of("UX_USERS_EMAIL", "UX_USERS_CODE", "IDX_USERS_NAME", "PK_USERS"),
+            indexes.stream().map(IndexInfo::getName).toList()
+        );
+        Assertions.assertEquals(
+            List.of(true, false, false, true),
+            indexes.stream().map(IndexInfo::getConstraint_backed).toList()
+        );
+        Assertions.assertEquals(
+            List.of(false, false, false, true),
+            indexes.stream().map(IndexInfo::getIs_primary).toList()
+        );
+        Assertions.assertEquals(
+            List.of(true, true, false, true),
+            indexes.stream().map(IndexInfo::getIs_unique).toList()
+        );
     }
 
     @Test
@@ -128,8 +245,10 @@ class DamengAgentMetadataTest {
         Assertions.assertEquals(List.of("MV_C", "TABLE_A", "VIEW_B"), tables.stream().map(TableInfo::getName).toList());
         Assertions.assertEquals(List.of("MATERIALIZED_VIEW", "TABLE", "VIEW"), tables.stream().map(TableInfo::getTable_type).toList());
         Assertions.assertEquals(List.of("mv comment", "table comment", "view comment"), tables.stream().map(TableInfo::getComment).toList());
-        Assertions.assertEquals(4, sqls.size(), String.join("\n", sqls));
-        Assertions.assertTrue(sqls.stream().allMatch(sql -> sql.contains("ALL_OBJECTS")), String.join("\n", sqls));
+        Assertions.assertEquals(5, sqls.size(), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream()
+            .filter(sql -> !sql.contains("FROM DBA_OBJECTS"))
+            .allMatch(sql -> sql.contains("ALL_OBJECTS")), String.join("\n", sqls));
         Assertions.assertEquals(List.of("catalog=null,schema=APP\\_DATA\\%2026,table=%,types=null"), jdbcMetadataCalls);
     }
 
@@ -222,6 +341,292 @@ class DamengAgentMetadataTest {
     }
 
     @Test
+    void mapsDamengViewValidityFromDbaObjectsAndBindsSchema() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        List<String> validityParams = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, viewValidityConnection(
+            sqls,
+            validityParams,
+            List.of(
+                List.of("APP", "VALID_VIEW", "VIEW", "VALID"),
+                List.of("APP", "INVALID_VIEW", "VIEW", "INVALID")
+            ),
+            null
+        ));
+
+        List<ObjectInfo> objects = agent.listObjects("APP");
+
+        Assertions.assertEquals(Boolean.TRUE, objects.stream()
+            .filter(object -> "VALID_VIEW".equals(object.getName()))
+            .findFirst().orElseThrow().getValid());
+        Assertions.assertEquals(Boolean.FALSE, objects.stream()
+            .filter(object -> "INVALID_VIEW".equals(object.getName()))
+            .findFirst().orElseThrow().getValid());
+        String validitySql = sqls.stream()
+            .filter(sql -> sql.contains("FROM DBA_OBJECTS"))
+            .findFirst()
+            .orElseThrow();
+        Assertions.assertTrue(validitySql.contains("SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, STATUS"), validitySql);
+        Assertions.assertTrue(validitySql.contains("OBJECT_TYPE = 'VIEW'"), validitySql);
+        Assertions.assertTrue(validitySql.contains("OWNER = ?"), validitySql);
+        Assertions.assertEquals(List.of("APP", "VALID_VIEW", "INVALID_VIEW"), validityParams);
+    }
+
+    @Test
+    void mapsDamengViewValidityThroughPagedListTablesResults() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        List<String> validityParams = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, viewValidityConnection(
+            sqls,
+            validityParams,
+            List.of(
+                List.of("APP", "VALID_VIEW", "VIEW", "VALID"),
+                List.of("APP", "INVALID_VIEW", "VIEW", "INVALID")
+            ),
+            null,
+            List.of(List.of("INVALID_VIEW", "VIEW", "invalid view"))
+        ));
+
+        List<TableInfo> tables = agent.listTables("APP", new MetadataListConstraints(null, 1, 1, List.of("VIEW")));
+
+        Assertions.assertEquals(1, tables.size());
+        Assertions.assertEquals("INVALID_VIEW", tables.get(0).getName());
+        Assertions.assertEquals(Boolean.FALSE, tables.get(0).getValid());
+        Assertions.assertEquals(List.of("APP", "INVALID_VIEW"), validityParams);
+    }
+
+    @Test
+    void mapsDamengViewValidityThroughJdbcListTablesFallback() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        List<String> validityParams = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, viewValidityJdbcFallbackConnection(
+            sqls,
+            validityParams,
+            List.of(List.of("APP", "VIEW_B", "VIEW", "INVALID"))
+        ));
+        setLegacyJdbcMetadata(agent, true);
+
+        List<TableInfo> tables = agent.listTables("APP");
+
+        Assertions.assertEquals(List.of("TABLE_A", "VIEW_B"), tables.stream().map(TableInfo::getName).toList());
+        Assertions.assertEquals(Boolean.FALSE, tables.stream()
+            .filter(table -> "VIEW_B".equals(table.getName()))
+            .findFirst().orElseThrow().getValid());
+        Assertions.assertNull(tables.stream()
+            .filter(table -> "TABLE_A".equals(table.getName()))
+            .findFirst().orElseThrow().getValid());
+        Assertions.assertEquals(List.of("APP", "VIEW_B"), validityParams);
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM DBA_OBJECTS")), sqls.toString());
+    }
+
+    @Test
+    void doesNotQueryOrAttachValidityToNonViewObjects() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, metadataConnection("id comment", null, true, List.of(), sqls));
+
+        List<ObjectInfo> objects = agent.listObjects("APP");
+
+        Assertions.assertTrue(objects.stream().allMatch(object -> object.getValid() == null), objects.toString());
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("FROM DBA_OBJECTS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void keepsViewObjectsWithUnknownValidityWhenStatusQueryFails() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, viewValidityConnection(
+            sqls,
+            new ArrayList<>(),
+            List.of(),
+            new SQLException("DBA_OBJECTS permission denied")
+        ));
+
+        List<ObjectInfo> objects = agent.listObjects("APP");
+
+        Assertions.assertEquals(2, objects.size());
+        Assertions.assertTrue(objects.stream().allMatch(object -> object.getValid() == null), objects.toString());
+        List<TableInfo> tables = agent.listTables("APP");
+        Assertions.assertEquals(2, tables.size());
+        Assertions.assertTrue(tables.stream().allMatch(table -> table.getValid() == null));
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM DBA_OBJECTS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void scopesTableViewValidityToSuccessivePagesAndSearches() {
+        assertViewValidityPageAndSearchIsolation(true);
+    }
+
+    @Test
+    void scopesObjectViewValidityToSuccessivePagesAndSearches() {
+        assertViewValidityPageAndSearchIsolation(false);
+    }
+
+    private void assertViewValidityPageAndSearchIsolation(boolean listTables) {
+        ScopedViewValidityFixture fixture = new ScopedViewValidityFixture();
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, fixture.connection());
+        String owner = "App'Owner";
+        List<String> names = List.of("PAGE_A", "PAGE_B", "Mixed'View");
+        for (int page = 0; page < names.size(); page++) {
+            String name = names.get(page);
+            fixture.rows.clear();
+            fixture.rows.add(List.of(name, "VIEW", "view comment"));
+            fixture.statusRows.add(List.of(owner, name, "VIEW", "INVALID"));
+            String search = page == 2 ? "Mixed'" : null;
+            if (search != null) {
+                fixture.rows.add(List.of("UNMATCHED_VIEW", "VIEW", "not requested"));
+                fixture.rows.add(List.of("Mixed'Table", "TABLE", "not a view"));
+            }
+            MetadataListConstraints constraints = new MetadataListConstraints(search, 1, search == null ? page : 0, List.of("VIEW"));
+            if (listTables) {
+                List<TableInfo> tables = agent.listTables(owner, constraints);
+                Assertions.assertEquals(List.of(name), tables.stream().map(TableInfo::getName).toList());
+                Assertions.assertEquals(Boolean.FALSE, tables.get(0).getValid());
+            } else {
+                List<ObjectInfo> objects = agent.listObjects(owner, constraints);
+                Assertions.assertEquals(List.of(name), objects.stream().map(ObjectInfo::getName).toList());
+                Assertions.assertEquals(Boolean.FALSE, objects.get(0).getValid());
+            }
+            Assertions.assertEquals(List.of(owner, name), fixture.requests.get(page));
+        }
+        Assertions.assertEquals(3, fixture.requests.size());
+    }
+
+    @Test
+    void scopesRawFallbackViewValidityAfterPaging() {
+        ScopedViewValidityFixture fixture = new ScopedViewValidityFixture();
+        fixture.rawFallback = true;
+        fixture.rows.addAll(List.of(
+            List.of("VIEW_A", "VIEW", "first"),
+            List.of("VIEW_B", "VIEW", "second"),
+            List.of("VIEW_C", "VIEW", "third")
+        ));
+        fixture.statusRows.add(List.of("APP", "VIEW_B", "VIEW", "VALID"));
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, fixture.connection());
+
+        List<ObjectInfo> objects = agent.listObjects("APP", new MetadataListConstraints(null, 1, 1, List.of("VIEW")));
+
+        Assertions.assertEquals(List.of("VIEW_B"), objects.stream().map(ObjectInfo::getName).toList());
+        Assertions.assertEquals(Boolean.TRUE, objects.get(0).getValid());
+        Assertions.assertEquals(List.of(List.of("APP", "VIEW_B")), fixture.requests);
+        List<TableInfo> tables = agent.listTables("APP", new MetadataListConstraints(null, 1, 1, List.of("VIEW")));
+        Assertions.assertEquals(List.of("VIEW_B"), tables.stream().map(TableInfo::getName).toList());
+        Assertions.assertEquals(Boolean.TRUE, tables.get(0).getValid());
+        Assertions.assertEquals(List.of(List.of("APP", "VIEW_B"), List.of("APP", "VIEW_B")), fixture.requests);
+    }
+
+    @Test
+    void scopesJdbcFallbackObjectValidityAfterFilteringAndPaging() {
+        DamengAgent agent = new DamengAgent();
+        List<String> params = new ArrayList<>();
+        TestSupport.setPrivateConnection(agent, viewValidityJdbcFallbackConnection(
+            new ArrayList<>(), params, List.of(List.of("APP", "VIEW_B", "VIEW", "VALID"))
+        ));
+        setLegacyJdbcMetadata(agent, true);
+
+        List<ObjectInfo> objects = agent.listObjects("APP", new MetadataListConstraints("VIEW", 1, 0, List.of("VIEW")));
+
+        Assertions.assertEquals(List.of("VIEW_B"), objects.stream().map(ObjectInfo::getName).toList());
+        Assertions.assertEquals(Boolean.TRUE, objects.get(0).getValid());
+        Assertions.assertTrue(agent.listObjects("APP", new MetadataListConstraints("VIEW", 1, 1, List.of("VIEW"))).isEmpty());
+        Assertions.assertEquals(List.of("APP", "VIEW_B"), params);
+    }
+
+    @Test
+    void skipsValidityQueriesForEmptyPagesAndNonViewResults() {
+        ScopedViewValidityFixture fixture = new ScopedViewValidityFixture();
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, fixture.connection());
+
+        Assertions.assertTrue(agent.listTables("APP").isEmpty());
+        Assertions.assertTrue(agent.listObjects("APP").isEmpty());
+        fixture.rows.addAll(List.of(
+            List.of("TABLE_A", "TABLE", "table"),
+            List.of("MV_A", "MATERIALIZED_VIEW", "materialized view")
+        ));
+        Assertions.assertEquals(2, agent.listTables("APP").size());
+        Assertions.assertTrue(agent.listObjects("APP").stream().allMatch(object -> object.getValid() == null));
+        Assertions.assertTrue(fixture.requests.isEmpty());
+    }
+
+    @Test
+    void preservesUnknownStatusesAndExactViewNames() {
+        ScopedViewValidityFixture fixture = new ScopedViewValidityFixture();
+        for (String name : List.of("MixedView", "MIXEDVIEW", "NULL_STATUS", "UNKNOWN_STATUS", "MISSING_STATUS")) {
+            fixture.rows.add(List.of(name, "VIEW", "view"));
+        }
+        fixture.statusRows.addAll(List.of(
+            List.of("APP", "MixedView", "VIEW", " valid "),
+            List.of("APP", "MIXEDVIEW", "VIEW", "invalid"),
+            Arrays.asList("APP", "NULL_STATUS", "VIEW", null),
+            List.of("APP", "UNKNOWN_STATUS", "VIEW", "UNRECOGNIZED")
+        ));
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, fixture.connection());
+
+        Assertions.assertEquals(Arrays.asList(true, false, null, null, null),
+            agent.listTables("APP").stream().map(TableInfo::getValid).toList());
+        Assertions.assertEquals(Arrays.asList(true, false, null, null, null),
+            agent.listObjects("APP").stream().map(ObjectInfo::getValid).toList());
+    }
+
+    @Test
+    void deduplicatesAndBatchesViewValidityNames() {
+        assertBatchedViewValidity(-1);
+    }
+
+    @Test
+    void keepsFailedBatchUnknownAndContinuesOtherValidityBatches() {
+        assertBatchedViewValidity(1);
+    }
+
+    private void assertBatchedViewValidity(int failedBatch) {
+        ScopedViewValidityFixture fixture = new ScopedViewValidityFixture();
+        fixture.failedBatch = failedBatch;
+        List<String> names = new ArrayList<>();
+        for (int index = 0; index < 1001; index++) {
+            String name = "VIEW_" + index;
+            names.add(name);
+            fixture.rows.add(List.of(name, "VIEW", "view"));
+            fixture.statusRows.add(List.of("APP", name, "VIEW", "VALID"));
+        }
+        fixture.rows.add(fixture.rows.get(0));
+        fixture.rows.add(List.of("TABLE_A", "TABLE", "table"));
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, fixture.connection());
+
+        List<TableInfo> tables = agent.listTables("APP");
+
+        Assertions.assertEquals(1003, tables.size());
+        Assertions.assertEquals(List.of(501, 501, 2), fixture.requests.stream().map(List::size).toList());
+        Assertions.assertEquals(names, fixture.requests.stream().flatMap(params -> params.stream().skip(1)).toList());
+        for (int index = 0; index < 1001; index++) {
+            Assertions.assertEquals(index / 500 == failedBatch ? null : Boolean.TRUE, tables.get(index).getValid());
+        }
+        Assertions.assertEquals(Boolean.TRUE, tables.get(1001).getValid());
+        Assertions.assertNull(tables.get(1002).getValid());
+    }
+
+    @Test
+    void reloadsValidityAfterStatusChangesInsteadOfCaching() {
+        ScopedViewValidityFixture fixture = new ScopedViewValidityFixture();
+        fixture.rows.add(List.of("VIEW_A", "VIEW", "view"));
+        fixture.statusRows.add(List.of("APP", "VIEW_A", "VIEW", "INVALID"));
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, fixture.connection());
+
+        Assertions.assertEquals(Boolean.FALSE, agent.listObjects("APP").get(0).getValid());
+        fixture.statusRows.set(0, List.of("APP", "VIEW_A", "VIEW", "VALID"));
+        Assertions.assertEquals(Boolean.TRUE, agent.listObjects("APP").get(0).getValid());
+        Assertions.assertEquals(List.of(List.of("APP", "VIEW_A"), List.of("APP", "VIEW_A")), fixture.requests);
+    }
+
+    @Test
     void queriesSequencesAndPackagesWhenRequested() {
         DamengAgent agent = new DamengAgent();
         TestSupport.setPrivateConnection(agent, JdbcMetadataSqlFake.connection());
@@ -267,8 +672,10 @@ class DamengAgentMetadataTest {
         Assertions.assertEquals(List.of("MATERIALIZED_VIEW", "TABLE", "VIEW"), objects.stream().map(ObjectInfo::getObject_type).toList());
         Assertions.assertEquals(List.of("APP_DATA%2026", "APP_DATA%2026", "APP_DATA%2026"), objects.stream().map(ObjectInfo::getSchema).toList());
         Assertions.assertEquals(List.of("mv comment", "table comment", "view comment"), objects.stream().map(ObjectInfo::getComment).toList());
-        Assertions.assertEquals(4, sqls.size(), String.join("\n", sqls));
-        Assertions.assertTrue(sqls.stream().allMatch(sql -> sql.contains("ALL_OBJECTS")), String.join("\n", sqls));
+        Assertions.assertEquals(5, sqls.size(), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream()
+            .filter(sql -> !sql.contains("FROM DBA_OBJECTS"))
+            .allMatch(sql -> sql.contains("ALL_OBJECTS")), String.join("\n", sqls));
         Assertions.assertEquals(List.of("catalog=null,schema=APP\\_DATA\\%2026,table=%,types=null"), jdbcMetadataCalls);
     }
 
@@ -493,6 +900,96 @@ class DamengAgentMetadataTest {
     }
 
     @Test
+    void fallsBackToViewCatalogWhenDbmsMetadataReportsInternalIndexError() {
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, proxy(Connection.class, (method, args) -> {
+            if ("prepareStatement".equals(method.getName())) {
+                String sql = (String) args[0];
+                if (sql.contains("DBMS_METADATA.GET_DDL")) {
+                    return proxy(PreparedStatement.class, (statementMethod, statementArgs) -> {
+                        if ("executeQuery".equals(statementMethod.getName())) {
+                            throw new SQLException("未找到对象或不允许查询系统定义的内部索引");
+                        }
+                        if ("close".equals(statementMethod.getName())) {
+                            return null;
+                        }
+                        return defaultValue(statementMethod.getReturnType());
+                    });
+                }
+                if (sql.contains("ALL_VIEWS")) {
+                    return metadataStatement(List.of(List.of("SELECT 1 AS ID FROM DUAL")));
+                }
+            }
+            if ("close".equals(method.getName())) {
+                return null;
+            }
+            if ("isClosed".equals(method.getName())) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        }));
+
+        ObjectSource source = agent.getObjectSource("APP", "ACTIVE_VIEW", "VIEW");
+
+        Assertions.assertTrue(source.getSource().contains("SELECT 1 AS ID FROM DUAL"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("系统字典视图"), source.getSource());
+    }
+
+    @Test
+    void tableDdlFallsBackToViewAndMaterializedViewCatalogDefinitions() {
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, proxy(Connection.class, (method, args) -> {
+            if ("prepareStatement".equals(method.getName())) {
+                String sql = (String) args[0];
+                if (sql.contains("DBMS_METADATA.GET_DDL")) {
+                    return failingMetadataStatement(new SQLException("未找到对象或不允许查询系统定义的内部索引"));
+                }
+                if (sql.contains("USER_MVIEWS")) {
+                    String[] boundTable = {null};
+                    return proxy(PreparedStatement.class, (statementMethod, statementArgs) -> {
+                        if ("setString".equals(statementMethod.getName())) {
+                            boundTable[0] = (String) statementArgs[1];
+                            return null;
+                        }
+                        if ("executeQuery".equals(statementMethod.getName())) {
+                            return metadataResultSet("ISSUE_3418_MV".equals(boundTable[0])
+                                ? List.of(List.of("SELECT 1 AS ID FROM DUAL"))
+                                : List.of());
+                        }
+                        if ("close".equals(statementMethod.getName())) {
+                            return null;
+                        }
+                        return defaultValue(statementMethod.getReturnType());
+                    });
+                }
+                if (sql.contains("ALL_VIEWS")) {
+                    return metadataStatement(List.of(List.of("SELECT 2 AS ID FROM DUAL")));
+                }
+            }
+            if ("close".equals(method.getName())) {
+                return null;
+            }
+            if ("isClosed".equals(method.getName())) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        }));
+        setConnectedUsername(agent, "APP");
+
+        String viewDdl = agent.getTableDdl("APP", "ACTIVE_VIEW");
+        String materializedViewDdl = agent.getTableDdl("APP", "ISSUE_3418_MV");
+
+        Assertions.assertEquals(
+            "CREATE VIEW \"APP\".\"ACTIVE_VIEW\" AS SELECT 2 AS ID FROM DUAL;",
+            viewDdl
+        );
+        Assertions.assertEquals(
+            "CREATE MATERIALIZED VIEW \"APP\".\"ISSUE_3418_MV\" AS SELECT 1 AS ID FROM DUAL;",
+            materializedViewDdl
+        );
+    }
+
+    @Test
     void readsViewSourceWithDbmsMetadataType() {
         DamengAgent agent = new DamengAgent();
         List<String> params = new ArrayList<>();
@@ -506,6 +1003,452 @@ class DamengAgentMetadataTest {
         Assertions.assertEquals(List.of("VIEW", "V_PROCESSPLAN", "APP"), params);
         Assertions.assertEquals("VIEW", source.getObject_type());
         Assertions.assertTrue(source.getSource().contains("CREATE VIEW"), source.getSource());
+    }
+
+    @Test
+    void fallsBackToAllSourceFunctionDdlWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE FUNCTION \"APP\".\"CALC_SCORE\"(V_ID INT) RETURN INT AS"),
+                    Arrays.asList("BEGIN"),
+                    Arrays.asList("  RETURN V_ID * 2;"),
+                    Arrays.asList("END;")
+                ),
+                null,
+                List.of(),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "CALC_SCORE", "FUNCTION");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE OR REPLACE FUNCTION"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("RETURN V_ID * 2;"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+        Assertions.assertEquals(1, sqls.stream().filter(sql -> sql.contains("DBMS_METADATA.GET_DDL")).count());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("TYPE = ?")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("FROM ALL_SOURCE") && !sql.contains("TYPE = ?")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("SYS.SYSTEXTS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void matchesDamengProcedureTypeWhenAllSourceUsesProc() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            typedRoutineFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE PROCEDURE \"APP\".\"REBUILD_CACHE\" AS"),
+                    Arrays.asList("BEGIN NULL; END;")
+                ),
+                null,
+                List.of(),
+                "1"
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "REBUILD_CACHE", "PROCEDURE");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE OR REPLACE PROCEDURE"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SOURCE") && sql.contains("TYPE = ?")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("SELECT o.INFO1")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("FROM ALL_SOURCE") && !sql.contains("TYPE = ?")), String.join("\n", sqls));
+    }
+
+    @Test
+    void matchesDamengFunctionTypeWhenAllSourceUsesProc() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            typedRoutineFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE FUNCTION \"APP\".\"CALC_SCORE\"(V_ID INT) RETURN INT AS"),
+                    Arrays.asList("BEGIN RETURN V_ID * 2; END;")
+                ),
+                null,
+                List.of(),
+                "0"
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "CALC_SCORE", "FUNCTION");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE OR REPLACE FUNCTION"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("SELECT o.INFO1")), String.join("\n", sqls));
+    }
+
+    @Test
+    void doesNotReturnProcedureSourceForFunctionFallback() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            typedRoutineFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE PROCEDURE \"APP\".\"REBUILD_CACHE\" AS"),
+                    Arrays.asList("BEGIN NULL; END;")
+                ),
+                null,
+                List.of(),
+                "1"
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "REBUILD_CACHE", "FUNCTION");
+
+        Assertions.assertFalse(source.getSource().contains("CREATE OR REPLACE PROCEDURE"), source.getSource());
+        Assertions.assertFalse(source.isEditable());
+        Assertions.assertEquals(2, sqls.stream().filter(sql -> sql.contains("FROM ALL_SOURCE")).count(), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("FROM ALL_SOURCE") && !sql.contains("TYPE = ?")), String.join("\n", sqls));
+    }
+
+    @Test
+    void fallsBackToAllSourceTypeDdlWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE TYPE \"APP\".\"T_ADDR\" AS OBJECT("),
+                    Arrays.asList("  CITY VARCHAR2(64)"),
+                    Arrays.asList(")")
+                ),
+                null,
+                List.of(),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "T_ADDR", "TYPE");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE OR REPLACE TYPE"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+    }
+
+    @Test
+    void fallsBackToAllSourcePackageBodyDdlWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE PACKAGE BODY \"APP\".\"PKG_DEMO\" AS"),
+                    Arrays.asList("  PROCEDURE P IS BEGIN NULL; END;"),
+                    Arrays.asList("END PKG_DEMO;")
+                ),
+                null,
+                List.of(),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "PKG_DEMO", "PACKAGE_BODY");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE OR REPLACE PACKAGE BODY"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+    }
+
+    @Test
+    void wrapsBareAllSourcePackageBodyAsExecutableDdl() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(
+                    Arrays.asList("PACKAGE BODY \"APP\".\"PKG_DEMO\" AS"),
+                    Arrays.asList("  PROCEDURE P IS BEGIN NULL; END;"),
+                    Arrays.asList("END PKG_DEMO;")
+                ),
+                null,
+                List.of(),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "PKG_DEMO", "PACKAGE_BODY");
+
+        Assertions.assertTrue(source.getSource().startsWith("CREATE OR REPLACE PACKAGE BODY"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+    }
+
+    @Test
+    void fallsBackToViewTextWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(missingDbmsMetadataPackageError(), sqls, List.of(), null, List.of(), null)
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "V_ACTIVE_USERS", "VIEW");
+
+        Assertions.assertTrue(source.getSource().contains("SELECT 1 AS ID FROM DUAL"), source.getSource());
+        // 字典视图正文不包含完整 CREATE VIEW 头，标记为不可编辑。
+        Assertions.assertFalse(source.isEditable());
+        Assertions.assertTrue(source.getSource().startsWith("--"), source.getSource());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_VIEWS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void fallsBackToTriggerBodyWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(missingDbmsMetadataPackageError(), sqls, List.of(), null, List.of(), null)
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "TRG_USERS", "TRIGGER");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE TRIGGER"), source.getSource());
+        // 触发器正文可能不含完整创建语句头，标记为不可编辑。
+        Assertions.assertFalse(source.isEditable());
+        Assertions.assertTrue(source.getSource().startsWith("--"), source.getSource());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_TRIGGERS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void reconstructsSequenceDdlWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(missingDbmsMetadataPackageError(), sqls, List.of(), null, List.of(), null)
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "SEQ_ORDERS", "SEQUENCE");
+
+        Assertions.assertTrue(
+            source.getSource().contains("CREATE SEQUENCE \"APP\".\"SEQ_ORDERS\""),
+            source.getSource()
+        );
+        Assertions.assertTrue(source.getSource().contains("INCREMENT BY 5"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("MAXVALUE 9999999999"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("CACHE 20"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("NOCYCLE"), source.getSource());
+        Assertions.assertFalse(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SEQUENCES")), String.join("\n", sqls));
+    }
+
+    @Test
+    void fallsBackToSysTextsWhenAllSourceIsUnavailable() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(),
+                missingCatalogViewError("ALL_SOURCE"),
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE FUNCTION \"APP\".\"CALC_SCORE\"(V_ID INT) RETURN INT AS"),
+                    Arrays.asList("BEGIN"),
+                    Arrays.asList("  RETURN V_ID * 2;"),
+                    Arrays.asList("END;")
+                ),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "CALC_SCORE", "FUNCTION");
+
+        Assertions.assertTrue(source.getSource().contains("CREATE OR REPLACE FUNCTION"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("SYS.SYSTEXTS") && sql.contains("SYS.SYSOBJECTS")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("SELECT t.TXT") && sql.contains("ORDER BY t.SEQNO")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("SYS.SYSTEXTS") && (sql.contains("t.TEXT") || sql.contains("t.LINE"))), String.join("\n", sqls));
+    }
+
+    @Test
+    void doesNotReturnProcedureSourceForFunctionSysTextsFallback() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            typedRoutineFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(),
+                missingCatalogViewError("ALL_SOURCE"),
+                List.of(
+                    Arrays.asList("CREATE OR REPLACE PROCEDURE \"APP\".\"REBUILD_CACHE\" AS"),
+                    Arrays.asList("BEGIN NULL; END;")
+                ),
+                "1"
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "REBUILD_CACHE", "FUNCTION");
+
+        Assertions.assertFalse(source.getSource().contains("CREATE OR REPLACE PROCEDURE"), source.getSource());
+        Assertions.assertFalse(source.isEditable());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("SELECT t.TXT") && sql.contains("ORDER BY t.SEQNO")), String.join("\n", sqls));
+    }
+
+    @Test
+    void wrapsBareSysTextsTypeAsExecutableDdl() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(),
+                missingCatalogViewError("ALL_SOURCE"),
+                List.of(
+                    Arrays.asList("TYPE \"APP\".\"T_ADDR\" AS OBJECT("),
+                    Arrays.asList("  CITY VARCHAR2(64)"),
+                    Arrays.asList(")")
+                ),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "T_ADDR", "TYPE");
+
+        Assertions.assertTrue(source.getSource().startsWith("CREATE OR REPLACE TYPE"), source.getSource());
+        Assertions.assertTrue(source.isEditable());
+    }
+
+    @Test
+    void keepsUnrecognizedRoutineCatalogTextReadOnly() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(Arrays.asList("BEGIN NULL; END;")),
+                null,
+                List.of(),
+                null
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "PKG_DEMO", "PACKAGE");
+
+        Assertions.assertTrue(source.getSource().startsWith("--"), source.getSource());
+        Assertions.assertFalse(source.isEditable());
+    }
+
+    @Test
+    void returnsUnavailablePlaceholderWhenAllCatalogSourcesFail() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                missingDbmsMetadataPackageError(),
+                sqls,
+                List.of(),
+                missingCatalogViewError("ALL_SOURCE"),
+                List.of(),
+                missingCatalogViewError("SYS.SYSTEXTS")
+            )
+        );
+
+        ObjectSource source = agent.getObjectSource("APP", "CALC_SCORE", "FUNCTION");
+
+        Assertions.assertFalse(source.isEditable());
+        Assertions.assertTrue(source.getSource().startsWith("--"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("SP_CREATE_SYSTEM_PACKAGES"), source.getSource());
+        Assertions.assertTrue(source.getSource().contains("DBMS_METADATA"), source.getSource());
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("SYS.SYSTEXTS")), String.join("\n", sqls));
+    }
+
+    @Test
+    void propagatesConnectionResetWithoutCatalogFallback() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(
+                new SQLException("DBMS_METADATA.GET_DDL connection reset"),
+                sqls,
+                List.of(),
+                null,
+                List.of(),
+                null
+            )
+        );
+
+        RuntimeException error = Assertions.assertThrows(
+            RuntimeException.class,
+            () -> agent.getObjectSource("APP", "CALC_SCORE", "FUNCTION")
+        );
+
+        Assertions.assertEquals("DBMS_METADATA.GET_DDL connection reset", error.getCause().getMessage());
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+    }
+
+    @Test
+    void doesNotFallBackForUnrelatedDbmsMetadataErrors() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        SQLException unrelated = new SQLException("DBMS_METADATA.GET_DDL 内部执行错误", "99999", -9001);
+        TestSupport.setPrivateConnection(
+            agent,
+            catalogFallbackConnection(unrelated, sqls, List.of(), null, List.of(), null)
+        );
+
+        Assertions.assertThrows(
+            RuntimeException.class,
+            () -> agent.getObjectSource("APP", "CALC_SCORE", "FUNCTION")
+        );
+
+        Assertions.assertTrue(sqls.stream().noneMatch(sql -> sql.contains("FROM ALL_SOURCE")), String.join("\n", sqls));
+    }
+
+    @Test
+    void tableDdlFallsBackWhenDbmsMetadataPackageIsMissing() {
+        DamengAgent agent = new DamengAgent();
+        List<String> sqls = new ArrayList<>();
+        TestSupport.setPrivateConnection(
+            agent,
+            metadataConnectionWithDbmsMetadataError(
+                sqls,
+                "[-2207]:无法解析的成员访问表达式[SF_DBMS_METADATA_RETURN_DDL]\n[-3325]:包/对象[DBMS_METADATA]解析失败"
+            )
+        );
+
+        String ddl = agent.getTableDdl("APP", "USERS");
+
+        Assertions.assertTrue(ddl.contains("CREATE TABLE \"APP\".\"USERS\""), ddl);
+        Assertions.assertTrue(sqls.stream().anyMatch(sql -> sql.contains("ALL_TAB_COLUMNS")), String.join("\n", sqls));
+        Assertions.assertEquals(1, sqls.stream().filter(sql -> sql.contains("DBMS_METADATA.GET_DDL")).count());
     }
 
     @Test
@@ -554,6 +1497,148 @@ class DamengAgentMetadataTest {
 
         Assertions.assertEquals(1, columns.size());
         Assertions.assertEquals("identity", columns.get(0).getExtra());
+    }
+
+    @Test
+    void readsIdentityColumnsFromDdlText() {
+        Assertions.assertEquals(
+            java.util.Set.of("ID"),
+            DamengAgent.identityColumnsFromDdlText(
+                "CREATE TABLE \"DBX_TEST\".\"T\"\n(\n\"ID\" INT IDENTITY(1, 1) NOT NULL,\n"
+                    + "\"NAME\" VARCHAR(64),\nNOT CLUSTER PRIMARY KEY(\"ID\")) STORAGE(ON \"MAIN\") ;"
+            )
+        );
+    }
+
+    @Test
+    void ignoresIdentityLookalikesInDdlText() {
+        // A column *named* IDENTITY whose default merely contains the word must not be reported,
+        // and neither must a table-level constraint that mentions it.
+        Assertions.assertEquals(
+            java.util.Set.of(),
+            DamengAgent.identityColumnsFromDdlText(
+                "CREATE TABLE \"DBX_TEST\".\"T\"\n(\n\"IDENTITY\" VARCHAR(32) DEFAULT 'IDENTITY(1,1)',\n"
+                    + "\"PLAIN\" INT,\n\"IDENTITY_KIND\" VARCHAR(8)) STORAGE(ON \"MAIN\") ;"
+            )
+        );
+    }
+
+    @Test
+    void readsEveryIdentityColumnFromDdlText() {
+        Assertions.assertEquals(
+            java.util.Set.of("A", "C"),
+            DamengAgent.identityColumnsFromDdlText(
+                "CREATE TABLE \"S\".\"T\"\n(\n\"A\" BIGINT IDENTITY(1, 1),\n\"B\" VARCHAR(9),\n"
+                    + "\"C\" INT identity(100, 5) NOT NULL,\nCLUSTER PRIMARY KEY(\"A\", \"C\")) ;"
+            )
+        );
+    }
+
+    @Test
+    void toleratesDdlTextThatCannotBeParsed() {
+        Assertions.assertEquals(java.util.Set.of(), DamengAgent.identityColumnsFromDdlText(null));
+        Assertions.assertEquals(java.util.Set.of(), DamengAgent.identityColumnsFromDdlText(""));
+        Assertions.assertEquals(java.util.Set.of(), DamengAgent.identityColumnsFromDdlText("CREATE TABLE \"S\".\"T\""));
+    }
+
+    @Test
+    void fallsBackToTableDdlWhenSysColumnsIsNotReadable() {
+        // Ordinary Dameng accounts have no SELECT on SYS.SYSCOLUMNS. Without the fallback the
+        // identity column looks like a plain NOT NULL column and the grid sends its value.
+        List<String> sqls = new ArrayList<>();
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, restrictedAccountConnection(sqls, List.of()));
+
+        List<ColumnInfo> columns = agent.getColumns("APP", "USERS");
+
+        Assertions.assertEquals(1, columns.size());
+        Assertions.assertEquals("identity", columns.get(0).getExtra());
+        Assertions.assertTrue(
+            sqls.stream().anyMatch(sql -> sql.contains("DBMS_METADATA.GET_DDL")),
+            sqls.toString()
+        );
+    }
+
+    @Test
+    void fallsBackToJdbcPrimaryKeysWhenConstraintDictionaryIsEmpty() {
+        // ALL_CONS_COLUMNS yields no rows (not an error) for those same accounts.
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, restrictedAccountConnection(new ArrayList<>(), List.of()));
+
+        List<ColumnInfo> columns = agent.getColumns("APP", "USERS");
+
+        Assertions.assertEquals(1, columns.size());
+        Assertions.assertTrue(columns.get(0).getIs_primary_key());
+    }
+
+    @Test
+    void keepsPrimaryKeysFromConstraintDictionaryWhenReadable() {
+        // The JDBC fallback must not displace the dictionary answer when that one works.
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, restrictedAccountConnection(new ArrayList<>(), List.of(List.of("ID"))));
+
+        List<ColumnInfo> columns = agent.getColumns("APP", "USERS");
+
+        Assertions.assertTrue(columns.get(0).getIs_primary_key());
+    }
+
+    @Test
+    void doesNotReadTableDdlWhenSysColumnsIsReadableButEmpty() {
+        // A readable-but-empty SYS.SYSCOLUMNS means "no identity column" and must stay cheap.
+        List<String> sqls = new ArrayList<>();
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, metadataConnection(null, null, false, List.of(), sqls));
+
+        agent.getColumns("APP", "USERS");
+
+        Assertions.assertTrue(
+            sqls.stream().noneMatch(sql -> sql.contains("DBMS_METADATA.GET_DDL")),
+            sqls.toString()
+        );
+    }
+
+    /**
+     * A connection shaped like a non-DBA Dameng account: SYS.SYSCOLUMNS raises a permission error
+     * and the constraint dictionary answers with no rows, while the table DDL and the driver's own
+     * primary-key metadata both still work.
+     */
+    private static Connection restrictedAccountConnection(List<String> sqls, List<List<Object>> constraintRows) {
+        DatabaseMetaData metadata = proxy(DatabaseMetaData.class, (method, args) -> {
+            if ("getPrimaryKeys".equals(method.getName())) {
+                return metadataResultSet(List.of(List.of("ID")));
+            }
+            return defaultValue(method.getReturnType());
+        });
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("getMetaData".equals(name)) {
+                return metadata;
+            }
+            if ("prepareStatement".equals(name)) {
+                String sql = (String) args[0];
+                sqls.add(sql);
+                if (sql.contains("SYS.SYSCOLUMNS")) {
+                    return failingMetadataStatement("没有[SYSCOLUMNS]对象的查询权限");
+                }
+                if (sql.contains("DBMS_METADATA.GET_DDL")) {
+                    return metadataStatement(List.of(List.of(
+                        "CREATE TABLE \"APP\".\"USERS\"\n(\n\"ID\" INT IDENTITY(1, 1) NOT NULL)"
+                            + " STORAGE(ON \"MAIN\", CLUSTERBTR) ;"
+                    )));
+                }
+                if (sql.contains("ALL_CONS_COLUMNS")) {
+                    return metadataStatement(constraintRows);
+                }
+                if (sql.contains("ALL_TAB_COLUMNS")) {
+                    return metadataStatement(defaultColumnMetadataRows("id comment"));
+                }
+                return metadataStatement(List.of());
+            }
+            if ("close".equals(name) || "isClosed".equals(name)) {
+                return "isClosed".equals(name) ? Boolean.FALSE : null;
+            }
+            return defaultValue(method.getReturnType());
+        });
     }
 
     @Test
@@ -747,6 +1832,171 @@ class DamengAgentMetadataTest {
         return metadataConnection(allColumnComment, fallbackColumnComment, includeMaterializedView, List.of(), null);
     }
 
+    private static Connection viewValidityConnection(
+        List<String> sqls,
+        List<String> validityParams,
+        List<List<Object>> validityRows,
+        SQLException validityError
+    ) {
+        return viewValidityConnection(
+            sqls,
+            validityParams,
+            validityRows,
+            validityError,
+            List.of(
+                List.of("VALID_VIEW", "VIEW", "valid view"),
+                List.of("INVALID_VIEW", "VIEW", "invalid view")
+            )
+        );
+    }
+
+    private static Connection viewValidityConnection(
+        List<String> sqls,
+        List<String> validityParams,
+        List<List<Object>> validityRows,
+        SQLException validityError,
+        List<List<Object>> tableRows
+    ) {
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("prepareStatement".equals(name)) {
+                String sql = (String) args[0];
+                sqls.add(sql);
+                if (sql.contains("FROM DBA_OBJECTS")) {
+                    if (validityError != null) return failingMetadataStatement(validityError);
+                    return statusMetadataStatement(validityRows, validityParams);
+                }
+                if (sql.contains("FROM ALL_OBJECTS o")) {
+                    return metadataStatement(tableRows);
+                }
+                return metadataStatement(List.of());
+            }
+            if ("close".equals(name)) return null;
+            if ("isClosed".equals(name)) return false;
+            return defaultValue(method.getReturnType());
+        });
+    }
+
+    private static Connection viewValidityJdbcFallbackConnection(
+        List<String> sqls,
+        List<String> validityParams,
+        List<List<Object>> validityRows
+    ) {
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("prepareStatement".equals(name)) {
+                String sql = (String) args[0];
+                sqls.add(sql);
+                if (sql.contains("FROM DBA_OBJECTS")) {
+                    return statusMetadataStatement(validityRows, validityParams);
+                }
+                return failingMetadataStatement(new SQLException("no ALL_OBJECTS privilege"));
+            }
+            if ("getMetaData".equals(name)) {
+                return proxy(DatabaseMetaData.class, (metadataMethod, metadataArgs) -> {
+                    if ("getSearchStringEscape".equals(metadataMethod.getName())) {
+                        return "\\";
+                    }
+                    if ("getTables".equals(metadataMethod.getName())) {
+                        return metadataResultSet(List.of(
+                            List.of("VIEW_B", "VIEW", "view comment"),
+                            List.of("TABLE_A", "TABLE", "table comment")
+                        ));
+                    }
+                    return defaultValue(metadataMethod.getReturnType());
+                });
+            }
+            if ("close".equals(name)) return null;
+            if ("isClosed".equals(name)) return false;
+            return defaultValue(method.getReturnType());
+        });
+    }
+
+    private static final class ScopedViewValidityFixture {
+        final List<List<Object>> rows = new ArrayList<>();
+        final List<List<Object>> statusRows = new ArrayList<>();
+        final List<List<String>> requests = new ArrayList<>();
+        boolean rawFallback;
+        int failedBatch = -1;
+
+        Connection connection() {
+            return proxy(Connection.class, (method, args) -> {
+                if ("prepareStatement".equals(method.getName())) {
+                    String sql = (String) args[0];
+                    if (sql.contains("FROM DBA_OBJECTS")) {
+                        List<String> params = new ArrayList<>();
+                        int batch = requests.size();
+                        requests.add(params);
+                        return proxy(PreparedStatement.class, (statementMethod, statementArgs) -> {
+                            if ("setString".equals(statementMethod.getName())) {
+                                int index = (Integer) statementArgs[0];
+                                while (params.size() < index) params.add(null);
+                                params.set(index - 1, (String) statementArgs[1]);
+                            }
+                            if ("executeQuery".equals(statementMethod.getName())) {
+                                Assertions.assertTrue(sql.contains("OWNER = ?"), sql);
+                                Assertions.assertTrue(params.size() > 1 && params.size() <= 501, params.toString());
+                                Assertions.assertTrue(sql.contains("OBJECT_NAME IN ("
+                                    + String.join(", ", Collections.nCopies(params.size() - 1, "?")) + ")"), sql);
+                                Assertions.assertEquals(params.size(), sql.chars().filter(character -> character == '?').count());
+                                for (String param : params) Assertions.assertFalse(sql.contains(param), sql);
+                                if (batch == failedBatch) throw new SQLException("DBA_OBJECTS permission denied");
+                                return statusResultSet(statusRows.stream()
+                                    .filter(row -> params.get(0).equals(row.get(0)) && params.subList(1, params.size()).contains(row.get(1)))
+                                    .toList());
+                            }
+                            return defaultValue(statementMethod.getReturnType());
+                        });
+                    }
+                    if (rawFallback && sql.contains("mv.OWNER")) {
+                        return failingMetadataStatement("no SYS.SYSOBJECTS privilege");
+                    }
+                    return metadataStatement(rows);
+                }
+                if ("isClosed".equals(method.getName())) return false;
+                return defaultValue(method.getReturnType());
+            });
+        }
+    }
+
+    private static PreparedStatement statusMetadataStatement(List<List<Object>> rows, List<String> params) {
+        return proxy(PreparedStatement.class, (method, args) -> {
+            String name = method.getName();
+            if ("setString".equals(name)) {
+                params.add(String.valueOf(args[1]));
+                return null;
+            }
+            if ("executeQuery".equals(name)) return statusResultSet(rows);
+            if ("close".equals(name)) return null;
+            return defaultValue(method.getReturnType());
+        });
+    }
+
+    private static ResultSet statusResultSet(List<List<Object>> rows) {
+        int[] index = {-1};
+        return proxy(ResultSet.class, (method, args) -> {
+            String name = method.getName();
+            if ("next".equals(name)) {
+                index[0] += 1;
+                return index[0] < rows.size();
+            }
+            if ("getString".equals(name)) {
+                String column = String.valueOf(args[0]).toUpperCase();
+                int columnIndex = switch (column) {
+                    case "OWNER" -> 0;
+                    case "OBJECT_NAME" -> 1;
+                    case "OBJECT_TYPE" -> 2;
+                    case "STATUS" -> 3;
+                    default -> -1;
+                };
+                Object value = columnIndex < 0 ? null : rows.get(index[0]).get(columnIndex);
+                return value == null ? null : String.valueOf(value);
+            }
+            if ("close".equals(name)) return null;
+            return defaultValue(method.getReturnType());
+        });
+    }
+
     private static Connection metadataConnectionWithIndexes(List<String> sqls) {
         return metadataConnection(
             "id comment",
@@ -919,11 +2169,21 @@ class DamengAgentMetadataTest {
                     return metadataStatement(rows);
                 }
                 if (sql.contains("USER_MVIEWS")) {
+                    if (sql.contains("SELECT QUERY")) {
+                        return metadataStatement(
+                            includeMaterializedView
+                                ? List.of(List.of("SELECT 1 AS ID FROM DUAL"))
+                                : List.of()
+                        );
+                    }
                     return metadataStatement(
                         includeMaterializedView
                             ? List.of(List.of("USER_SUMMARY_MV"))
                             : List.of()
                     );
+                }
+                if (sql.contains("ALL_VIEWS")) {
+                    return metadataStatement(List.of());
                 }
                 if (sql.contains("ALL_COL_COMMENTS") && !sql.contains("ALL_TAB_COLUMNS")) {
                     return metadataStatement(List.of());
@@ -954,6 +2214,24 @@ class DamengAgentMetadataTest {
             null,
             allColumnComment
         ));
+    }
+
+    // Serves every metadata query with the same positional rows; the index metadata query is
+    // the only one these tests run against it.
+    private static Connection indexMetadataConnection(List<List<Object>> rows) {
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("prepareStatement".equals(name)) {
+                return metadataStatement(rows);
+            }
+            if ("close".equals(name)) {
+                return null;
+            }
+            if ("isClosed".equals(name)) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        });
     }
 
     private static List<Object> indexRow(String name, String columns, String uniqueness, String indexType) {
@@ -1000,11 +2278,174 @@ class DamengAgentMetadataTest {
         }
     }
 
+    private static void setLegacyJdbcMetadata(DamengAgent agent, boolean value) {
+        try {
+            Field field = DamengAgent.class.getDeclaredField("legacyJdbcMetadata");
+            field.setAccessible(true);
+            field.set(agent, value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Unable to set legacy JDBC metadata mode", e);
+        }
+    }
+
+    private static Connection versionConnection(int majorVersion, String productVersion) {
+        DatabaseMetaData metadata = proxy(DatabaseMetaData.class, (method, args) -> switch (method.getName()) {
+            case "getDatabaseMajorVersion" -> majorVersion;
+            case "getDatabaseProductVersion" -> productVersion;
+            default -> defaultValue(method.getReturnType());
+        });
+        return proxy(Connection.class, (method, args) ->
+            "getMetaData".equals(method.getName()) ? metadata : defaultValue(method.getReturnType())
+        );
+    }
+
+    private static Connection legacyMetadataConnection(List<String> calls) {
+        DatabaseMetaData metadata = proxy(DatabaseMetaData.class, (method, args) -> {
+            switch (method.getName()) {
+                case "getSchemas":
+                    calls.add("getSchemas");
+                    return metadataResultSet(List.of(List.of("SYSDBA"), List.of("DBX_TEST")));
+                case "getTableTypes":
+                    return metadataResultSet(List.of(List.of("", "TABLE", "")));
+                case "getTables":
+                    Assertions.assertNull(args[3], "DM6 JDBC rejects non-null getTables types");
+                    calls.add("getTables:" + args[1]);
+                    return metadataResultSet(List.of(List.of("CONNECTION_SMOKE", "TABLE", "smoke table")));
+                case "getSearchStringEscape":
+                    return "\\";
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        });
+        return proxy(Connection.class, (method, args) -> {
+            if ("getMetaData".equals(method.getName())) {
+                return metadata;
+            }
+            if ("prepareStatement".equals(method.getName())) {
+                throw new AssertionError("Legacy metadata mode must not query DM8 catalog views: " + args[0]);
+            }
+            return defaultValue(method.getReturnType());
+        });
+    }
+
     private static Connection objectSourceConnection(List<String> params, String source) {
         return proxy(Connection.class, (method, args) -> {
             String name = method.getName();
             if ("prepareStatement".equals(name)) {
                 return metadataStatement(List.of(List.of(source)), params);
+            }
+            if ("close".equals(name)) {
+                return null;
+            }
+            if ("isClosed".equals(name)) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        });
+    }
+
+    /** 模拟 DM 实例未安装 DBMS_METADATA 系统包时的典型错误（[‑2207]/[‑3325]）。 */
+    private static SQLException missingDbmsMetadataPackageError() {
+        return new SQLException(
+            "[-2207]:无法解析的成员访问表达式[SF_DBMS_METADATA_RETURN_DDL]\n"
+                + "[-3325]:包/对象[DBMS_METADATA]解析失败",
+            "22000",
+            -3325
+        );
+    }
+
+    /** 模拟系统字典视图（ALL_SOURCE / SYS.SYSTEXTS 等）不存在的错误。 */
+    private static SQLException missingCatalogViewError(String view) {
+        return new SQLException("表或视图不存在: " + view, "42000", -2106);
+    }
+
+    /**
+     * DBMS_METADATA 失败时走系统字典降级的连接：ALL_VIEWS/ALL_TRIGGERS/ALL_SEQUENCES
+     * 固定返回一行样例数据；ALL_SOURCE / SYS.SYSTEXTS 的行与错误可通过参数定制。
+     */
+    private static Connection catalogFallbackConnection(
+        SQLException dbmsMetadataError,
+        List<String> sqls,
+        List<List<Object>> allSourceRows,
+        SQLException allSourceError,
+        List<List<Object>> systemTextRows,
+        SQLException systemTextError
+    ) {
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("prepareStatement".equals(name)) {
+                String sql = (String) args[0];
+                if (sqls != null) {
+                    sqls.add(sql);
+                }
+                if (sql.contains("DBMS_METADATA.GET_DDL")) {
+                    if (dbmsMetadataError != null) {
+                        return failingMetadataStatement(dbmsMetadataError);
+                    }
+                    return metadataStatement(List.of(List.of("CREATE OR REPLACE PROCEDURE placeholder")));
+                }
+                if (sql.contains("FROM ALL_SOURCE")) {
+                    if (allSourceError != null) {
+                        return failingMetadataStatement(allSourceError);
+                    }
+                    return metadataStatement(allSourceRows);
+                }
+                if (sql.contains("SYS.SYSTEXTS")) {
+                    if (systemTextError != null) {
+                        return failingMetadataStatement(systemTextError);
+                    }
+                    return metadataStatement(systemTextRows);
+                }
+                if (sql.contains("FROM ALL_VIEWS")) {
+                    return metadataStatement(List.of(List.of("SELECT 1 AS ID FROM DUAL")));
+                }
+                if (sql.contains("FROM ALL_TRIGGERS")) {
+                    return metadataStatement(List.of(List.of("CREATE TRIGGER \"APP\".\"TRG_USERS\" BEFORE INSERT ON \"APP\".\"USERS\" BEGIN NULL; END;")));
+                }
+                if (sql.contains("FROM ALL_SEQUENCES")) {
+                    return metadataStatement(List.of(List.of("1", "9999999999", "5", "N", "N", "20")));
+                }
+            }
+            if ("close".equals(name)) {
+                return null;
+            }
+            if ("isClosed".equals(name)) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        });
+    }
+
+    private static Connection typedRoutineFallbackConnection(
+        SQLException dbmsMetadataError,
+        List<String> sqls,
+        List<List<Object>> allSourceRows,
+        SQLException allSourceError,
+        List<List<Object>> systemTextRows,
+        String info1
+    ) {
+        int[] allSourceQueryCount = {0};
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("prepareStatement".equals(name)) {
+                String sql = (String) args[0];
+                sqls.add(sql);
+                if (sql.contains("DBMS_METADATA.GET_DDL")) {
+                    return failingMetadataStatement(dbmsMetadataError);
+                }
+                if (sql.contains("SELECT o.INFO1")) {
+                    return metadataStatement(List.of(List.of(info1)));
+                }
+                if (sql.contains("FROM ALL_SOURCE")) {
+                    if (allSourceError != null) {
+                        return failingMetadataStatement(allSourceError);
+                    }
+                    return metadataStatement(allSourceQueryCount[0]++ == 0 ? allSourceRows : List.of());
+                }
+                if (sql.contains("SYS.SYSTEXTS")) {
+                    return metadataStatement(systemTextRows);
+                }
+                return metadataStatement(List.of());
             }
             if ("close".equals(name)) {
                 return null;
@@ -1189,6 +2630,43 @@ class DamengAgentMetadataTest {
         });
     }
 
+    private static Connection databaseListConnection(
+        List<String> sqls,
+        String catalogError,
+        SQLException usersError
+    ) {
+        return proxy(Connection.class, (method, args) -> {
+            String name = method.getName();
+            if ("prepareStatement".equals(name)) {
+                String sql = (String) args[0];
+                sqls.add(sql);
+                if (sql.contains("SYS.SYSOBJECTS")) {
+                    if (catalogError != null) {
+                        return failingMetadataStatement(catalogError);
+                    }
+                    return metadataStatement(List.of(List.of("APP"), List.of("E2E_NORMAL"), List.of("SYSDBA")));
+                }
+                if (sql.contains("ALL_USERS")) {
+                    if (usersError != null) {
+                        return failingMetadataStatement(usersError);
+                    }
+                    return metadataStatement(List.of(List.of("E2E_NORMAL")));
+                }
+                throw new AssertionError("Unexpected SQL: " + sql);
+            }
+            if ("getMetaData".equals(name)) {
+                throw new AssertionError("listDatabases must not fall back to JDBC metadata getSchemas");
+            }
+            if ("close".equals(name)) {
+                return null;
+            }
+            if ("isClosed".equals(name)) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        });
+    }
+
     private static Connection schemaConnection(List<String> params) {
         return proxy(Connection.class, (method, args) -> {
             String name = method.getName();
@@ -1274,6 +2752,12 @@ class DamengAgentMetadataTest {
                     case "CHAR_USED" -> string(rows, index[0], 7);
                     case "COMMENTS", "COMMENT$", "REMARKS" -> string(rows, index[0], rows.get(index[0]).size() - 1);
                     case "COLNAME" -> string(rows, index[0], 0);
+                    case "MIN_VALUE" -> string(rows, index[0], 0);
+                    case "MAX_VALUE" -> string(rows, index[0], 1);
+                    case "INCREMENT_BY" -> string(rows, index[0], 2);
+                    case "CYCLE_FLAG" -> string(rows, index[0], 3);
+                    case "ORDER_FLAG" -> string(rows, index[0], 4);
+                    case "CACHE_SIZE" -> string(rows, index[0], 5);
                     default -> null;
                 };
             }

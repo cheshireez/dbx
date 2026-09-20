@@ -16,16 +16,18 @@ export interface ExplainPlanNode {
   children: ExplainPlanNode[];
 }
 
+export type ExplainPlanDatabaseType = "mysql" | "postgres" | "dameng" | "questdb" | "doris" | "oracle" | "oceanbase-oracle" | "sqlserver";
+
 export interface ParsedExplainPlan {
-  databaseType: "mysql" | "postgres" | "dameng" | "questdb" | "oracle" | "sqlserver";
+  databaseType: ExplainPlanDatabaseType;
   raw: unknown;
   nodes: ExplainPlanNode[];
 }
 
 export type BuildExplainSqlResult = { ok: true; sql: string } | { ok: false; reason: "unsupported" | "empty" | "unsafe" };
 
-const SUPPORTED_EXPLAIN_TYPES = new Set<DatabaseType>(["mysql", "postgres", "dameng", "questdb", "oracle", "sqlserver"]);
-export function supportsExplainPlan(databaseType?: DatabaseType): databaseType is "mysql" | "postgres" | "dameng" | "questdb" | "oracle" | "sqlserver" {
+const SUPPORTED_EXPLAIN_TYPES = new Set<DatabaseType>(["mysql", "postgres", "dameng", "questdb", "doris", "oracle", "oceanbase-oracle", "sqlserver"]);
+export function supportsExplainPlan(databaseType?: DatabaseType): databaseType is ExplainPlanDatabaseType {
   return !!databaseType && supportsDatabaseFeature(databaseType, "sqlExplain") && SUPPORTED_EXPLAIN_TYPES.has(databaseType);
 }
 
@@ -34,13 +36,17 @@ export function buildExplainSql(databaseType: DatabaseType | undefined, sql: str
   return api.buildExplainSql({ databaseType, sql, format, analyze }) as Promise<BuildExplainSqlResult>;
 }
 
-export function parseExplainResult(databaseType: "mysql" | "postgres" | "dameng" | "questdb" | "sqlserver", result: QueryResult): ParsedExplainPlan {
+export function parseExplainResult(databaseType: ExplainPlanDatabaseType, result: QueryResult): ParsedExplainPlan {
   if (databaseType === "dameng") {
     return parseDamengExplain(result);
   } else if (databaseType === "questdb") {
     return parseQuestdbExplain(result);
+  } else if (databaseType === "doris") {
+    return parseDorisExplain(result);
   } else if (databaseType === "sqlserver") {
     return parseSqlServerExplain(result);
+  } else if (databaseType === "oceanbase-oracle") {
+    return parseOceanbaseOracleExplain(result);
   }
   const raw = parseExplainCell(result.rows[0]?.[0]);
   const nodes = databaseType === "postgres" ? parsePostgresExplain(raw) : parseMysqlExplain(raw);
@@ -584,6 +590,38 @@ function parseExplainCell(value: unknown): unknown {
   }
 }
 
+function parseOceanbaseOracleExplain(result: QueryResult): ParsedExplainPlan {
+  // OceanBase JDBC returns one line of the JSON document per Query Plan row.
+  const text = result.rows.map((row) => String(row[0] ?? "")).join("\n");
+  const raw = parseExplainCell(text);
+  const root = objectValue(raw);
+  return { databaseType: "oceanbase-oracle", raw, nodes: root ? [parseOceanbaseOracleNode(root, "0")] : [] };
+}
+
+function parseOceanbaseOracleNode(plan: Record<string, unknown>, fallbackId: string): ExplainPlanNode {
+  const nodeType = stringValue(plan.OPERATOR)?.trim() || "Plan";
+  const relation = stringValue(plan.NAME)?.trim() || undefined;
+  const children = Object.entries(plan)
+    .filter(([key, value]) => /^CHILD_\d+$/.test(key) && objectValue(value))
+    .sort(([left], [right]) => Number(left.slice(6)) - Number(right.slice(6)))
+    .map(([key, value]) => parseOceanbaseOracleNode(objectValue(value)!, `${fallbackId}.${key.slice(6)}`));
+  const estimatedTime = numberLike(plan["EST.TIME(us)"]);
+  const details = Object.entries(plan)
+    .filter(([key, value]) => !["ID", "OPERATOR", "NAME", "EST.ROWS", "EST.TIME(us)", "COST"].includes(key) && !/^CHILD_\d+$/.test(key) && value !== null)
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+  if (estimatedTime !== undefined) details.unshift(`Estimated time: ${estimatedTime} µs`);
+  return {
+    id: numberLike(plan.ID) || fallbackId,
+    title: relation && relation !== nodeType ? `${nodeType} on ${relation}` : nodeType,
+    nodeType,
+    relation,
+    cost: numberLike(plan.COST),
+    rows: numberLike(plan["EST.ROWS"]),
+    details,
+    children,
+  };
+}
+
 // ── DM (达梦) tabular explain parser ──────────────────────────────────
 
 interface DamengExplainRow {
@@ -871,6 +909,29 @@ function parseQuestdbExplain(result: QueryResult): ParsedExplainPlan {
     return node;
   });
   return { databaseType: "questdb", raw: result, nodes };
+}
+
+// ── Doris explain parser ────────────────────────────────────────────
+function parseDorisExplain(result: QueryResult): ParsedExplainPlan {
+  const lines = result.rows.flatMap((row) => String(row[0] ?? "").split(/\r?\n/));
+  const raw = lines.join("\n");
+  const nodes = lines
+    .filter((line) => line.trim().length > 0)
+    .map((line, index): ExplainPlanNode => {
+      const text = line.trim();
+      return {
+        id: `plan_${index}`,
+        title: text,
+        nodeType: "Plan",
+        relation: "",
+        index: String(index),
+        cost: undefined,
+        rows: undefined,
+        details: [text],
+        children: [],
+      };
+    });
+  return { databaseType: "doris", raw, nodes };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────

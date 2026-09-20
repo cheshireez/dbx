@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { orderItemsByPinnedTreeNodeOrder, removePinnedTreeNodesFromOrder, treeNodePinIdentity, treeNodePinKey } from "@/lib/app/pinnedItems";
-import { buildObjectBrowserRows, canonicalizeObjectBrowserPinnedTreeNodeIdentity, objectBrowserRowLegacyPinnedTreeNodeIds, objectBrowserRowMatchesPinnedTreeNode, sortObjectBrowserRows, type ObjectBrowserRow } from "@/lib/table/objectBrowserRows";
+import { buildMongoObjectBrowserRows, buildObjectBrowserRows, canonicalizeObjectBrowserPinnedTreeNodeIdentity, objectBrowserRowLegacyPinnedTreeNodeIds, objectBrowserRowMatchesPinnedTreeNode, sortObjectBrowserRows, type ObjectBrowserRow } from "@/lib/table/objectBrowserRows";
 import type { TreeNode } from "@/types/database";
 
 describe("buildObjectBrowserRows", () => {
@@ -24,6 +24,20 @@ describe("buildObjectBrowserRows", () => {
     });
 
     expect(rows[0]?.schema).toBeUndefined();
+  });
+
+  it("preserves nullable view validity in browser rows", () => {
+    const rows = buildObjectBrowserRows({
+      objects: [
+        { name: "valid_view", object_type: "VIEW", valid: true },
+        { name: "invalid_view", object_type: "VIEW", valid: false },
+        { name: "unknown_view", object_type: "VIEW", valid: null },
+      ],
+      database: "app",
+      fallbackSchema: "app",
+    });
+
+    expect(rows.map((row) => row.valid)).toEqual([true, false, null]);
   });
 });
 
@@ -117,5 +131,34 @@ describe("Object Browser pinned ordering", () => {
     };
     expect(objectBrowserRowMatchesPinnedTreeNode(routineRow, treeNodePinIdentity(routineNode), context)).toBe(false);
     expect(objectBrowserRowMatchesPinnedTreeNode(routineRow, treeNodePinIdentity({ ...routineNode, id: "conn:app:public:functions:run:integer", label: "run(integer)", signature: "integer" }), context)).toBe(true);
+  });
+});
+
+describe("buildMongoObjectBrowserRows", () => {
+  it("maps collection kinds and keeps collection names searchable", () => {
+    const rows = buildMongoObjectBrowserRows({
+      collections: [
+        { name: "users", kind: "collection" },
+        { name: "active_users", kind: "view" },
+        { name: "metrics", kind: "timeseries" },
+      ],
+      database: "app",
+    });
+
+    expect(rows.map((row) => ({ name: row.name, type: row.type, collectionKind: row.collectionKind }))).toEqual([
+      { name: "users", type: "TABLE", collectionKind: "collection" },
+      { name: "active_users", type: "VIEW", collectionKind: "view" },
+      { name: "metrics", type: "TABLE", collectionKind: "timeseries" },
+    ]);
+  });
+
+  it("preserves distinct MongoDB collection identifiers verbatim", () => {
+    const rows = buildMongoObjectBrowserRows({
+      collections: [{ name: " users " }, { name: "users" }, { name: " " }, { name: "" }],
+      database: "app",
+    });
+
+    expect(rows.map((row) => row.name)).toEqual([" users ", "users", " "]);
+    expect(new Set(rows.map((row) => row.id))).toHaveLength(3);
   });
 });

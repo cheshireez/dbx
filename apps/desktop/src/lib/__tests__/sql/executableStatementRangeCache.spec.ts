@@ -1,6 +1,14 @@
-import { Text } from "@codemirror/state";
+import { ChangeSet, Text } from "@codemirror/state";
 import { describe, expect, it, vi } from "vitest";
-import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt, type ExecutableStatementRangeParser } from "@/lib/sql/executableStatementRangeCache";
+import {
+  executableStatementRangeAtCursor,
+  executableStatementRangeCacheForDoc,
+  executableStatementRangeStartingAt,
+  mapStatementGutterStartIndex,
+  statementGutterStartIndexForCache,
+  statementGutterStartIndexHasStartAt,
+  type ExecutableStatementRangeParser,
+} from "@/lib/sql/executableStatementRangeCache";
 
 describe("executableStatementRangeCacheForDoc", () => {
   it("tracks MongoDB commands for current-statement framing", () => {
@@ -37,6 +45,24 @@ describe("executableStatementRangeCacheForDoc", () => {
     expect(executableStatementRangeStartingAt(cache, secondStatementLine.from)?.sql).toBe("SELECT *\nFROM menus AS mn\nLIMIT 100");
   });
 
+  it("only exposes the routine start as executable when a MySQL procedure contains a CASE expression", () => {
+    const sql = [
+      "CREATE PROCEDURE p_case()",
+      "BEGIN",
+      "  INSERT INTO audit_log (status_text)",
+      "  SELECT CASE WHEN active = 1 THEN 'active' ELSE 'inactive' END;",
+      "  CASE WHEN active = 1 THEN SET @status_code = 1; ELSE SET @status_code = 0; END CASE;",
+      "  DELETE FROM stale_rows WHERE expires_at < NOW();",
+      "END;",
+    ].join("\n");
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+
+    expect(executableStatementRangeStartingAt(cache, doc.line(1).from)?.sql).toBe(sql.slice(0, -1));
+    expect(executableStatementRangeStartingAt(cache, doc.line(6).from)).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, doc.line(6).from + 4)?.sql).toBe(sql.slice(0, -1));
+  });
+
   it("keeps MyBatis parameters in a Kingbase gutter execution range", () => {
     const sql = ["SELECT sum(nvl(a.medfee_sumamt, 0)) AS medfee_sumamt, a.insutype", "FROM yd_org_decla_detail a", "WHERE a.busin_type = '1' AND a.clr_ym = #{ym}", "GROUP BY a.clr_ym, a.insutype;"].join("\n");
     const doc = Text.of(sql.split("\n"));
@@ -67,12 +93,45 @@ describe("executableStatementRangeCacheForDoc", () => {
     expect(executableStatementRangeStartingAt(cache, doc.line(5).from)).toBeNull();
   });
 
-  it("does not resolve gutter run buttons when non-whitespace precedes the statement on the same line", () => {
-    const doc = Text.of(["/* comment */ SELECT 1;"]);
+  it.each(["/*& tenant:'gdx' */", "/*&tenant:mctest*/", "/*+ MAX_EXECUTION_TIME(1000) */", "/*@global:true*/", "/*proxy*/"])("resolves the SQL line after a preserved leading directive for gutter execution: %s", (directive) => {
+    const sql = `SELECT 0;\n${directive}\nSELECT 1;`;
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+
+    expect(executableStatementRangeStartingAt(cache, doc.line(3).from)?.sql).toBe(`${directive}\nSELECT 1`);
+  });
+
+  it("keeps a same-line tenant hint in the gutter execution range", () => {
+    const sql = "/*& tenant:'gdx' */ SELECT\n*\nFROM table";
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+
+    expect(executableStatementRangeStartingAt(cache, doc.line(1).from)?.sql).toBe(sql);
+  });
+
+  it("treats a SQL Server temporary table after a hint as executable content", () => {
+    const sql = "/*+ hint */\n#temporary_table";
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, "sqlserver");
+
+    expect(executableStatementRangeStartingAt(cache, doc.line(2).from)?.sql).toBe(sql);
+  });
+
+  it("does not attach ordinary leading block comments to gutter execution", () => {
+    const doc = Text.of(["/* comment */", "SELECT 1;", "/* comment only */"]);
     const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
 
     expect(executableStatementRangeStartingAt(cache, doc.line(1).from)).toBeNull();
-    expect(executableStatementRangeStartingAt(cache, doc.toString().indexOf("SELECT"))?.sql).toBe("SELECT 1");
+    expect(executableStatementRangeStartingAt(cache, doc.line(2).from)?.sql).toBe("SELECT 1");
+    expect(executableStatementRangeStartingAt(cache, doc.line(3).from)).toBeNull();
+  });
+
+  it("resolves a same-line leading TDSQL directive for gutter execution", () => {
+    const sql = "/*sets:allsets */ SELECT 1;";
+    const doc = Text.of([sql]);
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+
+    expect(executableStatementRangeStartingAt(cache, doc.line(1).from)?.sql).toBe(sql.slice(0, -1));
   });
 
   it("resolves the current statement from a cursor inside a continuation line", () => {
@@ -154,12 +213,13 @@ describe("executableStatementRangeCacheForDoc", () => {
     expect(executableStatementRangeAtCursor(cache, doc.line(4).from)).toBeNull();
   });
 
-  it("resolves SQL after a leading block comment on the same line", () => {
-    const doc = Text.of(["/* comment */ SELECT 1;"]);
+  it("preserves a same-line TDSQL directive while ignoring a cursor inside its comment", () => {
+    const sql = "/*sets:allsets */ SELECT 1;";
+    const doc = Text.of([sql]);
     const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
 
-    expect(executableStatementRangeAtCursor(cache, doc.toString().indexOf("SELECT"))?.sql).toBe("SELECT 1");
-    expect(executableStatementRangeAtCursor(cache, doc.toString().indexOf("comment"))).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, sql.indexOf("SELECT"))?.sql).toBe(sql.slice(0, -1));
+    expect(executableStatementRangeAtCursor(cache, sql.indexOf("sets"))).toBeNull();
   });
 
   it("rebuilds the cache when the document instance changes", () => {
@@ -183,5 +243,35 @@ describe("executableStatementRangeCacheForDoc", () => {
 
     expect(postgres).not.toBe(mysql);
     expect(parse).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("statementGutterStartIndex", () => {
+  it("derives membership from both statement starts and executable line starts", () => {
+    const doc = Text.of(["/*+ hint */", "SELECT 1;", "", "SELECT 2;"]);
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+    const index = statementGutterStartIndexForCache(cache);
+
+    // First statement: executable start lands on the directive's following line.
+    expect(statementGutterStartIndexHasStartAt(index, doc.line(2).from)).toBe(true);
+    expect(statementGutterStartIndexHasStartAt(index, doc.line(4).from)).toBe(true);
+    expect(statementGutterStartIndexHasStartAt(index, doc.line(3).from)).toBe(false);
+  });
+
+  it("shifts start positions through insertions and deletions", () => {
+    const doc = Text.of(["SELECT 1;", "SELECT 2;"]);
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+    const index = statementGutterStartIndexForCache(cache);
+    const secondLineStart = doc.line(2).from;
+    expect(statementGutterStartIndexHasStartAt(index, secondLineStart)).toBe(true);
+
+    const header = "-- lead\n";
+    const afterInsert = mapStatementGutterStartIndex(index, ChangeSet.of({ from: 0, to: 0, insert: header }, doc.length));
+    expect(statementGutterStartIndexHasStartAt(afterInsert, secondLineStart)).toBe(false);
+    expect(statementGutterStartIndexHasStartAt(afterInsert, secondLineStart + header.length)).toBe(true);
+
+    const afterDelete = mapStatementGutterStartIndex(index, ChangeSet.of({ from: 0, to: "SELECT 1;\n".length, insert: "" }, doc.length));
+    expect(statementGutterStartIndexHasStartAt(afterDelete, secondLineStart - "SELECT 1;\n".length)).toBe(true);
+    expect(statementGutterStartIndexHasStartAt(afterDelete, 0)).toBe(true);
   });
 });

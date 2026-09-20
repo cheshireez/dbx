@@ -22,6 +22,10 @@ test("external SQL saves persist their selected data source before closing", () 
   assert.ok(write >= 0);
   assert.ok(write < remember);
   assert.ok(remember < close);
+  assert.ok(source.includes("catalog: tab.catalog"));
+  // The schema is part of the saved target too: without it a reopened file lands
+  // on the connection default and sidebar locate misses the table (issue #7648).
+  assert.ok(source.includes("schema: tab.schema"));
 });
 
 test("external SQL open entry points restore a saved data source", () => {
@@ -30,15 +34,31 @@ test("external SQL open entry points restore a saved data source", () => {
   const startupTabOpen = startupOpen.indexOf("queryStore.openExternalSqlFile");
   assert.ok(startupResolve >= 0);
   assert.ok(startupResolve < startupTabOpen);
+  assert.ok(startupOpen.includes("snapshot.version, target.catalog, target.schema"));
 
   const panelOpen = functionSource(sqlFilePanelSource, "async function openFile", "function executeFile");
   const panelResolve = panelOpen.indexOf("resolveExternalSqlFileTarget");
   const panelTabOpen = panelOpen.indexOf("queryStore.openExternalSqlFile");
   assert.ok(panelResolve >= 0);
   assert.ok(panelResolve < panelTabOpen);
+  assert.ok(panelOpen.includes("snapshot.version, target.catalog, target.schema"));
 
   const pickerOpen = functionSource(appSource, "async function openSqlFile()", "async function importResultArchive");
   assert.ok(pickerOpen.includes("applyExternalSqlFileTarget(tab, sqlPath)"));
+});
+
+test("external SQL catalog changes persist their complete target", () => {
+  const source = functionSource(appSource, "function changeActiveCatalog", "async function setActiveDatabaseAsDefault");
+  assert.ok(source.includes("queryStore.updateCatalog(tab.id, catalog, database)"));
+  assert.ok(source.includes("rememberExternalSqlFileTarget"));
+  assert.ok(source.includes("{ connectionId: tab.connectionId, database, catalog, schema: tab.schema }"));
+});
+
+test("external SQL schema changes persist their complete target", () => {
+  const source = functionSource(appSource, "function changeActiveSchema", "function openGitHub");
+  assert.ok(source.includes("queryStore.updateSchema(tab.id, schema)"));
+  assert.ok(source.includes("rememberExternalSqlFileTarget"));
+  assert.ok(source.includes("{ connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog, schema }"));
 });
 
 test("external SQL overwrite and recreate actions keep checked-write preconditions", () => {

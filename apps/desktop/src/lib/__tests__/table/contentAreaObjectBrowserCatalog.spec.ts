@@ -5,7 +5,7 @@ const contentAreaSource = readFileSync(new URL("../../../components/layout/Conte
 const connectionTreeSource = readFileSync(new URL("../../../components/sidebar/ConnectionTree.vue", import.meta.url), "utf8");
 const ddlViewDialogSource = readFileSync(new URL("../../../components/objects/DdlViewDialog.vue", import.meta.url), "utf8");
 const objectBrowserSource = readFileSync(new URL("../../../components/objects/ObjectBrowser.vue", import.meta.url), "utf8");
-const fetchTableDdlSource = objectBrowserSource.match(/async function fetchTableDdl\(\)[\s\S]*?(?=\nasync function fetchTableColumns\()/)?.[0] ?? "";
+const fetchTableDdlSource = objectBrowserSource.match(/async function fetchTableDdl(?:\([^)]*\))?[\s\S]*?(?=\nasync function fetchTableColumns\()/)?.[0] ?? "";
 const exportStructureSource = objectBrowserSource.match(/async function exportStructure\([\s\S]*?(?=\nasync function exportDataLegacy\()/)?.[0] ?? "";
 
 function openingTag(source: string, componentName: string): string {
@@ -36,8 +36,8 @@ describe("ContentArea object browser refresh wiring", () => {
   });
 
   it("exposes object and active table-info reloads as refresh", () => {
-    expect(objectBrowserSource).toMatch(/function refresh\(\): boolean \{\s+void reload\(\);\s+void refreshActiveTableInfo\(\);\s+return true;\s+\}/);
-    expect(objectBrowserSource).toContain("defineExpose({ focusSearch, refresh });");
+    expect(objectBrowserSource).toMatch(/function refresh\(\): boolean \{\s+void reload\(\{ preserveExistingRows: true \}\);\s+void refreshActiveTableInfo\(\);\s+return true;\s+\}/);
+    expect(objectBrowserSource).toContain("defineExpose({ focusSearch, refresh, matchesRefreshScope });");
   });
 
   it("shows the configured content refresh shortcut on the refresh button", () => {
@@ -47,12 +47,13 @@ describe("ContentArea object browser refresh wiring", () => {
 });
 
 describe("ObjectBrowser DDL API boundaries", () => {
-  it("uses display DDL for the table information panel", () => {
-    expect(fetchTableDdlSource).toMatch(/api\.getTableDisplayDdl\([\s\S]*?props\.catalog\);/);
+  it("uses the cached display DDL boundary for the table information panel", () => {
+    expect(fetchTableDdlSource).toMatch(/loadObjectDdl\(tableMetadataRequest\(row\), \{ force \}\)/);
+    expect(objectBrowserSource).toMatch(/function tableMetadataRequest\([\s\S]*?catalog: props\.catalog/);
   });
 
   it("keeps structure exports on the portable base DDL", () => {
-    expect(exportStructureSource).toMatch(/api\.getTableDdl\([\s\S]*?props\.catalog\);/);
+    expect(exportStructureSource).toMatch(/api\.getTableDdl\([\s\S]*?props\.catalog, true\);/);
     expect(exportStructureSource).not.toContain("api.getTableDisplayDdl(");
   });
 });

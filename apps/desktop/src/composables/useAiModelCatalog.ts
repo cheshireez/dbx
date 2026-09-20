@@ -53,6 +53,7 @@ function configSignature(config: AiConfigItem): string {
     authMethod: config.authMethod,
     apiStyle: config.apiStyle,
     proxyEnabled: config.proxyEnabled ?? false,
+    skipTlsVerify: config.skipTlsVerify ?? false,
     contextWindow: config.contextWindow ?? null,
     codexCliPath: config.codexCliPath ?? null,
     claudeCodeCliPath: config.claudeCodeCliPath ?? null,
@@ -60,6 +61,7 @@ function configSignature(config: AiConfigItem): string {
     opencodeCliPath: config.opencodeCliPath ?? null,
     cursorCliPath: config.cursorCliPath ?? null,
     codebuddyCliPath: config.codebuddyCliPath ?? null,
+    qoderCliPath: config.qoderCliPath ?? null,
     connectionFingerprint: fingerprint(
       JSON.stringify({
         apiKey: config.apiKey,
@@ -71,6 +73,7 @@ function configSignature(config: AiConfigItem): string {
         opencodeCliEnv: sortedRecord(config.opencodeCliEnv),
         cursorCliEnv: sortedRecord(config.cursorCliEnv),
         codebuddyCliEnv: sortedRecord(config.codebuddyCliEnv),
+        qoderCliEnv: sortedRecord(config.qoderCliEnv),
       }),
     ),
   });

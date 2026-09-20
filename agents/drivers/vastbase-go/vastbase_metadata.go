@@ -28,10 +28,12 @@ var postgresDataTypes = []string{
 }
 
 type vastbaseMode struct {
-	compatibilityMode string
-	postgresCatalog   bool
-	mysqlCompat       bool
-	sqlServerIdentity bool
+	compatibilityMode         string
+	compatibilityModeRaw      string
+	postgresCatalog           bool
+	mysqlCompat               bool
+	sqlServerIdentity         bool
+	supportsDisableConstraint bool
 }
 
 type databaseInfo struct {
@@ -45,11 +47,13 @@ type tableInfo struct {
 }
 
 type objectInfo struct {
-	Name       string  `json:"name"`
-	ObjectType string  `json:"object_type"`
-	Schema     string  `json:"schema"`
-	Comment    *string `json:"comment"`
-	Valid      *bool   `json:"valid,omitempty"`
+	Name           string  `json:"name"`
+	ObjectType     string  `json:"object_type"`
+	Schema         string  `json:"schema"`
+	Comment        *string `json:"comment"`
+	Valid          *bool   `json:"valid,omitempty"`
+	CustomTypeKind *string `json:"custom_type_kind,omitempty"`
+	HasMembers     *bool   `json:"has_members,omitempty"`
 }
 
 type metadataListConstraints struct {
@@ -62,6 +66,7 @@ type metadataListConstraints struct {
 type columnInfo struct {
 	Name                   string  `json:"name"`
 	DataType               string  `json:"data_type"`
+	ResolvedSchema         *string `json:"resolved_schema,omitempty"`
 	FullDataType           string  `json:"-"`
 	IsNullable             bool    `json:"is_nullable"`
 	ColumnDefault          *string `json:"column_default"`
@@ -111,64 +116,27 @@ type foreignKeyInfo struct {
 	RefColumn string `json:"ref_column"`
 }
 
+type constraintInfo struct {
+	Name              string   `json:"name"`
+	ConstraintType    string   `json:"constraint_type"`
+	Definition        string   `json:"definition"`
+	Columns           []string `json:"columns"`
+	RefSchema         *string  `json:"ref_schema,omitempty"`
+	RefTable          *string  `json:"ref_table,omitempty"`
+	RefColumns        []string `json:"ref_columns"`
+	MatchType         *string  `json:"match_type,omitempty"`
+	OnUpdate          *string  `json:"on_update,omitempty"`
+	OnDelete          *string  `json:"on_delete,omitempty"`
+	Deferrable        bool     `json:"deferrable"`
+	InitiallyDeferred bool     `json:"initially_deferred"`
+	Enabled           bool     `json:"enabled"`
+	Valid             bool     `json:"valid"`
+}
+
 type triggerInfo struct {
 	Name   string `json:"name"`
 	Event  string `json:"event"`
 	Timing string `json:"timing"`
-}
-
-func detectVastbaseMode(db *sql.DB, configuredMySQL bool) vastbaseMode {
-	if configuredMySQL {
-		return vastbaseMode{compatibilityMode: "mysql", mysqlCompat: true}
-	}
-	mode := vastbaseMode{compatibilityMode: detectDatabaseMode(db)}
-	mode.postgresCatalog = !catalogExists(db, "sys_catalog.sys_namespace") && catalogExists(db, "pg_catalog.pg_namespace")
-	if !mode.postgresCatalog {
-		if mode.compatibilityMode != "" {
-			mode.mysqlCompat = mode.compatibilityMode == "mysql"
-		} else {
-			mode.mysqlCompat = supportsBacktickIdentifiers(db)
-		}
-		mode.sqlServerIdentity = !mode.mysqlCompat && catalogExists(db, "sys.identity_columns")
-	}
-	return mode
-}
-
-func catalogExists(db *sql.DB, catalog string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	rows, err := db.QueryContext(ctx, "SELECT 1 FROM "+catalog+" WHERE 1 = 0")
-	if err != nil {
-		return false
-	}
-	return rows.Close() == nil
-}
-
-func detectMySQLCompatMode(db *sql.DB) bool {
-	if databaseMode := detectDatabaseMode(db); databaseMode != "" {
-		return databaseMode == "mysql"
-	}
-	return supportsBacktickIdentifiers(db)
-}
-
-func detectDatabaseMode(db *sql.DB) string {
-	var databaseMode string
-	switch err := db.QueryRow("SELECT setting FROM sys_catalog.sys_settings WHERE LOWER(name) = 'database_mode'").Scan(&databaseMode); {
-	case err == nil:
-		// Treat database_mode as authoritative when the server exposes it. This
-		// avoids misclassifying Oracle-compatible servers that also publish
-		// sql_mode for MySQL syntax toggles such as ANSI_QUOTES.
-		return strings.ToLower(strings.TrimSpace(databaseMode))
-	case errors.Is(err, sql.ErrNoRows):
-		return ""
-	default:
-		return ""
-	}
-}
-
-func supportsBacktickIdentifiers(db *sql.DB) bool {
-	var value int
-	return db.QueryRow("SELECT 1 AS `dbx_identifier_probe`").Scan(&value) == nil
 }
 
 func (s *server) identifierQuote() string {
@@ -192,8 +160,9 @@ func (s *server) connectionInfo() (map[string]any, error) {
 	}
 	return map[string]any{
 		"database": database, "username": username, "version": version, "schema": schema,
-		"compatibilityMode": s.mode.compatibilityMode, "mysql_compat_mode": s.mode.mysqlCompat,
-		"identifierQuote": s.identifierQuote(),
+		"compatibilityMode": s.mode.compatibilityMode, "compatibilityModeRaw": s.mode.compatibilityModeRaw,
+		"mysql_compat_mode": s.mode.mysqlCompat,
+		"identifierQuote":   s.identifierQuote(),
 		"databaseInfo": map[string]string{
 			"productName":            "Vastbase",
 			"productVersion":         version,
@@ -353,20 +322,725 @@ LIMIT 1`, catalog, prefix, catalog, prefix, quoteLiteral(effective), quoteLitera
 	return nullStringPtr(comment), nil
 }
 
+// listCustomTypes lists user-defined types visible in the given schema.
+//
+// Only explicitly created types are returned: base types (b), standalone
+// composite types (c), domains (d), enums (e), ranges (r) and multiranges (m).
+// Relation auto-generated row types (table/view/materialized view/foreign
+// table/partitioned table) are excluded via `typrelid = 0 OR relkind = 'c'`,
+// and array companion types are excluded via `typelem = 0`. MySQL
+// compatibility mode has no pg_type catalog contract and returns nothing.
+//
+// The comment join scopes description entries to the type catalog itself via
+// a regclass cast. `t.tableoid` cannot be used because Kingbase's native
+// sys_type catalog has no tableoid system column. Kingbase and Vastbase both
+// key COMMENT ON TYPE entries with the pg_type identity (oid 1247) even when
+// the server is in sys_catalog compatibility mode, so the filter always
+// references pg_catalog.pg_type.
+func (s *server) listCustomTypes(schema string) ([]objectInfo, error) {
+	if s.mode.mysqlCompat {
+		return []objectInfo{}, nil
+	}
+	catalog := "sys_catalog"
+	if s.mode.postgresCatalog {
+		catalog = "pg_catalog"
+	}
+	prefix := catalogPrefix(catalog)
+	query := fmt.Sprintf(`SELECT t.typname, d.description, t.typtype::text,
+CASE
+  WHEN t.typtype = 'c' THEN EXISTS (
+    SELECT 1 FROM %s.%s_attribute a
+    WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+  )
+  WHEN t.typtype = 'e' THEN EXISTS (
+    SELECT 1 FROM %s.%s_enum e WHERE e.enumtypid = t.oid
+  )
+  ELSE false
+END AS has_members
+FROM %s.%s_type t
+JOIN %s.%s_namespace n ON n.oid = t.typnamespace
+LEFT JOIN %s.%s_class c ON c.oid = t.typrelid
+LEFT JOIN %s.%s_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_type'::regclass AND d.objsubid = 0
+WHERE n.nspname = %s
+  AND t.typtype IN ('b','c','d','e','r','m')
+  AND t.typisdefined
+  AND t.typelem = 0
+  AND (t.typrelid = 0 OR c.relkind = 'c')
+  AND n.nspname <> 'pg_catalog'
+  AND n.nspname <> 'information_schema'
+  AND n.nspname NOT LIKE 'pg_toast%%'
+  AND n.nspname NOT LIKE 'pg_temp%%'
+ORDER BY t.typname`, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema))
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []objectInfo{}
+	for rows.Next() {
+		var name, kindCode string
+		var comment sql.NullString
+		var hasMembers bool
+		if err := rows.Scan(&name, &comment, &kindCode, &hasMembers); err != nil {
+			return nil, err
+		}
+		kind, ok := customTypeKindFromCode(kindCode)
+		if !ok {
+			continue
+		}
+		kindValue := string(kind)
+		result = append(result, objectInfo{Name: name, ObjectType: "TYPE", Schema: schema, Comment: nullStringPtr(comment), CustomTypeKind: &kindValue, HasMembers: &hasMembers})
+	}
+	return result, rows.Err()
+}
+
+func isSystemSchema(schema string) bool {
+	return schema == "pg_catalog" || schema == "information_schema" || strings.HasPrefix(schema, "pg_toast") || strings.HasPrefix(schema, "pg_temp")
+}
+
+type customTypeKind string
+
+const (
+	customTypeKindBase       customTypeKind = "base"
+	customTypeKindComposite  customTypeKind = "composite"
+	customTypeKindDomain     customTypeKind = "domain"
+	customTypeKindEnum       customTypeKind = "enum"
+	customTypeKindRange      customTypeKind = "range"
+	customTypeKindMultirange customTypeKind = "multirange"
+)
+
+type customTypeMember struct {
+	Name      string  `json:"name"`
+	DataType  string  `json:"dataType"`
+	Ordinal   int32   `json:"ordinal"`
+	Nullable  *bool   `json:"nullable,omitempty"`
+	Default   *string `json:"default,omitempty"`
+	Comment   *string `json:"comment,omitempty"`
+	EnumValue *string `json:"enumValue,omitempty"`
+}
+
+type customTypeDomainConstraint struct {
+	Name       string `json:"name"`
+	Definition string `json:"definition"`
+}
+
+type customTypeProperties struct {
+	BaseType                 *string                      `json:"baseType,omitempty"`
+	NotNull                  *bool                        `json:"notNull,omitempty"`
+	Default                  *string                      `json:"default,omitempty"`
+	Collation                *string                      `json:"collation,omitempty"`
+	DomainConstraints        []customTypeDomainConstraint `json:"domainConstraints"`
+	RangeSubtype             *string                      `json:"rangeSubtype,omitempty"`
+	RangeMultirangeName      *string                      `json:"rangeMultirangeName,omitempty"`
+	RangeCanonicalFunction   *string                      `json:"rangeCanonicalFunction,omitempty"`
+	RangeSubtypeDiffFunction *string                      `json:"rangeSubtypeDiffFunction,omitempty"`
+	RangeSubtypeOpclass      *string                      `json:"rangeSubtypeOpclass,omitempty"`
+	InputFunction            *string                      `json:"inputFunction,omitempty"`
+	OutputFunction           *string                      `json:"outputFunction,omitempty"`
+	ReceiveFunction          *string                      `json:"receiveFunction,omitempty"`
+	SendFunction             *string                      `json:"sendFunction,omitempty"`
+	AnalyzeFunction          *string                      `json:"analyzeFunction,omitempty"`
+	Internallength           *int32                       `json:"internallength,omitempty"`
+	PassedByValue            *bool                        `json:"passedByValue,omitempty"`
+	Alignment                *string                      `json:"alignment,omitempty"`
+	Storage                  *string                      `json:"storage,omitempty"`
+}
+
+type customTypeDdl struct {
+	SQL      string   `json:"sql"`
+	Complete bool     `json:"complete"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+type customTypeDetails struct {
+	Name       string               `json:"name"`
+	Schema     string               `json:"schema"`
+	Kind       customTypeKind       `json:"kind"`
+	Comment    *string              `json:"comment,omitempty"`
+	Members    []customTypeMember   `json:"members"`
+	Properties customTypeProperties `json:"properties"`
+	DDL        *customTypeDdl       `json:"ddl,omitempty"`
+}
+
+// customTypeCatalogQueries carries catalog-aware SQL fragments for type
+// details. Vastbase exposes pg_get_expr/pg_get_constraintdef under the sys_
+// prefix in system-catalog mode, so the function names follow the catalog.
+type customTypeCatalogQueries struct {
+	general                      string
+	enumMembers                  string
+	compositeMembers             string
+	domainBaseType               string
+	domainRenderedDefault        string
+	domainConstraints            string
+	rangeAttributes              string
+	rangeAttributesForMultirange string
+	rangeMultirange              string
+	collationName                string
+}
+
+// qualifiedCatalogTypeExpression keeps user-defined type references usable
+// outside the current search_path while retaining format_type's typmod output
+// for built-in pg_catalog types.
+func qualifiedCatalogTypeExpression(typeAlias, namespaceAlias, elementAlias, elementNamespaceAlias, oidExpression, typmodExpression string) string {
+	return fmt.Sprintf(`CASE
+  WHEN %s.typelem <> 0 AND %s.nspname <> 'pg_catalog'
+    THEN quote_ident(%s.nspname) || '.' || quote_ident(%s.typname) || '[]'
+  WHEN %s.nspname <> 'pg_catalog'
+    THEN quote_ident(%s.nspname) || '.' || quote_ident(%s.typname)
+  ELSE format_type(%s, %s)
+END`, typeAlias, elementNamespaceAlias, elementNamespaceAlias, elementAlias, namespaceAlias, namespaceAlias, typeAlias, oidExpression, typmodExpression)
+}
+
+func customTypeCatalogQueriesFor(catalog, prefix, schema, name string) customTypeCatalogQueries {
+	getExpr := prefix + "_get_expr"
+	getConstraintDef := prefix + "_get_constraintdef"
+	typeTable := catalog + "." + prefix + "_type"
+	namespaceTable := catalog + "." + prefix + "_namespace"
+	classTable := catalog + "." + prefix + "_class"
+	descriptionTable := catalog + "." + prefix + "_description"
+	procTable := catalog + "." + prefix + "_proc"
+	collationTable := catalog + "." + prefix + "_collation"
+	enumTable := catalog + "." + prefix + "_enum"
+	attributeTable := catalog + "." + prefix + "_attribute"
+	attrdefTable := catalog + "." + prefix + "_attrdef"
+	constraintTable := catalog + "." + prefix + "_constraint"
+	rangeTable := catalog + "." + prefix + "_range"
+	opclassTable := catalog + "." + prefix + "_opclass"
+	quotedSchema := quoteLiteral(schema)
+	quotedName := quoteLiteral(name)
+	compositeMemberType := qualifiedCatalogTypeExpression("at", "atn", "elem", "elem_n", "a.atttypid", "a.atttypmod")
+	domainBaseType := qualifiedCatalogTypeExpression("t", "n", "elem", "elem_n", "t.oid", "%[2]d::int4")
+	rangeSubtype := qualifiedCatalogTypeExpression("st", "stn", "elem", "elem_n", "r.rngsubtype", "NULL::integer")
+	return customTypeCatalogQueries{
+		general: fmt.Sprintf(`SELECT t.oid, t.typtype::text, t.typisdefined,
+t.typbasetype, t.typnotnull, t.typrelid, t.typelem, t.typcollation,
+t.typdefaultbin, t.typdefault, t.typlen, t.typbyval,
+t.typalign::text, t.typstorage::text, t.typtypmod,
+pi.proname, po.proname, pr.proname, ps.proname, pa.proname,
+d.description,
+CASE WHEN t.typrelid != 0 THEN (SELECT c.relkind::text FROM %s c WHERE c.oid = t.typrelid) END,
+CASE WHEN cl.oid IS NULL THEN NULL ELSE quote_ident(ncl.nspname) || '.' || quote_ident(cl.collname) END
+FROM %s t
+JOIN %s n ON n.oid = t.typnamespace
+LEFT JOIN %s d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_type'::regclass AND d.objsubid = 0
+LEFT JOIN %s pi ON pi.oid = t.typinput
+LEFT JOIN %s po ON po.oid = t.typoutput
+LEFT JOIN %s pr ON pr.oid = t.typreceive
+LEFT JOIN %s ps ON ps.oid = t.typsend
+LEFT JOIN %s pa ON pa.oid = t.typanalyze
+LEFT JOIN %s cl ON cl.oid = t.typcollation
+LEFT JOIN %s ncl ON ncl.oid = cl.collnamespace
+WHERE n.nspname = %s AND t.typname = %s`, classTable, typeTable, namespaceTable, descriptionTable, procTable, procTable, procTable, procTable, procTable, collationTable, namespaceTable, quotedSchema, quotedName),
+		enumMembers: fmt.Sprintf(`SELECT e.enumlabel, e.enumsortorder
+FROM %s e
+WHERE e.enumtypid = %%d ORDER BY e.enumsortorder`, enumTable),
+		compositeMembers: fmt.Sprintf(`SELECT a.attname, %s, a.attnum,
+NOT a.attnotnull, a.atthasdef, %s(ad.adbin, ad.adrelid), col_description(%%d, a.attnum)
+FROM %s a
+JOIN %s at ON at.oid = a.atttypid
+JOIN %s atn ON atn.oid = at.typnamespace
+LEFT JOIN %s elem ON elem.oid = at.typelem
+LEFT JOIN %s elem_n ON elem_n.oid = elem.typnamespace
+LEFT JOIN %s ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+WHERE a.attrelid = %%d AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, compositeMemberType, getExpr, attributeTable, typeTable, namespaceTable, typeTable, namespaceTable, attrdefTable),
+		domainBaseType: fmt.Sprintf(`SELECT %s
+FROM %s t
+JOIN %s n ON n.oid = t.typnamespace
+LEFT JOIN %s elem ON elem.oid = t.typelem
+LEFT JOIN %s elem_n ON elem_n.oid = elem.typnamespace
+WHERE t.oid = %%[1]d`, domainBaseType, typeTable, namespaceTable, typeTable, namespaceTable),
+		domainRenderedDefault: fmt.Sprintf(`SELECT %s(t.typdefaultbin, 0)
+FROM %s t WHERE t.oid = %%d`, getExpr, typeTable),
+		domainConstraints: fmt.Sprintf(`SELECT c.conname, %s(c.oid, true) FROM %s c WHERE c.contypid = %%d ORDER BY c.conname`, getConstraintDef, constraintTable),
+		rangeAttributes: fmt.Sprintf(`SELECT %s, quote_ident(ncan.nspname) || '.' || quote_ident(pcan.proname), quote_ident(ndiff.nspname) || '.' || quote_ident(pdiff.proname), quote_ident(nopc.nspname) || '.' || quote_ident(opc.opcname)
+FROM %s r
+JOIN %s st ON st.oid = r.rngsubtype
+JOIN %s stn ON stn.oid = st.typnamespace
+LEFT JOIN %s elem ON elem.oid = st.typelem
+LEFT JOIN %s elem_n ON elem_n.oid = elem.typnamespace
+LEFT JOIN %s pcan ON pcan.oid = r.rngcanonical
+LEFT JOIN %s pdiff ON pdiff.oid = r.rngsubdiff
+LEFT JOIN %s opc ON opc.oid = r.rngsubopc
+LEFT JOIN %s ncan ON ncan.oid = pcan.pronamespace
+LEFT JOIN %s ndiff ON ndiff.oid = pdiff.pronamespace
+LEFT JOIN %s nopc ON nopc.oid = opc.opcnamespace
+WHERE r.rngtypid = %%d`, rangeSubtype, rangeTable, typeTable, namespaceTable, typeTable, namespaceTable, procTable, procTable, opclassTable, namespaceTable, namespaceTable, namespaceTable),
+		rangeAttributesForMultirange: fmt.Sprintf(`SELECT %s, quote_ident(ncan.nspname) || '.' || quote_ident(pcan.proname), quote_ident(ndiff.nspname) || '.' || quote_ident(pdiff.proname), quote_ident(nopc.nspname) || '.' || quote_ident(opc.opcname)
+FROM %s r
+JOIN %s st ON st.oid = r.rngsubtype
+JOIN %s stn ON stn.oid = st.typnamespace
+LEFT JOIN %s elem ON elem.oid = st.typelem
+LEFT JOIN %s elem_n ON elem_n.oid = elem.typnamespace
+LEFT JOIN %s pcan ON pcan.oid = r.rngcanonical
+LEFT JOIN %s pdiff ON pdiff.oid = r.rngsubdiff
+LEFT JOIN %s opc ON opc.oid = r.rngsubopc
+LEFT JOIN %s ncan ON ncan.oid = pcan.pronamespace
+LEFT JOIN %s ndiff ON ndiff.oid = pdiff.pronamespace
+LEFT JOIN %s nopc ON nopc.oid = opc.opcnamespace
+WHERE r.rngmultitypid = %%d`, rangeSubtype, rangeTable, typeTable, namespaceTable, typeTable, namespaceTable, procTable, procTable, opclassTable, namespaceTable, namespaceTable, namespaceTable),
+		rangeMultirange: fmt.Sprintf(`SELECT mt.typname
+FROM %s r
+JOIN %s mt ON mt.oid = r.rngmultitypid
+WHERE r.rngtypid = %%d`, rangeTable, typeTable),
+		collationName: fmt.Sprintf(`SELECT quote_ident(ncl.nspname) || '.' || quote_ident(cl.collname) FROM %s cl JOIN %s ncl ON ncl.oid = cl.collnamespace WHERE cl.oid = %%d`, collationTable, namespaceTable),
+	}
+}
+
+// getTypeDetails returns read-only details of a user-defined type. MySQL
+// compatibility mode is explicitly unsupported instead of running PostgreSQL
+// catalog SQL against a MySQL-mode server.
+func (s *server) getTypeDetails(schema, name string) (*customTypeDetails, error) {
+	if s.mode.mysqlCompat {
+		return nil, errors.New("type details are not supported in MySQL compatibility mode")
+	}
+	schema = strings.TrimSpace(schema)
+	name = strings.TrimSpace(name)
+	if schema == "" || name == "" {
+		return nil, errors.New("schema and type name are required")
+	}
+	if isSystemSchema(schema) {
+		return nil, fmt.Errorf("system schema %s is not supported for custom type details", schema)
+	}
+	catalog := "sys_catalog"
+	if s.mode.postgresCatalog {
+		catalog = "pg_catalog"
+	}
+	prefix := catalogPrefix(catalog)
+	queries := customTypeCatalogQueriesFor(catalog, prefix, schema, name)
+
+	rows, err := s.metadataQuery(queries.general)
+	if err != nil {
+		return nil, fmt.Errorf("failed to locate custom type %s.%s: %w", schema, name, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("failed to read type %s.%s: %w", schema, name, err)
+		}
+		return nil, fmt.Errorf("custom type %s.%s does not exist", schema, name)
+	}
+	var oid, typbasetype, typrelid, typelem, typcollation int64
+	var typtype, typalign, typstorage string
+	var typisdefined, typnotnull, typbyval bool
+	var typdefaultbin, typdefault, inputFn, outputFn, receiveFn, sendFn, analyzeFn, comment, collname, relkind sql.NullString
+	var typlen sql.NullInt64
+	var typtypmod int64
+	if err := rows.Scan(&oid, &typtype, &typisdefined, &typbasetype, &typnotnull, &typrelid, &typelem, &typcollation, &typdefaultbin, &typdefault, &typlen, &typbyval, &typalign, &typstorage, &typtypmod, &inputFn, &outputFn, &receiveFn, &sendFn, &analyzeFn, &comment, &relkind, &collname); err != nil {
+		return nil, fmt.Errorf("failed to read type %s.%s: %w", schema, name, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if !typisdefined {
+		return nil, fmt.Errorf("custom type %s.%s is not fully defined", schema, name)
+	}
+	if typelem != 0 {
+		return nil, fmt.Errorf("custom type %s.%s is an array companion type", schema, name)
+	}
+	kind, ok := customTypeKindFromCode(typtype)
+	if !ok {
+		return nil, fmt.Errorf("custom type %s.%s is a pseudo type (typtype=%s)", schema, name, typtype)
+	}
+	if relkind.Valid && relkind.String != "" && relkind.String != "c" {
+		return nil, fmt.Errorf("%s.%s is the auto-generated row type of a relation, not an independent custom type", schema, name)
+	}
+
+	properties := customTypeCommonProperties(inputFn, outputFn, receiveFn, sendFn, analyzeFn, typlen, typbyval, typalign, typstorage)
+	properties.DomainConstraints = []customTypeDomainConstraint{}
+	details := &customTypeDetails{
+		Name:       name,
+		Schema:     schema,
+		Kind:       kind,
+		Comment:    nullStringPtr(comment),
+		Members:    []customTypeMember{},
+		Properties: properties,
+	}
+
+	var warnings []string
+	switch kind {
+	case customTypeKindEnum:
+		details.Members, err = s.customTypeEnumMembers(queries.enumMembers, oid)
+		if err != nil {
+			return nil, err
+		}
+	case customTypeKindComposite:
+		details.Members, err = s.customTypeCompositeMembers(queries.compositeMembers, typrelid)
+		if err != nil {
+			return nil, err
+		}
+	case customTypeKindDomain:
+		warnings = append(warnings, s.customTypeDomainAttributes(queries, &details.Properties, oid, typbasetype, typtypmod, typnotnull, typdefaultbin, typdefault, typcollation, collname)...)
+	case customTypeKindRange:
+		warnings = append(warnings, s.customTypeRangeAttributes(queries, &details.Properties, oid, false)...)
+	case customTypeKindMultirange:
+		warnings = append(warnings, s.customTypeRangeAttributes(queries, &details.Properties, oid, true)...)
+	case customTypeKindBase:
+	}
+	details.DDL = buildCustomTypeDDL(schema, name, kind, inputFn, &details.Members, &details.Properties, warnings)
+	return details, nil
+}
+
+func customTypeKindFromCode(code string) (customTypeKind, bool) {
+	switch code {
+	case "b":
+		return customTypeKindBase, true
+	case "c":
+		return customTypeKindComposite, true
+	case "d":
+		return customTypeKindDomain, true
+	case "e":
+		return customTypeKindEnum, true
+	case "r":
+		return customTypeKindRange, true
+	case "m":
+		return customTypeKindMultirange, true
+	default:
+		return "", false
+	}
+}
+
+func customTypeCommonProperties(inputFn, outputFn, receiveFn, sendFn, analyzeFn sql.NullString, typlen sql.NullInt64, typbyval bool, typalign, typstorage string) customTypeProperties {
+	properties := customTypeProperties{}
+	properties.InputFunction = nullStringPtr(inputFn)
+	properties.OutputFunction = nullStringPtr(outputFn)
+	properties.ReceiveFunction = nullStringPtr(receiveFn)
+	properties.SendFunction = nullStringPtr(sendFn)
+	properties.AnalyzeFunction = nullStringPtr(analyzeFn)
+	if typlen.Valid && typlen.Int64 > 0 {
+		value := int32(typlen.Int64)
+		properties.Internallength = &value
+	}
+	properties.PassedByValue = &typbyval
+	if typalign != "" {
+		properties.Alignment = &typalign
+	}
+	if typstorage != "" {
+		properties.Storage = &typstorage
+	}
+	return properties
+}
+
+func (s *server) customTypeEnumMembers(sqlTemplate string, oid int64) ([]customTypeMember, error) {
+	rows, err := s.metadataQuery(fmt.Sprintf(sqlTemplate, oid))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read enum values: %w", err)
+	}
+	defer rows.Close()
+	var members []customTypeMember
+	index := 0
+	for rows.Next() {
+		var label string
+		var sortOrder float64
+		if err := rows.Scan(&label, &sortOrder); err != nil {
+			return nil, err
+		}
+		// enumsortorder is float4; ALTER TYPE ... ADD VALUE BEFORE/AFTER can
+		// yield fractional values. Use the ORDER BY position for a unique key.
+		index++
+		members = append(members, customTypeMember{Ordinal: int32(index), EnumValue: &label})
+	}
+	return members, rows.Err()
+}
+
+func (s *server) customTypeCompositeMembers(sqlTemplate string, typrelid int64) ([]customTypeMember, error) {
+	rows, err := s.metadataQuery(fmt.Sprintf(sqlTemplate, typrelid, typrelid))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read composite fields: %w", err)
+	}
+	defer rows.Close()
+	var members []customTypeMember
+	for rows.Next() {
+		var member customTypeMember
+		var hasDefault bool
+		var comment sql.NullString
+		if err := rows.Scan(&member.Name, &member.DataType, &member.Ordinal, &member.Nullable, &hasDefault, &member.Default, &comment); err != nil {
+			return nil, err
+		}
+		if !hasDefault {
+			member.Default = nil
+		}
+		member.Comment = nullStringPtr(comment)
+		members = append(members, member)
+	}
+	return members, rows.Err()
+}
+
+func (s *server) customTypeDomainAttributes(queries customTypeCatalogQueries, properties *customTypeProperties, oid, typbasetype, typtypmod int64, typnotnull bool, typdefaultbin, typdefault sql.NullString, typcollation int64, collname sql.NullString) []string {
+	var warnings []string
+	if base := s.singleStringQuery(fmt.Sprintf(queries.domainBaseType, typbasetype, typtypmod)); base != "" {
+		properties.BaseType = &base
+	}
+	properties.NotNull = &typnotnull
+	defaultValue, defaultWarnings := resolveCustomTypeDomainDefault(typdefaultbin, typdefault, func() (string, error) {
+		return s.singleStringQueryResult(fmt.Sprintf(queries.domainRenderedDefault, oid))
+	})
+	properties.Default = defaultValue
+	warnings = append(warnings, defaultWarnings...)
+	if typcollation != 0 {
+		if collname.Valid && collname.String != "" {
+			properties.Collation = &collname.String
+		} else if value := s.singleStringQuery(fmt.Sprintf(queries.collationName, typcollation)); value != "" {
+			properties.Collation = &value
+		}
+	}
+	rows, err := s.metadataQuery(fmt.Sprintf(queries.domainConstraints, oid))
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("domain constraints could not be read: %v", err))
+		return warnings
+	}
+	for rows.Next() {
+		var constraint customTypeDomainConstraint
+		if err := rows.Scan(&constraint.Name, &constraint.Definition); err != nil {
+			warnings = append(warnings, fmt.Sprintf("domain constraints could not be decoded: %v", err))
+			break
+		}
+		if constraint.Definition != "" {
+			properties.DomainConstraints = append(properties.DomainConstraints, constraint)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("domain constraints could not be read: %v", err))
+	}
+	if err := rows.Close(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("domain constraints could not be closed: %v", err))
+	}
+	return warnings
+}
+
+func (s *server) customTypeRangeAttributes(queries customTypeCatalogQueries, properties *customTypeProperties, oid int64, isMultirange bool) []string {
+	var warnings []string
+	// pg_range.rngtypid stores the RANGE oid; a multirange view resolves its
+	// owning range through rngmultitypid instead.
+	rangeTemplate := queries.rangeAttributes
+	if isMultirange {
+		rangeTemplate = queries.rangeAttributesForMultirange
+	}
+	rows, err := s.metadataQuery(fmt.Sprintf(rangeTemplate, oid))
+	if err != nil {
+		return []string{fmt.Sprintf("range attributes could not be read: %v", err)}
+	}
+	if rows.Next() {
+		var subtype, canonical, subdiff, opclass sql.NullString
+		if err := rows.Scan(&subtype, &canonical, &subdiff, &opclass); err != nil {
+			warnings = append(warnings, fmt.Sprintf("range attributes could not be decoded: %v", err))
+		} else {
+			properties.RangeSubtype = nullStringPtr(subtype)
+			properties.RangeCanonicalFunction = nullStringPtr(canonical)
+			properties.RangeSubtypeDiffFunction = nullStringPtr(subdiff)
+			properties.RangeSubtypeOpclass = nullStringPtr(opclass)
+		}
+	} else if err := rows.Err(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("range attributes could not be read: %v", err))
+	} else {
+		warnings = append(warnings, "range attributes returned no rows")
+	}
+	if err := rows.Close(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("range attributes could not be closed: %v", err))
+	}
+	// Optional PG 13+ multirange companion; older kernels have no column.
+	if multirangeRows, err := s.metadataQuery(fmt.Sprintf(queries.rangeMultirange, oid)); err == nil {
+		if multirangeRows.Next() {
+			var name string
+			if scanErr := multirangeRows.Scan(&name); scanErr != nil {
+				warnings = append(warnings, fmt.Sprintf("multirange companion could not be decoded: %v", scanErr))
+			} else if name != "" {
+				properties.RangeMultirangeName = &name
+			}
+		} else if rowsErr := multirangeRows.Err(); rowsErr != nil {
+			warnings = append(warnings, fmt.Sprintf("multirange companion could not be read: %v", rowsErr))
+		}
+		if closeErr := multirangeRows.Close(); closeErr != nil {
+			warnings = append(warnings, fmt.Sprintf("multirange companion could not be closed: %v", closeErr))
+		}
+	} else {
+		warnings = append(warnings, fmt.Sprintf("multirange companion could not be read: %v", err))
+	}
+	return warnings
+}
+
+func (s *server) singleStringQuery(query string) string {
+	value, _ := s.singleStringQueryResult(query)
+	return value
+}
+
+func (s *server) singleStringQueryResult(query string) (string, error) {
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", rows.Err()
+	}
+	var value sql.NullString
+	if err := rows.Scan(&value); err != nil {
+		return "", err
+	}
+	if !value.Valid {
+		return "", nil
+	}
+	return value.String, nil
+}
+
+func resolveCustomTypeDomainDefault(typdefaultbin, typdefault sql.NullString, render func() (string, error)) (*string, []string) {
+	if typdefault.Valid && typdefault.String != "" {
+		value := typdefault.String
+		return &value, nil
+	}
+	if !typdefaultbin.Valid || typdefaultbin.String == "" {
+		return nil, nil
+	}
+	value, err := render()
+	if err != nil {
+		return nil, []string{fmt.Sprintf("default value could not be rendered; the generated DDL is incomplete: %v", err)}
+	}
+	if value == "" {
+		return nil, []string{"default value could not be rendered; the generated DDL is incomplete"}
+	}
+	return &value, nil
+}
+
+func quoteCatalogIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) && strings.Contains(value, `"."`) {
+		return value
+	}
+	if separator := strings.LastIndexByte(value, '.'); separator >= 0 {
+		return quoteIdentifier(value[:separator]) + "." + quoteIdentifier(value[separator+1:])
+	}
+	return quoteIdentifier(value)
+}
+
+// buildCustomTypeDDL generates normalized CREATE TYPE text. complete is only
+// true when the text can be executed standalone; multiranges and base types
+// are marked incomplete with visible warnings.
+func buildCustomTypeDDL(schema, name string, kind customTypeKind, inputFn sql.NullString, members *[]customTypeMember, properties *customTypeProperties, warnings []string) *customTypeDdl {
+	qualified := quoteIdentifier(schema) + "." + quoteIdentifier(name)
+	switch kind {
+	case customTypeKindEnum:
+		values := make([]string, 0, len(*members))
+		for _, member := range *members {
+			if member.EnumValue != nil {
+				values = append(values, quoteLiteral(*member.EnumValue))
+			}
+		}
+		return &customTypeDdl{
+			SQL:      fmt.Sprintf("CREATE TYPE %s AS ENUM (%s);", qualified, strings.Join(values, ", ")),
+			Complete: true,
+			Warnings: warnings,
+		}
+	case customTypeKindComposite:
+		fields := make([]string, 0, len(*members))
+		comments := make([]string, 0, len(*members))
+		for _, member := range *members {
+			fields = append(fields, quoteIdentifier(member.Name)+" "+member.DataType)
+			if member.Comment != nil {
+				comments = append(comments, fmt.Sprintf("COMMENT ON COLUMN %s.%s IS %s;", qualified, quoteIdentifier(member.Name), quoteLiteral(*member.Comment)))
+			}
+		}
+		sql := fmt.Sprintf("CREATE TYPE %s AS (\n  %s\n);", qualified, strings.Join(fields, ",\n  "))
+		if len(comments) > 0 {
+			sql = sql + "\n" + strings.Join(comments, "\n")
+		}
+		return &customTypeDdl{SQL: sql, Complete: true, Warnings: warnings}
+	case customTypeKindDomain:
+		complete := true
+		base := "unknown"
+		if properties.BaseType != nil && *properties.BaseType != "" {
+			base = *properties.BaseType
+		} else {
+			complete = false
+			warnings = append(warnings, "base type could not be resolved; the generated DDL is incomplete")
+		}
+		parts := []string{fmt.Sprintf("CREATE DOMAIN %s AS %s", qualified, base)}
+		if properties.Collation != nil && *properties.Collation != "" {
+			parts = append(parts, "COLLATE "+quoteCatalogIdentifier(*properties.Collation))
+		}
+		if properties.Default != nil && *properties.Default != "" {
+			parts = append(parts, "DEFAULT "+*properties.Default)
+		}
+		if properties.NotNull != nil && *properties.NotNull {
+			parts = append(parts, "NOT NULL")
+		}
+		for _, constraint := range properties.DomainConstraints {
+			body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(constraint.Definition), "CHECK"))
+			constraintName := constraint.Name
+			if constraintName == "" {
+				constraintName = name + "_check"
+			}
+			parts = append(parts, fmt.Sprintf("CONSTRAINT %s CHECK %s", quoteIdentifier(constraintName), body))
+		}
+		for _, warning := range warnings {
+			if strings.Contains(warning, "domain constraints") || strings.Contains(warning, "default value could not be rendered") {
+				complete = false
+			}
+		}
+		return &customTypeDdl{SQL: strings.Join(parts, "\n  ") + ";", Complete: complete, Warnings: warnings}
+	case customTypeKindRange:
+		var args []string
+		if properties.RangeSubtype != nil && *properties.RangeSubtype != "" {
+			args = append(args, "subtype = "+*properties.RangeSubtype)
+		}
+		if properties.RangeSubtypeOpclass != nil && *properties.RangeSubtypeOpclass != "" {
+			args = append(args, "subtype_opclass = "+quoteCatalogIdentifier(*properties.RangeSubtypeOpclass))
+		}
+		if properties.RangeCanonicalFunction != nil && *properties.RangeCanonicalFunction != "" {
+			args = append(args, "canonical = "+quoteCatalogIdentifier(*properties.RangeCanonicalFunction))
+		}
+		if properties.RangeSubtypeDiffFunction != nil && *properties.RangeSubtypeDiffFunction != "" {
+			args = append(args, "subtype_diff = "+quoteCatalogIdentifier(*properties.RangeSubtypeDiffFunction))
+		}
+		if properties.RangeMultirangeName != nil && *properties.RangeMultirangeName != "" {
+			args = append(args, "multirange_type_name = "+quoteCatalogIdentifier(*properties.RangeMultirangeName))
+		}
+		if properties.RangeSubtype == nil || *properties.RangeSubtype == "" {
+			result := &customTypeDdl{
+				SQL:      fmt.Sprintf("CREATE TYPE %s AS RANGE (subtype = unknown);", qualified),
+				Complete: false,
+				Warnings: append(warnings, "range attributes could not be resolved"),
+			}
+			return result
+		}
+		return &customTypeDdl{
+			SQL:      fmt.Sprintf("CREATE TYPE %s AS RANGE (\n  %s\n);", qualified, strings.Join(args, ",\n  ")),
+			Complete: true,
+			Warnings: warnings,
+		}
+	case customTypeKindMultirange:
+		return &customTypeDdl{
+			SQL:      "",
+			Complete: false,
+			Warnings: append(append([]string{}, warnings...), fmt.Sprintf("%s is the auto-generated multirange companion of a range type; it has no standalone CREATE statement", qualified)),
+		}
+	default: // customTypeKindBase
+		inputName := "unknown"
+		if inputFn.Valid && inputFn.String != "" {
+			inputName = inputFn.String
+		}
+		return &customTypeDdl{
+			SQL:      fmt.Sprintf("CREATE TYPE %s;  -- base type attributes require manual reconstruction", qualified),
+			Complete: false,
+			Warnings: append(append([]string{}, warnings...), fmt.Sprintf("%s is a base type; its input/output functions (%s) cannot be rebuilt from catalogs", qualified, inputName)),
+		}
+	}
+}
+
 func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
 	effective, err := s.effectiveSchema(schema)
 	if err != nil {
 		return nil, err
 	}
-	tables, err := s.listTables(effective, metadataListConstraints{})
-	if err != nil {
-		return nil, err
+	result := []objectInfo{}
+	if constraintsAllowsTableLike(constraints) {
+		tables, err := s.listTables(effective, metadataListConstraints{})
+		if err != nil {
+			return nil, err
+		}
+		for _, table := range tables {
+			result = append(result, objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: effective, Comment: table.Comment})
+		}
 	}
-	result := make([]objectInfo, 0, len(tables))
-	for _, table := range tables {
-		result = append(result, objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: effective, Comment: table.Comment})
-	}
-	if !s.mode.mysqlCompat {
+	if !s.mode.mysqlCompat && constraintsAllowRoutines(constraints) {
 		catalog := "sys_catalog"
 		function := "sys"
 		if s.mode.postgresCatalog {
@@ -387,6 +1061,16 @@ WHERE n.nspname = %s ORDER BY p.proname`, catalog, function, catalog, function, 
 			}
 			_ = rows.Close()
 		}
+	}
+	if constraintsAllowTypes(constraints) {
+		types, typesErr := s.listCustomTypes(effective)
+		if typesErr != nil {
+			// A type catalog failure is a real fault: surfacing it lets the user
+			// distinguish an incomplete “all objects” view from an actually
+			// empty schema, instead of silently dropping the type group.
+			return nil, fmt.Errorf("list custom types in schema %q: %w", effective, typesErr)
+		}
+		result = append(result, types...)
 	}
 	filtered := result[:0]
 	for _, item := range result {
@@ -481,43 +1165,66 @@ func completionNameMatches(name string, request completionAssistantRequest) bool
 }
 
 func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
-	effective, err := s.effectiveSchema(schema)
-	if err != nil {
-		return nil, err
-	}
-	primary, _ := s.primaryKeys(effective, table)
 	if s.mode.mysqlCompat {
+		effective, err := s.effectiveSchema(schema)
+		if err != nil {
+			return nil, err
+		}
+		primary, _ := s.primaryKeys(effective, table)
 		return s.informationSchemaColumns(effective, table, primary)
 	}
 	catalog, prefix := "sys_catalog", "sys"
 	if s.mode.postgresCatalog {
 		catalog, prefix = "pg_catalog", "pg"
-		return s.queryCatalogColumns(effective, table, primary, catalog, prefix, "pg_get_expr")
+		result, err := s.queryCatalogColumns(schema, table, catalog, prefix, "pg_get_expr")
+		return s.finishCatalogColumns(schema, table, result, err)
 	}
 	expression := "sys_get_expr"
 	if s.usePgDefaultExpression {
 		expression = "pg_get_expr"
 	}
-	result, err := s.queryCatalogColumns(effective, table, primary, catalog, prefix, expression)
+	result, err := s.queryCatalogColumns(schema, table, catalog, prefix, expression)
 	if err != nil && expression == "sys_get_expr" && isUndefinedFunction(err, expression) {
 		// Some V8R6 PostgreSQL-mode databases keep sys_catalog while adbin is
 		// pg_node_tree. Cache the compatible function after the exact failure.
 		s.usePgDefaultExpression = true
-		return s.queryCatalogColumns(effective, table, primary, catalog, prefix, "pg_get_expr")
+		result, err = s.queryCatalogColumns(schema, table, catalog, prefix, "pg_get_expr")
 	}
-	return result, err
+	return s.finishCatalogColumns(schema, table, result, err)
+}
+
+func (s *server) finishCatalogColumns(schema, table string, result []columnInfo, err error) ([]columnInfo, error) {
+	if err != nil || len(result) == 0 {
+		return result, err
+	}
+	resolvedSchema := strings.TrimSpace(schema)
+	if result[0].ResolvedSchema != nil {
+		resolvedSchema = *result[0].ResolvedSchema
+	}
+	primary, _ := s.primaryKeys(resolvedSchema, table)
+	for index := range result {
+		result[index].IsPrimaryKey = primary[strings.ToLower(result[index].Name)]
+	}
+	if s.mode.sqlServerIdentity {
+		s.applyIdentityMetadata(resolvedSchema, table, result)
+	}
+	return result, nil
 }
 
 func (s *server) queryCatalogColumns(
 	schema, table string,
-	primary map[string]bool,
 	catalog, prefix, expression string,
 ) ([]columnInfo, error) {
 	identityExpression := "a.attidentity"
 	if s.catalogIdentityUnsupported {
 		identityExpression = "CAST(NULL AS varchar(1)) AS attidentity"
 	}
-	query := fmt.Sprintf(`SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
+	relationPredicate := fmt.Sprintf("n.nspname = %s AND c.relname = %s", quoteLiteral(schema), quoteLiteral(table))
+	if strings.TrimSpace(schema) == "" {
+		visibilityFunction := vastbaseCatalogFunction(catalog, "sys_table_is_visible", "pg_table_is_visible")
+		relationPredicate = fmt.Sprintf("c.relname = %s AND %s(c.oid)", quoteLiteral(table), visibilityFunction)
+	}
+	query := fmt.Sprintf(`SELECT n.nspname, a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
 	%s(ad.adbin, ad.adrelid), col_description(a.attrelid, a.attnum),
 	CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 THEN ((a.atttypmod - 4) >> 16) & 65535 END,
 	CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 THEN (a.atttypmod - 4) & 65535 END,
@@ -526,11 +1233,11 @@ func (s *server) queryCatalogColumns(
 	FROM %s.%s_attribute a JOIN %s.%s_type t ON t.oid = a.atttypid
 	JOIN %s.%s_class c ON c.oid = a.attrelid JOIN %s.%s_namespace n ON n.oid = c.relnamespace
 	LEFT JOIN %s.%s_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, expression, identityExpression, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
+WHERE %s AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, expression, identityExpression, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, relationPredicate)
 	rows, err := s.metadataQuery(query)
 	if err != nil && !s.catalogIdentityUnsupported && isUndefinedColumn(err, "attidentity") {
 		s.catalogIdentityUnsupported = true
-		return s.queryCatalogColumns(schema, table, primary, catalog, prefix, expression)
+		return s.queryCatalogColumns(schema, table, catalog, prefix, expression)
 	}
 	if err != nil {
 		return nil, err
@@ -538,20 +1245,17 @@ WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped 
 	defer rows.Close()
 	result := []columnInfo{}
 	for rows.Next() {
-		var name, dataType string
+		var resolvedSchema, name, dataType string
 		var nullable bool
 		var defaultValue, comment, identity sql.NullString
 		var precision, scale, length sql.NullInt64
-		if err := rows.Scan(&name, &dataType, &nullable, &defaultValue, &comment, &precision, &scale, &length, &identity); err != nil {
+		if err := rows.Scan(&resolvedSchema, &name, &dataType, &nullable, &defaultValue, &comment, &precision, &scale, &length, &identity); err != nil {
 			return nil, err
 		}
-		result = append(result, columnInfo{Name: name, DataType: dataType, IsNullable: nullable, ColumnDefault: nullStringPtr(defaultValue), IsPrimaryKey: primary[strings.ToLower(name)], Extra: vastbaseIdentityClause(identity.String), Comment: nullStringPtr(comment), NumericPrecision: nullIntPtr(precision), NumericScale: nullIntPtr(scale), CharacterMaximumLength: nullIntPtr(length)})
+		result = append(result, columnInfo{Name: name, DataType: dataType, ResolvedSchema: stringPtr(resolvedSchema), IsNullable: nullable, ColumnDefault: nullStringPtr(defaultValue), Extra: vastbaseIdentityClause(identity.String), Comment: nullStringPtr(comment), NumericPrecision: nullIntPtr(precision), NumericScale: nullIntPtr(scale), CharacterMaximumLength: nullIntPtr(length)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
-	}
-	if s.mode.sqlServerIdentity {
-		s.applyIdentityMetadata(schema, table, result)
 	}
 	return result, nil
 }
@@ -612,13 +1316,17 @@ func (s *server) queryInformationSchemaColumns(schema, table string, primary map
 	default:
 		fullDataTypeExpression = "NULL AS column_type"
 	}
+	catalog, prefix := "sys_catalog", "sys"
+	if s.mode.postgresCatalog {
+		catalog, prefix = "pg_catalog", "pg"
+	}
 	query := fmt.Sprintf(`SELECT c.column_name, c.data_type, %s, c.is_nullable, c.column_default,
 	col_description(a.attrelid, a.attnum), c.numeric_precision, c.numeric_scale, c.character_maximum_length
 	FROM information_schema.columns c
-	LEFT JOIN sys_catalog.sys_namespace n ON n.nspname = c.table_schema
-	LEFT JOIN sys_catalog.sys_class rel ON rel.relnamespace = n.oid AND rel.relname = c.table_name
-	LEFT JOIN sys_catalog.sys_attribute a ON a.attrelid = rel.oid AND a.attname = c.column_name AND a.attnum > 0 AND NOT a.attisdropped
-	WHERE c.table_schema = %s AND c.table_name = %s ORDER BY c.ordinal_position`, fullDataTypeExpression, quoteLiteral(schema), quoteLiteral(table))
+	LEFT JOIN %s.%s_namespace n ON n.nspname = c.table_schema
+	LEFT JOIN %s.%s_class rel ON rel.relnamespace = n.oid AND rel.relname = c.table_name
+	LEFT JOIN %s.%s_attribute a ON a.attrelid = rel.oid AND a.attname = c.column_name AND a.attnum > 0 AND NOT a.attisdropped
+	WHERE c.table_schema = %s AND c.table_name = %s ORDER BY c.ordinal_position`, fullDataTypeExpression, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
 	rows, err := s.metadataQuery(query)
 	if err != nil {
 		return nil, err
@@ -778,6 +1486,314 @@ WHERE tc.table_schema = ` + quoteLiteral(effective) + ` AND tc.table_name = ` + 
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+func vastbaseConstraintFunctionName(catalog string) string {
+	if catalog == "pg_catalog" {
+		return "pg_get_constraintdef"
+	}
+	return "sys_get_constraintdef"
+}
+
+func vastbaseConstraintsQuery(catalog, prefix, schema, table string, definitionUnsupported, validatedUnsupported, enabledUnsupported bool) string {
+	definitionExpression := fmt.Sprintf("COALESCE(%s(c.oid, true), '')", vastbaseCatalogFunction(catalog, "sys_get_constraintdef", "pg_get_constraintdef"))
+	validExpression := "COALESCE(CAST(c.convalidated AS text), 'T')"
+	enabledExpression := "COALESCE(CAST(c.conenable AS text), 'T')"
+	if definitionUnsupported {
+		definitionExpression = "''"
+	}
+	if validatedUnsupported {
+		validExpression = "'T'"
+	}
+	if enabledUnsupported {
+		enabledExpression = "'T'"
+	}
+	return fmt.Sprintf(`SELECT COALESCE(c.conname, ''), CAST(c.contype AS text), %s,
+CAST(c.conkey AS text), rn.nspname, rt.relname, CAST(c.confkey AS text),
+CAST(c.confmatchtype AS text), CAST(c.confupdtype AS text), CAST(c.confdeltype AS text),
+c.condeferrable, c.condeferred, %s, %s
+FROM %s.%s_constraint c
+JOIN %s.%s_class t ON t.oid = c.conrelid
+JOIN %s.%s_namespace n ON n.oid = t.relnamespace
+LEFT JOIN %s.%s_class rt ON rt.oid = c.confrelid
+LEFT JOIN %s.%s_namespace rn ON rn.oid = rt.relnamespace
+WHERE n.nspname = %s AND t.relname = %s AND t.relkind IN ('r', 'p', 'f')
+ORDER BY COALESCE(c.conname, '')`, definitionExpression, validExpression, enabledExpression, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
+}
+
+func (s *server) listConstraints(schema, table string) ([]constraintInfo, error) {
+	effective, err := s.effectiveSchema(schema)
+	if err != nil {
+		return nil, err
+	}
+	catalog, prefix := "sys_catalog", "sys"
+	if s.mode.postgresCatalog {
+		catalog, prefix = "pg_catalog", "pg"
+	}
+	effective, table, err = s.resolveConstraintRelation(catalog, prefix, effective, table)
+	if err != nil {
+		return nil, err
+	}
+	definitionUnsupported := s.constraintDefinitionUnsupported
+	validatedUnsupported := s.constraintValidatedUnsupported
+	enabledUnsupported := s.constraintEnabledUnsupported
+	var rows *sql.Rows
+	for {
+		rows, err = s.metadataQuery(vastbaseConstraintsQuery(catalog, prefix, effective, table, definitionUnsupported, validatedUnsupported, enabledUnsupported))
+		if err == nil {
+			break
+		}
+		changed := false
+		if !definitionUnsupported && isUndefinedFunction(err, vastbaseConstraintFunctionName(catalog)) {
+			definitionUnsupported = true
+			s.constraintDefinitionUnsupported = true
+			changed = true
+		}
+		if !validatedUnsupported && isUndefinedColumn(err, "convalidated") {
+			validatedUnsupported = true
+			s.constraintValidatedUnsupported = true
+			changed = true
+		}
+		if !enabledUnsupported && isUndefinedColumn(err, "conenable") {
+			enabledUnsupported = true
+			s.constraintEnabledUnsupported = true
+			changed = true
+		}
+		if !changed {
+			return nil, err
+		}
+	}
+	defer rows.Close()
+
+	type rawConstraint struct {
+		name, kind, definition                        string
+		columnNumbers, refColumnNumbers               []int
+		refSchema, refTable                           sql.NullString
+		matchType, onUpdate, onDelete                 sql.NullString
+		deferrable, initiallyDeferred, valid, enabled bool
+	}
+	raw := []rawConstraint{}
+	for rows.Next() {
+		var item rawConstraint
+		var columnsRaw, refColumnsRaw sql.NullString
+		var validRaw, enabledRaw any
+		if err := rows.Scan(&item.name, &item.kind, &item.definition, &columnsRaw, &item.refSchema, &item.refTable, &refColumnsRaw, &item.matchType, &item.onUpdate, &item.onDelete, &item.deferrable, &item.initiallyDeferred, &validRaw, &enabledRaw); err != nil {
+			return nil, err
+		}
+		item.columnNumbers, err = parseVastbaseConstraintAttributeNumbers(columnsRaw.String)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse constraint %s columns: %w", item.name, err)
+		}
+		item.refColumnNumbers, err = parseVastbaseConstraintAttributeNumbers(refColumnsRaw.String)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse constraint %s referenced columns: %w", item.name, err)
+		}
+		item.valid = parseVastbaseConstraintValid(validRaw)
+		item.enabled = parseVastbaseConstraintEnabled(enabledRaw)
+		raw = append(raw, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	attributes, err := s.relationAttributesByNumber(catalog, prefix, effective, table)
+	if err != nil {
+		return nil, err
+	}
+	refAttributes := map[string]map[int]string{}
+	result := make([]constraintInfo, 0, len(raw))
+	for _, item := range raw {
+		constraint := constraintInfo{
+			Name: item.name, ConstraintType: vastbaseConstraintTypeName(item.kind), Definition: item.definition,
+			Columns: []string{}, RefColumns: []string{}, Deferrable: item.deferrable,
+			InitiallyDeferred: item.initiallyDeferred, Enabled: item.enabled, Valid: item.valid,
+		}
+		for _, number := range item.columnNumbers {
+			if name := attributes[number]; name != "" {
+				constraint.Columns = append(constraint.Columns, name)
+			}
+		}
+		if item.refSchema.Valid {
+			constraint.RefSchema = stringPtr(item.refSchema.String)
+		}
+		if item.refTable.Valid {
+			constraint.RefTable = stringPtr(item.refTable.String)
+		}
+		if strings.EqualFold(strings.TrimSpace(item.kind), "f") && item.refSchema.Valid && item.refTable.Valid {
+			key := item.refSchema.String + "\x00" + item.refTable.String
+			ref := refAttributes[key]
+			if ref == nil {
+				ref, err = s.relationAttributesByNumber(catalog, prefix, item.refSchema.String, item.refTable.String)
+				if err != nil {
+					return nil, err
+				}
+				refAttributes[key] = ref
+			}
+			for _, number := range item.refColumnNumbers {
+				if name := ref[number]; name != "" {
+					constraint.RefColumns = append(constraint.RefColumns, name)
+				}
+			}
+			constraint.MatchType = vastbaseConstraintMatchType(item.matchType)
+			constraint.OnUpdate = vastbaseConstraintAction(item.onUpdate)
+			constraint.OnDelete = vastbaseConstraintAction(item.onDelete)
+		}
+		result = append(result, constraint)
+	}
+	return result, nil
+}
+
+func (s *server) resolveConstraintRelation(catalog, prefix, schema, table string) (string, string, error) {
+	query := fmt.Sprintf(`SELECT n.nspname, c.relname
+FROM %s.%s_class c JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+WHERE LOWER(n.nspname) = LOWER(%s) AND LOWER(c.relname) = LOWER(%s)
+AND c.relkind IN ('r', 'p', 'f')
+ORDER BY CASE WHEN n.nspname = %s AND c.relname = %s THEN 0 ELSE 1 END`, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table), quoteLiteral(schema), quoteLiteral(table))
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+	type relationName struct{ schema, table string }
+	matches := []relationName{}
+	for rows.Next() {
+		var match relationName
+		if err := rows.Scan(&match.schema, &match.table); err != nil {
+			return "", "", err
+		}
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", err
+	}
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("Vastbase relation not found: %s.%s", schema, table)
+	}
+	if matches[0].schema == schema && matches[0].table == table {
+		return schema, table, nil
+	}
+	if len(matches) > 1 {
+		return "", "", fmt.Errorf("ambiguous Vastbase relation name %s.%s under case-insensitive matching", schema, table)
+	}
+	return matches[0].schema, matches[0].table, nil
+}
+
+func (s *server) relationAttributesByNumber(catalog, prefix, schema, table string) (map[int]string, error) {
+	query := fmt.Sprintf(`SELECT a.attnum, a.attname
+FROM %s.%s_attribute a JOIN %s.%s_class c ON c.oid = a.attrelid
+JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped`, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[int]string{}
+	for rows.Next() {
+		var number int
+		var name string
+		if err := rows.Scan(&number, &name); err != nil {
+			return nil, err
+		}
+		result[number] = name
+	}
+	return result, rows.Err()
+}
+
+func parseVastbaseConstraintAttributeNumbers(raw string) ([]int, error) {
+	value := strings.TrimSpace(strings.Trim(raw, "{}[]"))
+	if value == "" {
+		return []int{}, nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
+	result := make([]int, 0, len(parts))
+	for _, part := range parts {
+		number, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("invalid attribute number %q", part)
+		}
+		result = append(result, number)
+	}
+	return result, nil
+}
+
+func parseVastbaseConstraintValue(raw any) string {
+	if raw == nil {
+		return ""
+	}
+	if bytes, ok := raw.([]byte); ok {
+		return strings.ToLower(strings.TrimSpace(string(bytes)))
+	}
+	return strings.ToLower(strings.TrimSpace(fmt.Sprint(raw)))
+}
+
+func parseVastbaseConstraintValid(raw any) bool {
+	if value, ok := raw.(bool); ok {
+		return value
+	}
+	switch parseVastbaseConstraintValue(raw) {
+	case "0", "f", "false", "n", "no", "not validated", "not_validated", "invalid":
+		return false
+	default:
+		return true
+	}
+}
+
+func parseVastbaseConstraintEnabled(raw any) bool {
+	if value, ok := raw.(bool); ok {
+		return value
+	}
+	switch parseVastbaseConstraintValue(raw) {
+	case "0", "f", "false", "d", "disabled", "disable", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func vastbaseConstraintTypeName(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "p":
+		return "PRIMARY KEY"
+	case "f":
+		return "FOREIGN KEY"
+	case "u":
+		return "UNIQUE"
+	case "c":
+		return "CHECK"
+	case "t":
+		return "CONSTRAINT TRIGGER"
+	case "x":
+		return "EXCLUDE"
+	case "n":
+		return "NOT NULL"
+	default:
+		return strings.TrimSpace(value)
+	}
+}
+
+func vastbaseConstraintMatchType(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	labels := map[string]string{"f": "FULL", "p": "PARTIAL", "s": "SIMPLE"}
+	result, ok := labels[strings.ToLower(strings.TrimSpace(value.String))]
+	if !ok {
+		return nil
+	}
+	return &result
+}
+
+func vastbaseConstraintAction(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	labels := map[string]string{"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
+	result, ok := labels[strings.ToLower(strings.TrimSpace(value.String))]
+	if !ok {
+		return nil
+	}
+	return &result
 }
 
 func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
@@ -1053,6 +2069,8 @@ func vastbaseIdentityClause(code string) *string {
 		clause = "GENERATED ALWAYS AS IDENTITY"
 	case "d":
 		clause = "GENERATED BY DEFAULT AS IDENTITY"
+	case "m":
+		clause = "IDENTITY"
 	default:
 		return nil
 	}
@@ -1131,6 +2149,10 @@ WHERE tc.table_schema=` + quoteLiteral(schema) + ` AND tc.table_name=` + quoteLi
 }
 
 func (s *server) applyIdentityMetadata(schema, table string, columns []columnInfo) {
+	if s.mode.postgresCatalog {
+		s.applyPostgresIdentityMetadata(schema, table, columns)
+		return
+	}
 	query := `SELECT a.attname, ic.seed_value, ic.increment_value FROM sys.identity_columns ic
 JOIN sys_catalog.sys_class c ON c.oid=ic.object_id JOIN sys_catalog.sys_namespace n ON n.oid=c.relnamespace
 JOIN sys_catalog.sys_attribute a ON a.attrelid=c.oid AND a.attnum=ic.column_id
@@ -1160,6 +2182,52 @@ WHERE n.nspname=` + quoteLiteral(schema) + ` AND c.relname=` + quoteLiteral(tabl
 	}
 }
 
+func (s *server) applyPostgresIdentityMetadata(schema, table string, columns []columnInfo) {
+	query := `SELECT a.attname, pg_get_serial_sequence(quote_ident(n.nspname) || '.' || quote_ident(c.relname), a.attname), a.attidentity
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ` + quoteLiteral(schema) + ` AND c.relname = ` + quoteLiteral(table) + ` AND a.attidentity <> ''`
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return
+	}
+	type identityColumn struct {
+		name, sequence, identity string
+	}
+	identityColumns := []identityColumn{}
+	for rows.Next() {
+		var item identityColumn
+		if rows.Scan(&item.name, &item.sequence, &item.identity) == nil {
+			identityColumns = append(identityColumns, item)
+		}
+	}
+	_ = rows.Close()
+	byName := map[string]*columnInfo{}
+	for i := range columns {
+		byName[strings.ToLower(columns[i].Name)] = &columns[i]
+	}
+	for _, item := range identityColumns {
+		column := byName[strings.ToLower(item.name)]
+		if column == nil {
+			continue
+		}
+		extra := vastbaseIdentityClause(item.identity)
+		if extra == nil {
+			extra = stringPtr("IDENTITY")
+		}
+		if item.sequence != "" {
+			var start, increment sql.NullInt64
+			sequenceQuery := "SELECT start_value, increment_by FROM " + quoteCatalogIdentifier(item.sequence)
+			if err := s.requireDBQueryRow(sequenceQuery, &start, &increment); err == nil && start.Valid && increment.Valid {
+				value := fmt.Sprintf("IDENTITY(%d,%d)", start.Int64, increment.Int64)
+				extra = &value
+			}
+		}
+		column.Extra = extra
+	}
+}
+
 func catalogPrefix(catalog string) string {
 	if catalog == "pg_catalog" {
 		return "pg"
@@ -1172,7 +2240,7 @@ func normalizeTableType(value string) string {
 	switch normalized {
 	case "BASE_TABLE", "PARTITIONED_TABLE":
 		return "TABLE"
-	case "MATERIALIZED_VIEW", "FOREIGN_TABLE", "VIEW", "TABLE":
+	case "MATERIALIZED_VIEW", "FOREIGN_TABLE", "VIEW", "TABLE", "TYPE", "TYPE_BODY":
 		return normalized
 	default:
 		return "TABLE"
@@ -1210,6 +2278,38 @@ func constraintsAllowsTableLike(constraints metadataListConstraints) bool {
 	for _, kind := range constraints.ObjectTypes {
 		switch normalizeTableType(kind) {
 		case "TABLE", "VIEW", "MATERIALIZED_VIEW", "FOREIGN_TABLE":
+			return true
+		}
+	}
+	return false
+}
+
+// constraintsAllowTypes reports whether the object-type filter asks for
+// user-defined types (or leaves the filter open). normalizeTableType treats
+// "TYPE" and "TYPE_BODY" as first-class kinds, so table-like constraints never
+// match them and a dedicated type request does not scan relations.
+func constraintsAllowTypes(constraints metadataListConstraints) bool {
+	if len(constraints.ObjectTypes) == 0 {
+		return true
+	}
+	for _, kind := range constraints.ObjectTypes {
+		switch normalizeTableType(kind) {
+		case "TYPE", "TYPE_BODY":
+			return true
+		}
+	}
+	return false
+}
+
+// constraintsAllowRoutines reports whether the object-type filter asks for
+// procedures or functions (or leaves the filter open).
+func constraintsAllowRoutines(constraints metadataListConstraints) bool {
+	if len(constraints.ObjectTypes) == 0 {
+		return true
+	}
+	for _, kind := range constraints.ObjectTypes {
+		upper := strings.ToUpper(strings.TrimSpace(kind))
+		if strings.Contains(upper, "PROCEDURE") || strings.Contains(upper, "FUNCTION") {
 			return true
 		}
 	}
@@ -1269,6 +2369,8 @@ func objectOrder(kind string) int {
 		return 4
 	case "FUNCTION":
 		return 5
+	case "TYPE":
+		return 6
 	default:
 		return 9
 	}

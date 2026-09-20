@@ -24,10 +24,16 @@ class DriverReleasePackagesTest(unittest.TestCase):
             duckdb_source.write_bytes(b"\xcf\xfa\xed\xfetest-duckdb-agent")
             rabbitmq_source = release_dir / "dbx-agent-rabbitmq-linux-x64"
             rabbitmq_source.write_bytes(b"\x7fELFtest-rabbitmq-agent")
+            rocketmq_source = release_dir / "dbx-agent-rocketmq-windows-x64.exe"
+            rocketmq_source.write_bytes(b"MZtest-rocketmq-agent")
             cassandra_source = release_dir / "dbx-agent-cassandra-linux-x64"
             cassandra_source.write_bytes(b"\x7fELFtest-cassandra-agent")
             tdengine_source = release_dir / "dbx-agent-tdengine-windows-aarch64.exe"
             tdengine_source.write_bytes(b"MZtest-tdengine-agent")
+            etcd_source = release_dir / "dbx-agent-etcd-linux-x64"
+            etcd_source.write_bytes(b"\x7fELFtest-etcd-agent")
+            etcd2_source = release_dir / "dbx-agent-etcd2-macos-aarch64"
+            etcd2_source.write_bytes(b"test-etcd2-agent")
             java_source = release_dir / "dbx-agent-h2.jar"
             java_source.write_bytes(b"test-jar")
             versions = {
@@ -40,8 +46,16 @@ class DriverReleasePackagesTest(unittest.TestCase):
                 "vastbase": "0.1.37",
                 "duckdb": "0.1.0",
                 "rabbitmq": "0.1.0",
+                "rocketmq": "0.1.0",
+                "zookeeper": "0.1.0",
                 "cassandra": "0.1.37",
+                "hive": "0.1.43",
+                "argo": "0.1.0",
                 "tdengine": "0.1.0",
+                "etcd": "0.1.40",
+                "etcd2": "0.1.0",
+                "argo": "0.1.0",
+                "sqlite-worker": "0.1.0",
             }
 
             renamed = version_agent_artifacts(release_dir, versions)
@@ -50,8 +64,11 @@ class DriverReleasePackagesTest(unittest.TestCase):
             versioned_vastbase = release_dir / "dbx-agent-vastbase-0.1.37-linux-x64"
             versioned_duckdb = release_dir / "dbx-agent-duckdb-0.1.0-macos-aarch64"
             versioned_rabbitmq = release_dir / "dbx-agent-rabbitmq-0.1.0-linux-x64"
+            versioned_rocketmq = release_dir / "dbx-agent-rocketmq-0.1.0-windows-x64.exe"
             versioned_cassandra = release_dir / "dbx-agent-cassandra-0.1.37-linux-x64"
             versioned_tdengine = release_dir / "dbx-agent-tdengine-0.1.0-windows-aarch64.exe"
+            versioned_etcd = release_dir / "dbx-agent-etcd-0.1.40-linux-x64"
+            versioned_etcd2 = release_dir / "dbx-agent-etcd2-0.1.0-macos-aarch64"
             self.assertEqual(
                 renamed,
                 [
@@ -61,7 +78,10 @@ class DriverReleasePackagesTest(unittest.TestCase):
                     versioned_vastbase,
                     versioned_duckdb,
                     versioned_rabbitmq,
+                    versioned_rocketmq,
                     versioned_tdengine,
+                    versioned_etcd,
+                    versioned_etcd2,
                 ],
             )
 
@@ -90,7 +110,7 @@ class DriverReleasePackagesTest(unittest.TestCase):
                     },
                     "kingbase": {
                         "version": "0.1.34",
-                        "label": "人大金仓 KingbaseES",
+                        "label": "金仓KingbaseES",
                         "min_app_version": "0.6.0",
                         "jre": "21",
                         "jar": {"url": "https://example.com/legacy-placeholder.jar", "size": 0},
@@ -140,6 +160,19 @@ class DriverReleasePackagesTest(unittest.TestCase):
                             }
                         },
                     },
+                    "rocketmq": {
+                        "version": "0.1.0",
+                        "label": "Apache RocketMQ",
+                        "min_app_version": "0.6.0",
+                        "jre": "21",
+                        "jar": {"url": "https://example.com/legacy-placeholder.jar", "size": 0},
+                        "native": {
+                            "windows-x64": {
+                                "url": f"https://example.com/{versioned_rocketmq.name}",
+                                "size": versioned_rocketmq.stat().st_size,
+                            }
+                        },
+                    },
                     "tdengine": {
                         "version": "0.1.0",
                         "label": "TDengine",
@@ -168,6 +201,7 @@ class DriverReleasePackagesTest(unittest.TestCase):
                     release_dir / "dbx-agent-vastbase-0.1.37-linux-x64.tar.zst",
                     release_dir / "dbx-agent-duckdb-0.1.0-macos-aarch64.tar.zst",
                     release_dir / "dbx-agent-rabbitmq-0.1.0-linux-x64.tar.zst",
+                    release_dir / "dbx-agent-rocketmq-0.1.0-windows-x64.tar.zst",
                     release_dir / "dbx-agent-tdengine-0.1.0-windows-aarch64.tar.zst",
                 ],
             )
@@ -178,7 +212,8 @@ class DriverReleasePackagesTest(unittest.TestCase):
                 (outputs[3], "vastbase", versioned_vastbase, "native", "linux-x64"),
                 (outputs[4], "duckdb", versioned_duckdb, "native", "macos-aarch64"),
                 (outputs[5], "rabbitmq", versioned_rabbitmq, "native", "linux-x64"),
-                (outputs[6], "tdengine", versioned_tdengine, "native", "windows-aarch64"),
+                (outputs[6], "rocketmq", versioned_rocketmq, "native", "windows-x64"),
+                (outputs[7], "tdengine", versioned_tdengine, "native", "windows-aarch64"),
             ]
             for output, driver_name, source, artifact_type, platform in package_cases:
                 tar_bytes = subprocess.run(
@@ -208,7 +243,8 @@ class DriverReleasePackagesTest(unittest.TestCase):
                 (final_registry["drivers"]["vastbase"]["native"]["linux-x64"], outputs[3]),
                 (final_registry["drivers"]["duckdb"]["native"]["macos-aarch64"], outputs[4]),
                 (final_registry["drivers"]["rabbitmq"]["native"]["linux-x64"], outputs[5]),
-                (final_registry["drivers"]["tdengine"]["native"]["windows-aarch64"], outputs[6]),
+                (final_registry["drivers"]["rocketmq"]["native"]["windows-x64"], outputs[6]),
+                (final_registry["drivers"]["tdengine"]["native"]["windows-aarch64"], outputs[7]),
             ]
             for artifact, output in release_artifacts:
                 self.assertEqual(artifact["url"], f"https://example.com/{output.name}")
@@ -222,9 +258,12 @@ class DriverReleasePackagesTest(unittest.TestCase):
                 [
                     versioned_cassandra,
                     versioned_duckdb,
+                    versioned_etcd,
+                    versioned_etcd2,
                     versioned_java,
                     versioned_native,
                     versioned_rabbitmq,
+                    versioned_rocketmq,
                     versioned_tdengine,
                     versioned_vastbase,
                 ],
@@ -260,6 +299,55 @@ class DriverReleasePackagesTest(unittest.TestCase):
             self.assertEqual(renamed, [versioned])
             self.assertFalse(source.exists())
             self.assertEqual(versioned.read_bytes(), b"\x7fELFtest-iotdb-agent")
+
+    def test_versions_hive_native_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_dir = Path(temp_dir)
+            source = release_dir / "dbx-agent-hive-windows-x64.exe"
+            source.write_bytes(b"MZtest-hive-agent")
+            versions = {driver: "0.1.0" for driver in NATIVE_DRIVERS}
+            versions["hive"] = "0.1.44"
+
+            renamed = version_agent_artifacts(release_dir, versions)
+            versioned = release_dir / "dbx-agent-hive-0.1.44-windows-x64.exe"
+
+            self.assertEqual(renamed, [versioned])
+            self.assertFalse(source.exists())
+            self.assertEqual(versioned.read_bytes(), b"MZtest-hive-agent")
+
+    def test_versions_zookeeper_native_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_dir = Path(temp_dir)
+            source = release_dir / "dbx-agent-zookeeper-linux-aarch64"
+            source.write_bytes(b"\x7fELFtest-zookeeper-agent")
+            versions = {driver: "0.1.0" for driver in NATIVE_DRIVERS}
+            versions["zookeeper"] = "0.1.8"
+
+            renamed = version_agent_artifacts(release_dir, versions)
+            versioned = release_dir / "dbx-agent-zookeeper-0.1.8-linux-aarch64"
+
+            self.assertEqual(renamed, [versioned])
+            self.assertFalse(source.exists())
+            self.assertEqual(versioned.read_bytes(), b"\x7fELFtest-zookeeper-agent")
+
+    def test_versions_sqlite_worker_native_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_dir = Path(temp_dir)
+            x64 = release_dir / "dbx-agent-sqlite-worker-linux-x64"
+            arm = release_dir / "dbx-agent-sqlite-worker-linux-aarch64"
+            x64.write_bytes(b"\x7fELFtest-sqlite-worker-x64")
+            arm.write_bytes(b"\x7fELFtest-sqlite-worker-arm")
+            versions = {driver: "0.1.0" for driver in NATIVE_DRIVERS}
+
+            renamed = version_agent_artifacts(release_dir, versions)
+            versioned_x64 = release_dir / "dbx-agent-sqlite-worker-0.1.0-linux-x64"
+            versioned_arm = release_dir / "dbx-agent-sqlite-worker-0.1.0-linux-aarch64"
+
+            self.assertEqual(renamed, [versioned_arm, versioned_x64])
+            self.assertFalse(x64.exists())
+            self.assertFalse(arm.exists())
+            self.assertEqual(versioned_x64.read_bytes(), b"\x7fELFtest-sqlite-worker-x64")
+            self.assertEqual(versioned_arm.read_bytes(), b"\x7fELFtest-sqlite-worker-arm")
 
     def test_full_offline_bundle_includes_supported_windows_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

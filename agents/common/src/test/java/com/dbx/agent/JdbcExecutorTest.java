@@ -27,6 +27,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class JdbcExecutorTest {
     @Test
+    void statementRowLimitIncludesOverflowProbeWithoutIntegerOverflow() {
+        assertEquals(2, JdbcExecutor.statementMaxRows(0));
+        assertEquals(JdbcExecutor.DEFAULT_MAX_ROWS + 1,
+            JdbcExecutor.statementMaxRows(JdbcExecutor.DEFAULT_MAX_ROWS));
+        assertEquals(Integer.MAX_VALUE, JdbcExecutor.statementMaxRows(Integer.MAX_VALUE));
+    }
+
+    @Test
     void blobResultValuesPreferBlobObjectsWhenGetBytesFails() throws Exception {
         ResultSet rs = resultSet(
             new SerialBlob(new byte[]{0x01, 0x2A, (byte) 0xFF}),
@@ -243,6 +251,47 @@ class JdbcExecutorTest {
     }
 
     @Test
+    void executeAdvancesPastUpdateCountsToTheFollowingResultSet() {
+        CountingResultSetFixture fixture = countingResultSet(new Object[][]{{42, "Bill_Record"}});
+
+        QueryResult result = JdbcExecutor.INSTANCE.execute(
+            updateThenResultSetConnection(1, fixture.resultSet()),
+            "DECLARE @tables TABLE (id INT, name NVARCHAR(128)); INSERT INTO @tables VALUES (42, 'Bill_Record'); SELECT * FROM @tables;",
+            "",
+            schema -> "",
+            () -> "",
+            100,
+            null,
+            0,
+            JdbcExecutor.INSTANCE::defaultResultValue,
+            JdbcExecutor.StatementMessageReader.NONE,
+            true
+        );
+
+        assertEquals(Arrays.asList("id", "name"), result.getColumns());
+        assertEquals(Arrays.asList(Arrays.asList(42, "Bill_Record")), result.getRows());
+    }
+
+    @Test
+    void executePageAdvancesPastUpdateCountsToTheFollowingResultSet() {
+        CountingResultSetFixture fixture = countingResultSet(new Object[][]{{42, "Bill_Record"}});
+
+        QueryPageResult result = JdbcExecutor.INSTANCE.executePage(
+            updateThenResultSetConnection(1, fixture.resultSet()),
+            "DECLARE @tables TABLE (id INT, name NVARCHAR(128)); INSERT INTO @tables VALUES (42, 'Bill_Record'); SELECT * FROM @tables;",
+            "",
+            schema -> "",
+            () -> "",
+            new QueryPageOptions(100, null, 100),
+            JdbcExecutor.INSTANCE::defaultResultValue,
+            true
+        );
+
+        assertEquals(Arrays.asList("id", "name"), result.getColumns());
+        assertEquals(Arrays.asList(Arrays.asList(42, "Bill_Record")), result.getRows());
+    }
+
+    @Test
     void executeStillPropagatesStatementErrors() {
         SQLException failure = new SQLException("permission denied", "42000", 229);
         RuntimeException thrown = assertThrows(
@@ -443,6 +492,42 @@ class JdbcExecutorTest {
                 case "clearWarnings":
                     clearWarningsCalls.incrementAndGet();
                     return null;
+                case "close":
+                    return null;
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        };
+        Statement statement = (Statement) Proxy.newProxyInstance(
+            Statement.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            statementHandler
+        );
+        InvocationHandler connectionHandler = (Object unused, Method method, Object[] args) -> {
+            if (method.getName().equals("createStatement")) {
+                return statement;
+            }
+            return defaultValue(method.getReturnType());
+        };
+        return (Connection) Proxy.newProxyInstance(
+            Connection.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            connectionHandler
+        );
+    }
+
+    private static Connection updateThenResultSetConnection(int updateCount, ResultSet resultSet) {
+        AtomicInteger resultIndex = new AtomicInteger();
+        InvocationHandler statementHandler = (Object unused, Method method, Object[] args) -> {
+            switch (method.getName()) {
+                case "execute":
+                    return false;
+                case "getUpdateCount":
+                    return resultIndex.get() == 0 ? updateCount : -1;
+                case "getMoreResults":
+                    return resultIndex.incrementAndGet() == 1;
+                case "getResultSet":
+                    return resultSet;
                 case "close":
                     return null;
                 default:

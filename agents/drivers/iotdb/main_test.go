@@ -26,6 +26,16 @@ func TestHandshakeAdvertisesNativeCapabilities(t *testing.T) {
 	}
 }
 
+func TestExecuteTransactionIsRejectedBeforeConnecting(t *testing.T) {
+	server := &server{}
+	_, err := server.executeStatements(map[string]json.RawMessage{
+		"statements": json.RawMessage(`["INSERT INTO metrics(device, time, value) VALUES ('d1', 1, 1)"]`),
+	}, true)
+	if err == nil || err.Error() != "IoTDB does not support transactions" {
+		t.Fatalf("expected unsupported transaction error, got %v", err)
+	}
+}
+
 func TestHandleLineClassifiesMissingSession(t *testing.T) {
 	response, _ := newRuntimeServer().handleLine(
 		`{"jsonrpc":"2.0","id":7,"method":"validate_session","params":{"agentSessionId":"missing"}}`,
@@ -120,14 +130,89 @@ func TestMetadataHelpers(t *testing.T) {
 
 func TestNormalizeIoTDBValues(t *testing.T) {
 	when := time.Date(2026, time.August, 10, 12, 34, 56, 123, time.FixedZone("CST", 8*60*60))
-	if got := normalizeIoTDBValue(when, "TIMESTAMP"); got != "2026-08-10T12:34:56.000000123+08:00" {
-		t.Fatalf("unexpected timestamp: %#v", got)
+	if got := normalizeIoTDBValue(when, "DATETIME"); got != "2026-08-10T12:34:56.000000123+08:00" {
+		t.Fatalf("unexpected datetime: %#v", got)
 	}
 	if got := normalizeIoTDBValue(when, "DATE"); got != "2026-08-10" {
 		t.Fatalf("unexpected date: %#v", got)
 	}
 	if got := normalizeIoTDBValue([]byte{0xde, 0xad}, "BLOB"); got != "dead" {
 		t.Fatalf("unexpected blob: %#v", got)
+	}
+}
+
+func TestTreeTimeColumnPresentation(t *testing.T) {
+	columns := []string{"Time", "root.db.d1.s1"}
+	for _, precision := range []string{"ms", "us", "ns"} {
+		types := normalizedColumnTypes([]string{"INT64", "DOUBLE"}, columns, client.TreeSqlDialect, precision)
+		want := []string{"TIMESTAMP(" + precision + ")", "DOUBLE"}
+		if !reflect.DeepEqual(types, want) {
+			t.Fatalf("unexpected tree column types for %s: %#v", precision, types)
+		}
+	}
+}
+
+func TestTableTimestampColumnPresentation(t *testing.T) {
+	columns := []string{"time", "device", "event_time"}
+	for _, precision := range []string{"ms", "us", "ns"} {
+		got := normalizedColumnTypes([]string{"TIMESTAMP", "STRING", "TIMESTAMP"}, columns, client.TableSqlDialect, precision)
+		want := []string{"TIMESTAMP(" + precision + ")", "STRING", "TIMESTAMP(" + precision + ")"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("unexpected table column types for %s: %#v", precision, got)
+		}
+	}
+}
+
+func TestUnknownTimestampPrecisionDoesNotEnableFormattingMetadata(t *testing.T) {
+	columns := []string{"Time", "root.db.d1.s1"}
+	if got := normalizedColumnTypes([]string{"INT64", "DOUBLE"}, columns, client.TreeSqlDialect, ""); !reflect.DeepEqual(got, []string{"TIMESTAMP", "DOUBLE"}) {
+		t.Fatalf("unexpected unknown-precision types: %#v", got)
+	}
+	for _, value := range []string{"ms", "US", " ns "} {
+		if normalizeTimestampPrecision(value) == "" {
+			t.Fatalf("expected supported precision %q", value)
+		}
+	}
+	if normalizeTimestampPrecision("seconds") != "" {
+		t.Fatal("unsupported precision must not be accepted")
+	}
+}
+
+func TestTreeTimeColumnPresentationDoesNotRewriteOrdinaryInt64(t *testing.T) {
+	columns := []string{"Time", "value"}
+	if got := normalizedColumnTypes([]string{"INT64", "INT64"}, columns, client.TableSqlDialect, "ms"); !reflect.DeepEqual(got, []string{"INT64", "INT64"}) {
+		t.Fatalf("unexpected table column types: %#v", got)
+	}
+	if got := normalizedColumnTypes([]string{"INT64", "INT64"}, []string{"value", "Time"}, client.TreeSqlDialect, "ms"); !reflect.DeepEqual(got, []string{"INT64", "INT64"}) {
+		t.Fatalf("unexpected non-axis column types: %#v", got)
+	}
+}
+
+func TestTreeTimeAggregationColumnsPresentAsTimestamps(t *testing.T) {
+	columns := []string{
+		"max_time(root.db.d1.s1)",
+		"MIN_TIME(root.db.d1.s1)",
+		" max_time(root.db.d1.s1) ",
+		"max_by(Time,root.db.d1.s1)",
+		"MIN_BY( time , root.db.d1.s1 )",
+		"avg(root.db.d1.s1)",
+		"count(root.db.d1.s1)",
+	}
+	got := normalizedColumnTypes([]string{"INT64", "INT64", "INT64", "INT64", "INT64", "DOUBLE", "INT64"}, columns, client.TreeSqlDialect, "ms")
+	want := []string{"TIMESTAMP(ms)", "TIMESTAMP(ms)", "TIMESTAMP(ms)", "TIMESTAMP(ms)", "TIMESTAMP(ms)", "DOUBLE", "INT64"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected tree aggregation types: %#v", got)
+	}
+	if name := normalizedColumnTypes([]string{"INT64"}, []string{"max_timer(root.db.d1.s1)"}, client.TreeSqlDialect, "ms"); !reflect.DeepEqual(name, []string{"INT64"}) {
+		t.Fatalf("unrelated prefix must stay INT64: %#v", name)
+	}
+	if table := normalizedColumnTypes([]string{"INT64"}, []string{"max_time(t1.s1)"}, client.TableSqlDialect, "ms"); !reflect.DeepEqual(table, []string{"INT64"}) {
+		t.Fatalf("table dialect must stay INT64: %#v", table)
+	}
+	for _, column := range []string{"max_by(s1,time)", "max_by(event_time,s1)", "max_bytes(time,s1)"} {
+		if got := normalizedColumnTypes([]string{"INT64"}, []string{column}, client.TreeSqlDialect, "ms"); !reflect.DeepEqual(got, []string{"INT64"}) {
+			t.Fatalf("non-time max_by result %q must stay INT64: %#v", column, got)
+		}
 	}
 }
 

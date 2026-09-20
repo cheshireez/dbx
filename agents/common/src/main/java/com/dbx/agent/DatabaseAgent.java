@@ -56,7 +56,7 @@ public interface DatabaseAgent {
     default List<ObjectInfo> listObjects(String schema) {
         List<ObjectInfo> result = new ArrayList<>();
         for (TableInfo table : listTables(schema)) {
-            result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment()));
+            result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment(), table.getValid()));
         }
         return result;
     }
@@ -147,6 +147,14 @@ public interface DatabaseAgent {
 
     List<TriggerInfo> listTriggers(String schema, String table);
 
+    default List<PartitionInfo> listPartitions(String schema, String table) {
+        return Collections.emptyList();
+    }
+
+    default List<PartitionInfo> listSubpartitions(String schema, String table) {
+        return Collections.emptyList();
+    }
+
     default QueryResult executeQuery(String sql, String schema) {
         return executeQuery(sql, schema, new ExecuteQueryOptions());
     }
@@ -224,13 +232,71 @@ public interface DatabaseAgent {
         if (conn == null) {
             throw new IllegalStateException("Not connected");
         }
-        return TransactionExecutor.executeUpdateStatements(
-            conn,
-            statements,
-            schema,
-            this::setSchemaSQL,
-            this::resetSchemaSQL
-        );
+        return unchecked(() -> {
+            if (!conn.getAutoCommit()) {
+                throw new IllegalStateException("Cannot start a one-shot transaction while a manual transaction is open");
+            }
+            return TransactionExecutor.executeUpdateStatements(
+                conn,
+                statements,
+                schema,
+                this::setSchemaSQL,
+                this::resetSchemaSQL
+            );
+        });
+    }
+
+    /** Starts an interactive transaction on the current JDBC connection. */
+    default Map<String, Object> beginManualTransaction(String schema) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return unchecked(() -> {
+            if (!conn.getAutoCommit()) {
+                throw new IllegalStateException("Manual transaction already open");
+            }
+            if (schema != null && !schema.trim().isEmpty()) {
+                JdbcSchemaSwitcher.apply(conn, schema, this::setSchemaSQL, this::resetSchemaSQL);
+            }
+            conn.setAutoCommit(false);
+            JdbcSchemaSwitcher.preserve(conn);
+            return Collections.singletonMap("ok", (Object) true);
+        });
+    }
+
+    /** Commits an interactive transaction on the current JDBC connection. */
+    default Map<String, Object> commitManualTransaction() {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return unchecked(() -> {
+            if (conn.getAutoCommit()) {
+                throw new IllegalStateException("No manual transaction open");
+            }
+            conn.commit();
+            conn.setAutoCommit(true);
+            JdbcSchemaSwitcher.releasePreserved(conn);
+            return Collections.singletonMap("ok", (Object) true);
+        });
+    }
+
+    /** Rolls back an interactive transaction on the current JDBC connection. */
+    default Map<String, Object> rollbackManualTransaction() {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return unchecked(() -> {
+            if (conn.getAutoCommit()) {
+                throw new IllegalStateException("No manual transaction open");
+            }
+            conn.rollback();
+            conn.setAutoCommit(true);
+            JdbcSchemaSwitcher.releasePreserved(conn);
+            return Collections.singletonMap("ok", (Object) true);
+        });
     }
 
     default QueryResult executeBatch(List<String> statements, String schema) {

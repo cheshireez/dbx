@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, nextTick, watch, onMounted, onBeforeUnmount } from "vue";
+import { computed, ref, shallowRef, nextTick, watch, onMounted, onBeforeUnmount, toRaw } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
-import { RefreshCw, Trash2, Plus, Save, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Table2, Braces, X, Search, Wrench, Filter, Columns3Cog, SquareDashed, Minus, Rows3, AlignLeft, AlignRight, EyeOff } from "@lucide/vue";
+import { RefreshCw, Trash2, Plus, Save, ChevronDown, ChevronLeft, ChevronRight, Table2, Braces, X, Search, Wrench, Filter, Columns3Cog, SquareDashed, Minus, Rows3, AlignLeft, AlignRight, EyeOff, Palette, Copy } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -18,10 +18,12 @@ import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { Switch } from "@/components/ui/switch";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import * as api from "@/lib/backend/api";
+import type { DynamoDbIndexInfo, DynamoDbTableDescription } from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { getDataGridConditionSuggestionPosition, type DataGridConditionSuggestionPosition } from "@/lib/dataGrid/dataGridConditionSuggestionPosition";
 import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
 import { documentViewerFontStyle } from "@/lib/document/documentViewerFontStyle";
-import { clampDocumentPage, documentPageRequestLimit, resetElasticsearchDocumentTotals, resolveElasticsearchDocumentTotals } from "@/lib/document/elasticsearchDocumentTotals";
+import { ELASTICSEARCH_DEFAULT_MAX_RESULT_WINDOW, clampDocumentPage, resetElasticsearchDocumentTotals, resolveElasticsearchDocumentTotals } from "@/lib/document/elasticsearchDocumentTotals";
 import { canGoNextDocumentPage, isSameDocumentQueryTotalCountRequest, resolveDocumentQueryTotals, type DocumentQueryTotalCountRequest } from "@/lib/document/documentQueryTotals";
 import {
   arrayObjectAncestorPathForDocumentField,
@@ -36,7 +38,9 @@ import {
   flattenDocumentFieldPathTree,
   searchDocumentFieldPathTree,
   documentFilterModeNeedsValue,
-  documentFilterModeOptions,
+  documentFilterModeOptionsFor,
+  documentFilterModeUsesList,
+  documentFilterModeUsesRange,
   documentFilterValueTypeOptions,
   documentStoreProviderFor,
   elasticsearchBoolClauseOptions,
@@ -55,17 +59,20 @@ import {
   type ElasticsearchQueryType,
 } from "@/lib/app/documentStoreProvider";
 import {
+  formatDocumentStoreIdLabel,
   isDocumentStoreIdentityField,
   normalizeDocumentStoreRouting,
   parseDocumentStoreInputValue,
   parseDocumentStoreJsonDocument,
   planDocumentStoreIdentityMigration,
+  prepareDocumentStoreWriteDocument,
   resolveDocumentStoreWriteRouting,
   serializeDocumentStoreId,
   stringifyDocumentStoreValue,
   documentStoreValueForGrid,
 } from "@/lib/app/documentJsonValues";
-import { applyDocumentStoreIdentityPlan, insertDocumentStoreDocument as insertDocumentStoreDocumentCore } from "@/lib/app/documentStoreSave";
+import { applyDocumentStoreIdentityPlan, formatMeilisearchDocumentOperationPreview, insertDocumentStoreDocument as insertDocumentStoreDocumentCore } from "@/lib/app/documentStoreSave";
+import { restoreDocumentBrowserState, saveDocumentBrowserState, type DocumentBrowserDataSnapshot } from "@/lib/tabs/documentBrowserStateCache";
 import RedisJsonEditor from "@/components/redis/RedisJsonEditor.vue";
 import { isLosslessJsonNumber, parseJsonPreservingLargeNumbers } from "@/lib/common/safeJsonFormat";
 import {
@@ -74,19 +81,38 @@ import {
   buildMongoUpdateDocument,
   formatMongoShellLiteral,
   mongoDocumentDisplayValue,
+  mongoDocumentGridValue,
   mongoDocumentGridColumnTypes,
   mongoDocumentIdForGrid,
   parseMongoDocumentInputValue,
   serializeMongoDocumentId,
   type MongoInputValue,
 } from "@/lib/mongo/mongoDocumentValues";
+import {
+  buildMongoCompletionItemsFromContext,
+  getMongoDocumentQueryCompletionContext,
+  inferMongoCompletionFields,
+  mongoCompletionNeedsFields,
+  plainMongoCompletionInsertion,
+  readMongoPropertyPrefix,
+  shouldAutoOpenMongoDocumentQueryCompletion,
+  type MongoCompletionField,
+  type MongoCompletionItem,
+  type MongoDocumentQueryKind,
+} from "@/lib/mongo/mongoCompletion";
+import { mongoDocumentsToQueryResult } from "@/lib/mongo/mongoShellCommand";
 import type { GridNewRowMeta } from "@/lib/dataGrid/gridNewRowPlacement";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
-import { findDocumentTextMatches, renderDocumentJsonHtml } from "@/lib/document/documentJsonSearch";
 import { documentDataGridColumnLayoutScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
+import type { SerializedDataGridLocalColumnFilters } from "@/lib/dataGrid/dataGridLocalColumnFilterState";
 import { documentGridColumnVisibilityScopeKey, migrateDocumentGridColumnVisibilityToLayout } from "@/lib/document/documentGridColumnVisibilityStorage";
+import { matchesElasticsearchIndexPattern, subscribeElasticsearchIndexCleared, type ElasticsearchIndexClearedDetail } from "@/lib/sidebar/elasticsearchIndexActions";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore } from "@/stores/settingsStore";
+import { useToast } from "@/composables/useToast";
+import { copyToClipboard } from "@/lib/common/clipboard";
+import DocumentQueryCompletionMenu from "./DocumentQueryCompletionMenu.vue";
 import JsonEditNode from "./JsonEditNode.vue";
+
 import type { EditNode } from "@/types/editor";
 import type { ColumnInfo, DatabaseType, QueryResult, QueryTab } from "@/types/database";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
@@ -94,6 +120,7 @@ import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 
 const { t } = useI18n();
+const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 
@@ -103,25 +130,50 @@ const props = defineProps<{
   collection: string;
   databaseType?: DatabaseType;
   tableMeta?: NonNullable<QueryTab["tableMeta"]>;
+  /** Tab id; query conditions are cached per tab and restored on remount. */
+  stateKey?: string;
 }>();
 
 type JsonRecord = Record<string, unknown>;
 type ViewMode = "document" | "table";
+const DYNAMODB_DEFAULT_EXPORT_ROW_LIMIT = 10_000;
+
+// This component is keyed by tab in ContentArea and unmounted on every tab
+// switch; without restoring from the per-tab cache, coming back to the tab
+// would silently drop the user's filter/sort conditions and re-query the
+// server. Page position and rows only survive for skip-based paging: cursor
+// stores (DynamoDB/Elasticsearch) cannot resume a page without their cursor
+// stacks, and infinite scroll always restarts from the first segment.
+const restoredDocumentBrowserState = props.stateKey ? restoreDocumentBrowserState(props.stateKey) : undefined;
+const skipBasedDocumentStore = documentStoreProviderFor(props.databaseType).kind === "mongodb" || documentStoreProviderFor(props.databaseType).kind === "meilisearch";
+const restoresSkipBasedPage = !!restoredDocumentBrowserState && !settingsStore.editorSettings.infiniteScroll && skipBasedDocumentStore;
 
 const documents = ref<JsonRecord[]>([]);
 const copyDocuments = ref<JsonRecord[]>([]);
+const gridRows = shallowRef<QueryResult["rows"]>([]);
+// Set only when the most recent load() appended a continuation segment onto
+// the existing documents (infinite scroll); undefined for a full replace.
+// Mirrors QueryResult.appended_from_row_count so DataGrid's infinite-scroll
+// bookkeeping (see appendQueryResultSegment in queryStore.ts) can tell a
+// genuine append apart from a stale/failed one.
+const appendedFromRowCount = ref<number | undefined>(undefined);
 const mongoCopyDocumentsAvailable = ref(false);
 const lastGridColumns = ref<string[]>([]);
 const lastGridColumnTypes = ref<string[]>([]);
 const total = ref<number | undefined>(undefined);
+// Logical-result identity for DataGrid's tab-switch view snapshot. A data tab
+// gets this from queryStore.publishResultGeneration; document tabs have no
+// store-side result, so the browser mints one per completed load and inherits
+// it on an infinite-scroll append and on a cache restore.
+const documentViewGeneration = ref<string | undefined>(undefined);
 const totalIsExact = ref(true);
 const paginationTotal = ref<number | undefined>(undefined);
 const loading = ref(false);
 const documentLoadExecutionId = ref("");
 const documentLoadCancelling = ref(false);
 const documentLoadingElapsedSeconds = ref("0.0");
-const page = ref(0);
-const pageSize = ref(normalizeResultPageSize(settingsStore.editorSettings.pageSize));
+const page = ref(restoresSkipBasedPage ? Math.max(0, Math.trunc(restoredDocumentBrowserState!.page)) : 0);
+const pageSize = ref(normalizeResultPageSize(settingsStore.editorSettings.tableOpenPageSize));
 const selectedIdx = ref<number | null>(null);
 const editJson = ref("");
 const isEditing = ref(false);
@@ -135,23 +187,21 @@ const columnWidthDensity = computed(() => settingsStore.editorSettings.columnWid
 const dataGridRenderMode = computed(() => settingsStore.editorSettings.dataGridRenderMode);
 const tableFontSize = computed(() => settingsStore.editorSettings.tableFontSize);
 const numericColumnRightAlign = computed(() => settingsStore.editorSettings.numericColumnRightAlign ?? true);
+const colorizeDataGridCellTypes = computed(() => settingsStore.editorSettings.colorizeDataGridCellTypes);
 const viewMode = computed<ViewMode>({
   get: () => settingsStore.editorSettings.mongoViewMode,
   set: (value) => settingsStore.updateEditorSettings({ mongoViewMode: value }),
 });
-const filterInput = ref("");
-const sortInput = ref("");
+const filterInput = ref(restoredDocumentBrowserState?.filterInput ?? "");
+const sortInput = ref(restoredDocumentBrowserState?.sortInput ?? "");
+const localColumnFilters = ref<SerializedDataGridLocalColumnFilters>(restoredDocumentBrowserState?.localColumnFilters ?? {});
+const localColumnFilterColumns = ref<string[] | undefined>(restoredDocumentBrowserState?.localColumnFilterColumns);
 const filterInputRef = ref<HTMLTextAreaElement>();
 const sortInputRef = ref<HTMLTextAreaElement>();
 const dataGridRef = ref<InstanceType<typeof DataGrid>>();
 const viewOptionsOpen = ref(false);
 const mongoUpdateTarget = computed(() => (props.databaseType === "mongodb" && mongoCopyDocumentsAvailable.value ? { collection: props.collection, idColumn: "_id" as const } : undefined));
-const documentViewerRef = ref<HTMLElement>();
-const documentSearchInputRef = ref<HTMLInputElement>();
-const documentSearchOpen = ref(false);
-const documentSearchQuery = ref("");
-const documentSearchMatchIndex = ref(0);
-const documentSearchHasNavigated = ref(false);
+const documentJsonEditorRef = ref<{ openSearch: () => boolean }>();
 const documentViewerSearchActive = ref(false);
 
 function openDataGridExtractorConfiguration() {
@@ -181,6 +231,10 @@ function increaseTableFontSize() {
 
 function setNumericColumnRightAlign(value: boolean) {
   settingsStore.updateEditorSettings({ numericColumnRightAlign: value });
+}
+
+function setColorizeDataGridCellTypes(value: boolean) {
+  settingsStore.updateEditorSettings({ colorizeDataGridCellTypes: value });
 }
 const tableSearchSplitContainerRef = ref<HTMLDivElement>();
 const tableFindPaneWidth = ref<number | null>(null);
@@ -223,17 +277,19 @@ watch(
 
 const pageTotal = computed(() => paginationTotal.value);
 const documentPageCount = computed(() => (pageTotal.value === undefined ? undefined : Math.max(1, Math.ceil(pageTotal.value / pageSize.value))));
-const canGoNextPage = computed(() =>
-  canGoNextDocumentPage({
+const canGoNextPage = computed(() => {
+  if (documentStoreProvider.value.kind === "dynamodb") return dynamodbHasNextCursor.value;
+  if (documentStoreProvider.value.kind === "elasticsearch") return elasticsearchHasNextCursor.value;
+  return canGoNextDocumentPage({
     page: page.value,
     pageSize: pageSize.value,
     rowCount: documents.value.length,
     paginationTotal: pageTotal.value,
-  }),
-);
+  });
+});
 const documentRequestLimit = computed(() => {
-  if (documentStoreProvider.value.kind !== "elasticsearch" || paginationTotal.value === undefined) return pageSize.value;
-  return documentPageRequestLimit(page.value, pageSize.value, paginationTotal.value);
+  if (documentStoreProvider.value.kind !== "elasticsearch") return pageSize.value;
+  return Math.min(pageSize.value, ELASTICSEARCH_DEFAULT_MAX_RESULT_WINDOW);
 });
 
 const tableFindPaneStyle = computed(() => {
@@ -243,6 +299,8 @@ const tableFindPaneStyle = computed(() => {
 const documentFontStyle = computed(() => documentViewerFontStyle(settingsStore.editorSettings));
 const documentStoreLabels = computed(() => ({
   documentsLabel: documentStoreProvider.value.documentsLabel({ total: total.value ?? 0, totalIsExact: totalIsExact.value, t }),
+  filterInputLabel: documentStoreProvider.value.kind === "dynamodb" ? t("dynamodb.filter") : documentStoreProvider.value.filterInputLabel,
+  sortInputLabel: documentStoreProvider.value.kind === "dynamodb" ? t("dynamodb.sortKey") : documentStoreProvider.value.sortInputLabel,
   queryPreview: documentQueryPreview.value,
 }));
 
@@ -265,9 +323,184 @@ type DocumentGridChanges = {
 const documentFilterBuilderOpen = ref(false);
 const documentFilterFieldPopoverOpen = ref<Record<string, boolean>>({});
 const documentFilterFieldSearch = ref<Record<string, string>>({});
-const documentFilterRules = ref<DocumentFilterRule[]>([]);
-const appliedDocumentFilter = ref<Record<string, unknown> | null>(null);
+const documentFilterRules = ref<DocumentFilterRule[]>(restoredDocumentBrowserState?.documentFilterRules ?? []);
+const appliedDocumentFilter = ref<Record<string, unknown> | null>(restoredDocumentBrowserState?.appliedDocumentFilter ?? null);
+
+// Identity + conditions the currently held rows were loaded under. Rows are
+// only worth replaying while this still matches the live inputs; a filter edit
+// with a load still in flight would otherwise pair new conditions with stale
+// rows on the next remount.
+function documentDataSignature(): string | undefined {
+  try {
+    return JSON.stringify([documentStoreProvider.value.kind, props.connectionId, props.database, props.collection, currentDocumentFilter() ?? null, currentDocumentSortJson(sortInput.value) ?? null, page.value, pageSize.value, settingsStore.editorSettings.infiniteScroll === true]);
+  } catch {
+    // Malformed filter/sort JSON: nothing stable to key rows against.
+    return undefined;
+  }
+}
+
+// Local value filters describe column values, not the rows that happen to be
+// loaded, so paging and page-size changes must not drop them. Only a new query
+// (collection, filter or sort) invalidates the snapshot; restored filters are
+// mapped back by column name, so a changed column set is handled as well.
+function documentLocalColumnFilterSignature(): string | undefined {
+  try {
+    return JSON.stringify([documentStoreProvider.value.kind, props.connectionId, props.database, props.collection, currentDocumentFilter() ?? null, currentDocumentSortJson(sortInput.value) ?? null]);
+  } catch {
+    // Malformed filter/sort JSON: nothing stable to key filters against.
+    return undefined;
+  }
+}
+
+const documentLocalColumnFilterRestoreKey = computed(() => documentLocalColumnFilterSignature());
+
+let loadedDocumentDataSignature: string | undefined;
+
+function captureDocumentBrowserData(): DocumentBrowserDataSnapshot | undefined {
+  // Cursor stores (DynamoDB/Elasticsearch) drop their cursor stacks on unmount
+  // and cannot resume a page without them, so they keep restarting at page 0.
+  if (!skipBasedDocumentStore) return undefined;
+  // Never completed a load, mid-flight, or errored — let the remount retry.
+  if (lastGridColumns.value.length === 0 || loading.value || error.value) return undefined;
+  const signature = documentDataSignature();
+  if (!signature || signature !== loadedDocumentDataSignature) return undefined;
+  return {
+    signature,
+    viewGeneration: documentViewGeneration.value,
+    // Unwrap the reactive proxies: this snapshot outlives the component.
+    documents: toRaw(documents.value),
+    copyDocuments: toRaw(copyDocuments.value),
+    copyDocumentsAvailable: mongoCopyDocumentsAvailable.value,
+    gridColumns: toRaw(lastGridColumns.value),
+    gridColumnTypes: toRaw(lastGridColumnTypes.value),
+    total: total.value,
+    totalIsExact: totalIsExact.value,
+    paginationTotal: paginationTotal.value,
+    selectedIdx: selectedIdx.value,
+  };
+}
+
+function persistDocumentBrowserState(options: { includeData?: boolean } = {}) {
+  if (!props.stateKey) return;
+  saveDocumentBrowserState(props.stateKey, {
+    filterInput: filterInput.value,
+    sortInput: sortInput.value,
+    appliedDocumentFilter: appliedDocumentFilter.value,
+    documentFilterRules: documentFilterRules.value,
+    page: page.value,
+    localColumnFilters: localColumnFilters.value,
+    localColumnFilterColumns: localColumnFilterColumns.value,
+    // Any condition change drops the payload; only the unmount capture stores
+    // rows, so a cached page can never outlive the conditions that produced it.
+    data: options.includeData ? captureDocumentBrowserData() : undefined,
+  });
+}
+
+function handleLocalColumnFiltersChange(filters: SerializedDataGridLocalColumnFilters) {
+  localColumnFilters.value = Object.fromEntries(Object.entries(filters).map(([columnIndex, values]) => [columnIndex, [...values]]));
+  localColumnFilterColumns.value = Object.keys(filters).length > 0 ? [...gridResult.value.columns] : undefined;
+  // Local value filters only change the client-side view. Keep the loaded rows
+  // in the tab snapshot so returning to the tab does not trigger a reload.
+  persistDocumentBrowserState({ includeData: true });
+}
+
+// Keep these sources in lockstep with documentLocalColumnFilterSignature(): a
+// changed query means the local-filter snapshot no longer describes what the
+// user is looking at.
+watch(
+  [filterInput, sortInput, appliedDocumentFilter],
+  () => {
+    localColumnFilters.value = {};
+    localColumnFilterColumns.value = undefined;
+    persistDocumentBrowserState();
+  },
+  { deep: true },
+);
+// Paging and page-size changes reload rows, but the local value filters stay put.
+watch([page, pageSize, () => settingsStore.editorSettings.infiniteScroll], () => persistDocumentBrowserState());
+watch(documentFilterRules, () => persistDocumentBrowserState(), { deep: true });
+
+// Seed the grid from the cached page so a tab switch costs no round trip
+// (#8679). The signature guard rejects a snapshot whose identity or conditions
+// no longer match — a changed page-size setting, say — and falls through to a
+// normal load.
+const restoredDocumentData = skipBasedDocumentStore && restoredDocumentBrowserState?.data && restoredDocumentBrowserState.data.signature === documentDataSignature() ? restoredDocumentBrowserState.data : undefined;
+if (restoredDocumentData) {
+  // Assign the columns before committing so a collection that loaded empty
+  // stays distinguishable from one that never loaded: commitLoadedDocuments
+  // reads a non-empty lastGridColumns as "a load has completed", which is what
+  // drives the refresh toolbar for an empty collection.
+  lastGridColumns.value = restoredDocumentData.gridColumns;
+  lastGridColumnTypes.value = restoredDocumentData.gridColumnTypes;
+  commitLoadedDocuments(restoredDocumentData.documents, restoredDocumentData.copyDocuments, restoredDocumentData.copyDocumentsAvailable, false, documentStoreProvider.value.kind);
+  total.value = restoredDocumentData.total;
+  totalIsExact.value = restoredDocumentData.totalIsExact;
+  paginationTotal.value = restoredDocumentData.paginationTotal;
+  loadedDocumentDataSignature = restoredDocumentData.signature;
+  // Same rows as before the switch, so the grid may replay its viewport.
+  documentViewGeneration.value = restoredDocumentData.viewGeneration;
+  const restoredSelectedIdx = restoredDocumentData.selectedIdx;
+  if (restoredSelectedIdx !== null && restoredSelectedIdx >= 0 && restoredSelectedIdx < documents.value.length) {
+    selectedIdx.value = restoredSelectedIdx;
+    editJson.value = stringifyDocumentStoreValue(documents.value[restoredSelectedIdx], documentStoreProvider.value.kind, 2);
+  }
+  // Keep the grid's "count total rows" action working without a preceding load.
+  loadedDocumentQueryTotalCountRequest = {
+    connectionId: props.connectionId,
+    database: props.database,
+    collection: props.collection,
+    filter: currentDocumentFilter(),
+    generation: documentRequestGeneration,
+    storeKind: documentStoreProvider.value.kind,
+  };
+}
+
 const elasticsearchMappingFields = ref<ColumnInfo[]>([]);
+function elasticsearchGridColumnTypesFor(columns: readonly string[]): string[] {
+  const mappingTypes = elasticsearchFieldTypes.value;
+  return columns.map((column) => {
+    // Elasticsearch metadata fields are not part of an index mapping, but they
+    // are textual identifiers in the document grid just like mapped keywords.
+    if (column === "_id" || column === "_routing" || column === "_type") return "keyword";
+    return mappingTypes.get(column) ?? "";
+  });
+}
+const elasticsearchGridColumnTypes = computed(() => elasticsearchGridColumnTypesFor(lastGridColumns.value));
+const dynamodbTableDescription = ref<DynamoDbTableDescription | null>(null);
+const dynamodbIndexName = ref("__table__");
+const dynamodbPageCursors = ref<Array<string | undefined>>([undefined]);
+const dynamodbHasNextCursor = ref(false);
+const dynamodbExactTotal = ref<number | undefined>();
+const elasticsearchPageCursors = ref<Array<string | undefined>>([undefined]);
+const elasticsearchHasNextCursor = ref(false);
+let dynamodbExactCountKey: string | null = null;
+
+const dynamodbIndexOptions = computed<Array<{ value: string; label: string; index?: DynamoDbIndexInfo }>>(() => [
+  { value: "__table__", label: t("dynamodb.baseTable") },
+  ...(dynamodbTableDescription.value?.indexes ?? []).map((index) => ({
+    value: index.name,
+    label: `${index.name} (${index.kind === "global" ? "GSI" : "LSI"} · ${index.projectionType})`,
+    index,
+  })),
+]);
+
+const dynamodbSelectedIndex = computed(() => {
+  if (dynamodbIndexName.value === "__table__") return undefined;
+  return dynamodbTableDescription.value?.indexes.find((index) => index.name === dynamodbIndexName.value);
+});
+
+const dynamodbPartialProjectionReadOnly = computed(() => documentStoreProvider.value.kind === "dynamodb" && !!dynamodbSelectedIndex.value && dynamodbSelectedIndex.value.projectionType !== "ALL");
+const documentStoreEditable = computed(() => !dynamodbPartialProjectionReadOnly.value);
+const documentStoreEditDisabledReason = computed(() => (dynamodbPartialProjectionReadOnly.value ? t("dynamodb.partialProjectionReadOnly", { projection: dynamodbSelectedIndex.value?.projectionType ?? "UNKNOWN" }) : undefined));
+
+const dynamodbSelectedKey = computed(() => {
+  const table = dynamodbTableDescription.value;
+  if (!table) return null;
+  if (dynamodbIndexName.value === "__table__") {
+    return { partitionKey: table.partitionKey, sortKey: table.sortKey };
+  }
+  return dynamodbSelectedIndex.value ?? null;
+});
 
 const pendingDelete = ref<PendingDelete | null>(null);
 const documentFilterComposingEditors = new Set<string>();
@@ -280,21 +513,9 @@ const selectedDoc = computed(() => {
 });
 const selectedDocumentIdLabel = computed(() => {
   if (isNew.value) return "New";
-  const id = selectedDoc.value?._id;
-  if (id === undefined || id === null) return "";
-  return typeof id === "object" ? stringifyDocumentStoreValue(id, documentStoreProvider.value.kind) : String(id);
+  return formatDocumentStoreIdLabel(selectedDoc.value?._id, documentStoreProvider.value.kind);
 });
 const selectedDocumentIdWidth = computed(() => `${Math.min(Math.max(Array.from(selectedDocumentIdLabel.value).length + 2, 5), 52)}ch`);
-const documentSearchText = computed(() => editJson.value);
-const documentSearchMatches = computed(() => findDocumentTextMatches(documentSearchText.value, documentSearchQuery.value));
-const documentSearchActiveIndex = computed(() => {
-  if (documentSearchMatches.value.length === 0) return 0;
-  return Math.min(documentSearchMatchIndex.value, documentSearchMatches.value.length - 1);
-});
-const documentSearchStatus = computed(() => {
-  const count = documentSearchMatches.value.length;
-  return count > 0 ? `${documentSearchActiveIndex.value + 1}/${count}` : "0/0";
-});
 
 const editKeyWidth = computed(() => {
   const longest = editFields.value.reduce((max, field) => {
@@ -308,9 +529,15 @@ const deleteDetails = computed(() => {
   if (!pending) return "";
   if (pending.kind === "document") {
     const id = documents.value[pending.index]?._id ?? "";
+    if (documentStoreProvider.value.kind === "dynamodb") {
+      return t("dynamodb.documentDetails", {
+        table: props.collection,
+        id: formatDocumentStoreIdLabel(id, "dynamodb"),
+      });
+    }
     const displayId = mongoDocumentIdForGrid(id);
-    if (props.databaseType === "elasticsearch" || props.databaseType === "easysearch") {
-      const product = props.databaseType === "easysearch" ? "Easysearch" : "Elasticsearch";
+    if (props.databaseType === "elasticsearch" || props.databaseType === "easysearch" || props.databaseType === "meilisearch") {
+      const product = props.databaseType === "easysearch" ? "Easysearch" : props.databaseType === "meilisearch" ? "Meilisearch" : "Elasticsearch";
       return `${product} index: ${props.collection}\nDocument _id: ${String(displayId)}`;
     }
     return t("dangerDialog.mongoDocumentDetails", { collection: props.collection, id: String(displayId) });
@@ -318,42 +545,172 @@ const deleteDetails = computed(() => {
   return t("dangerDialog.mongoFieldDetails", { field: pending.name || t("mongo.field") });
 });
 
-const gridResult = computed<QueryResult>(() => {
-  const docs = documents.value;
-  if (!docs.length) {
-    return {
-      columns: lastGridColumns.value,
-      column_types: lastGridColumnTypes.value,
-      rows: [],
-      affected_rows: 0,
-      execution_time_ms: 0,
-      truncated: false,
-    };
-  }
-
+function documentGridColumns(documentsToRender: JsonRecord[]): string[] {
   const keySet = new Set<string>();
   keySet.add("_id");
-  for (const doc of docs) {
+  for (const doc of documentsToRender) {
     for (const key of Object.keys(doc)) {
       if (key !== "_id") keySet.add(key);
     }
   }
-  const columns = [...keySet];
-  const columnTypes = documentStoreProvider.value.kind === "mongodb" ? mongoDocumentGridColumnTypes(docs, columns) : undefined;
+  return [...keySet];
+}
 
-  const rows = docs.map((doc) =>
-    columns.map((col) => {
-      const val = mongoDocumentDisplayValue(doc[col]);
-      if (val === undefined || val === null) return null;
-      if (col === "_id") return documentStoreProvider.value.kind === "elasticsearch" ? documentStoreValueForGrid(val, "elasticsearch") : mongoDocumentIdForGrid(val);
-      if (typeof val === "object") return documentStoreValueForGrid(val, documentStoreProvider.value.kind);
-      if (typeof val === "string" || typeof val === "number" || typeof val === "boolean") return val;
-      return String(val);
-    }),
-  );
+function documentGridRow(doc: JsonRecord, columns: string[], kind: DocumentStoreKind): QueryResult["rows"][number] {
+  return columns.map((column) => {
+    const rawValue = doc[column];
+    // MongoDB distinguishes a missing field from an explicit BSON null. Keep a
+    // missing field visually blank; the NULL grid sentinel is reserved for an
+    // existing field whose BSON value is null.
+    if (kind === "mongodb" && rawValue === undefined) return "";
+    const value = kind === "mongodb" ? mongoDocumentGridValue(rawValue) : mongoDocumentDisplayValue(rawValue);
+    if (value === undefined || value === null) return null;
+    if (column === "_id") return kind === "mongodb" ? mongoDocumentIdForGrid(value) : documentStoreValueForGrid(value, kind);
+    if (typeof value === "object") return documentStoreValueForGrid(value, kind);
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+    return String(value);
+  });
+}
 
-  return { columns, column_types: columnTypes, rows, mongo_documents: docs, mongo_copy_documents: copyDocuments.value, affected_rows: 0, execution_time_ms: 0, truncated: false };
+function sameGridColumns(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((column, index) => column === right[index]);
+}
+
+function commitLoadedDocuments(nextDocuments: JsonRecord[], nextCopyDocuments: JsonRecord[], hasTypePreservingCopyDocuments: boolean, append: boolean, kind: DocumentStoreKind) {
+  const previousDocumentCount = documents.value.length;
+  const combinedDocuments = append ? [...documents.value, ...nextDocuments] : nextDocuments;
+  // A collection that has never returned any document (as opposed to one that
+  // returned documents before and is now empty) would otherwise keep
+  // `lastGridColumns` at its initial `[]` forever, which the grid reads as
+  // "no query has completed" and renders without a toolbar/refresh button.
+  const hasEstablishedColumns = lastGridColumns.value.length > 0;
+  const nextColumns = combinedDocuments.length > 0 || !hasEstablishedColumns ? documentGridColumns(combinedDocuments) : lastGridColumns.value;
+  const canAppendGridRows = append && gridRows.value.length === previousDocumentCount && sameGridColumns(lastGridColumns.value, nextColumns);
+
+  documents.value = combinedDocuments;
+  copyDocuments.value = append ? [...copyDocuments.value, ...nextCopyDocuments] : nextCopyDocuments;
+  mongoCopyDocumentsAvailable.value = append ? mongoCopyDocumentsAvailable.value && hasTypePreservingCopyDocuments : hasTypePreservingCopyDocuments;
+
+  if (combinedDocuments.length > 0 || !hasEstablishedColumns) {
+    lastGridColumns.value = nextColumns;
+    lastGridColumnTypes.value = kind === "mongodb" ? mongoDocumentGridColumnTypes(combinedDocuments, nextColumns) : [];
+  }
+
+  if (canAppendGridRows) {
+    appendedFromRowCount.value = previousDocumentCount;
+    gridRows.value = [...gridRows.value, ...nextDocuments.map((document) => documentGridRow(document, nextColumns, kind))];
+    return;
+  }
+
+  appendedFromRowCount.value = undefined;
+  gridRows.value = combinedDocuments.map((document) => documentGridRow(document, nextColumns, kind));
+}
+
+const gridResult = computed<QueryResult>(() => {
+  const docs = documents.value;
+  const columnTypes = documentStoreProvider.value.kind === "elasticsearch" ? elasticsearchGridColumnTypes.value : lastGridColumnTypes.value;
+  if (!docs.length) {
+    return {
+      columns: lastGridColumns.value,
+      column_types: columnTypes,
+      rows: [],
+      affected_rows: 0,
+      execution_time_ms: 0,
+      truncated: false,
+      local_column_filters: localColumnFilters.value,
+    };
+  }
+
+  return {
+    columns: lastGridColumns.value,
+    column_types: columnTypes,
+    rows: gridRows.value,
+    mongo_documents: docs,
+    mongo_copy_documents: copyDocuments.value,
+    affected_rows: 0,
+    execution_time_ms: 0,
+    truncated: false,
+    appended_from_row_count: appendedFromRowCount.value,
+    local_column_filters: localColumnFilters.value,
+  };
 });
+
+async function exportAllDocumentStoreDocuments(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void): Promise<QueryResult | undefined> {
+  const kind = documentStoreProvider.value.kind;
+  if (kind !== "mongodb" && kind !== "dynamodb" && kind !== "elasticsearch") return undefined;
+
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const collection = props.collection;
+  const filter = currentDocumentFilter();
+  const sort = currentDocumentSortJson(sortInput.value);
+  const exportSettings = settingsStore.editorSettings;
+  const batchSize = Math.max(1, Math.trunc(exportSettings.exportBatchSize));
+  const rowLimit = exportSettings.exportRowLimitEnabled ? Math.max(0, Math.trunc(exportSettings.exportRowLimit)) : kind === "dynamodb" ? DYNAMODB_DEFAULT_EXPORT_ROW_LIMIT : Number.POSITIVE_INFINITY;
+  const exportExecutionId = uuid();
+  const exportStartedAt = performance.now();
+  const exportedDocuments: JsonRecord[] = [];
+  let exportedCopyDocuments: JsonRecord[] | undefined = kind === "mongodb" ? [] : undefined;
+  let totalRows: number | null = null;
+  let cursor: string | undefined;
+  let lastCursor: string | undefined;
+  const seenCursors = new Set<string>();
+
+  try {
+    while (exportedDocuments.length < rowLimit) {
+      const requestLimit = Math.min(batchSize, kind === "dynamodb" ? 1000 : kind === "elasticsearch" ? ELASTICSEARCH_DEFAULT_MAX_RESULT_WINDOW : Number.POSITIVE_INFINITY, rowLimit - exportedDocuments.length);
+      if (requestLimit <= 0) break;
+      if (cursor) lastCursor = cursor;
+      const result = await api.documentFindDocuments(connectionId, database, collection, kind === "dynamodb" || kind === "elasticsearch" ? 0 : exportedDocuments.length, requestLimit, filter, undefined, sort, undefined, exportExecutionId, cursor, kind === "elasticsearch");
+      const pageDocuments = result.documents.slice(0, requestLimit).map(asRecord);
+      exportedDocuments.push(...pageDocuments);
+
+      if (kind === "mongodb" && exportedCopyDocuments) {
+        if (result.extended_documents?.length === result.documents.length) {
+          exportedCopyDocuments.push(...result.extended_documents.slice(0, pageDocuments.length).map(asRecord));
+        } else {
+          exportedCopyDocuments = undefined;
+        }
+      }
+
+      if ((kind === "mongodb" || kind === "elasticsearch") && result.total_is_exact !== false) totalRows = Math.min(result.total, rowLimit);
+      onProgress?.({ rowsExported: exportedDocuments.length, totalRows });
+
+      if (kind === "dynamodb" || kind === "elasticsearch") {
+        cursor = result.next_cursor;
+        if (!cursor) break;
+        if (seenCursors.has(cursor)) throw new Error(kind === "dynamodb" ? t("dynamodb.repeatedCursor") : "Elasticsearch cursor repeated during export");
+        seenCursors.add(cursor);
+        continue;
+      }
+
+      const reachedExactTotal = result.total_is_exact !== false && exportedDocuments.length >= result.total;
+      if (pageDocuments.length === 0 || pageDocuments.length < requestLimit || reachedExactTotal) break;
+    }
+  } finally {
+    if (kind === "elasticsearch") {
+      const cursorToClose = lastCursor ?? cursor;
+      if (cursorToClose) void closeElasticsearchCursor(cursorToClose);
+    }
+  }
+
+  if (kind === "dynamodb" || kind === "elasticsearch") {
+    const truncatedByLimit = !!cursor && exportedDocuments.length >= rowLimit;
+    totalRows = truncatedByLimit ? null : exportedDocuments.length;
+    onProgress?.({ rowsExported: exportedDocuments.length, totalRows });
+    if (truncatedByLimit) {
+      toast(kind === "dynamodb" ? t("dynamodb.exportLimitReached", { count: rowLimit }) : `Elasticsearch export limit reached (${rowLimit})`, 6000);
+    }
+  }
+
+  const result = mongoDocumentsToQueryResult(exportedDocuments, performance.now() - exportStartedAt, totalRows ?? exportedDocuments.length, exportedCopyDocuments, totalRows !== null);
+  if (result.columns.length === 0) result.columns = gridResult.value.columns;
+  result.column_types = kind === "mongodb" ? mongoDocumentGridColumnTypes(exportedDocuments, result.columns) : kind === "elasticsearch" ? elasticsearchGridColumnTypesFor(result.columns) : undefined;
+  result.affected_rows = exportedDocuments.length;
+  result.truncated = (kind === "dynamodb" || kind === "elasticsearch") && !!cursor && exportedDocuments.length >= rowLimit;
+  result.has_more = result.truncated;
+  return result;
+}
 const expandedDocumentFilterFieldPaths = ref<Set<string>>(new Set());
 const elasticsearchFieldTypes = computed(() => new Map(elasticsearchMappingFields.value.map((field) => [field.name, field.data_type])));
 const elasticsearchFilterFieldNames = computed(() => {
@@ -399,6 +756,7 @@ const documentStructuredFilterCount = computed(() => {
     return count + (Array.isArray(rules) ? rules.length : 0);
   }, 0);
 });
+const currentDocumentFilterModeOptions = computed(() => documentFilterModeOptionsFor(documentStoreProvider.value.kind));
 const documentLoadingLabelKey = computed(() => (documentLoadCancelling.value ? "common.stopping" : "common.loading"));
 let documentLoadingTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -550,6 +908,7 @@ function updateDocumentFilterRule(ruleId: string, patch: Partial<DocumentFilterR
     } else {
       if (patch.fieldName !== undefined && patch.fieldName !== rule.fieldName) next.valueType = "auto";
       if (!documentFilterModeNeedsValue(next.mode)) next.rawValue = "";
+      if (!documentFilterModeUsesRange(next.mode)) next.rawEndValue = "";
     }
     return next;
   });
@@ -576,8 +935,54 @@ function resetDocumentFilterBuilder() {
   documentFilterRules.value = documentFilterFieldOptions.value.length > 0 ? [createDocumentFilterRule()] : [];
 }
 
+function dynamodbCountFilterKey(filter: string | undefined): string {
+  return JSON.stringify([props.connectionId, props.collection, filter ?? ""]);
+}
+
+function resetDynamoDbExactCount() {
+  dynamodbExactCountKey = null;
+  dynamodbExactTotal.value = undefined;
+}
+
+function resetDynamoDbPagination(options: { preserveExactCount?: boolean } = {}) {
+  dynamodbPageCursors.value = [undefined];
+  dynamodbHasNextCursor.value = false;
+  paginationTotal.value = undefined;
+  if (!options.preserveExactCount) resetDynamoDbExactCount();
+}
+
+async function closeElasticsearchCursor(cursor?: string) {
+  if (!cursor) return;
+  try {
+    await api.closeQuerySession(props.connectionId, props.database, cursor);
+  } catch (error) {
+    console.warn("[DBX] failed to close Elasticsearch cursor", error);
+  }
+}
+
+function resetElasticsearchPagination() {
+  const cursor = [...elasticsearchPageCursors.value].reverse().find((candidate): candidate is string => !!candidate);
+  if (cursor) void closeElasticsearchCursor(cursor);
+  elasticsearchPageCursors.value = [undefined];
+  elasticsearchHasNextCursor.value = false;
+}
+
 function currentDocumentFilter(): string | undefined {
-  return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value, documentStoreProvider.value.kind);
+  const filter = currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value, documentStoreProvider.value.kind);
+  if (documentStoreProvider.value.kind !== "dynamodb" || dynamodbIndexName.value === "__table__") return filter;
+  const parsed = filter ? JSON.parse(filter) : {};
+  return JSON.stringify({ ...parsed, $index: dynamodbIndexName.value });
+}
+
+function selectDynamoDbIndex(value: unknown) {
+  const next = typeof value === "string" && value ? value : "__table__";
+  if (dynamodbIndexName.value === next) return;
+  dynamodbIndexName.value = next;
+  if (dynamodbPartialProjectionReadOnly.value && isEditing.value) cancelEdit();
+  sortInput.value = "";
+  page.value = 0;
+  resetDynamoDbPagination();
+  void load({ page: 0 });
 }
 
 function resizeDocumentQueryInput(el: HTMLTextAreaElement | undefined) {
@@ -589,6 +994,8 @@ function resizeDocumentQueryInput(el: HTMLTextAreaElement | undefined) {
 function resizeDocumentQueryInputs() {
   resizeDocumentQueryInput(filterInputRef.value);
   resizeDocumentQueryInput(sortInputRef.value);
+  // A bar that just grew a line moved the menu's anchor with it.
+  repositionOpenDocumentQueryCompletions();
 }
 
 function formatFilterInput() {
@@ -615,6 +1022,330 @@ watch([filterInput, sortInput], () => {
   void nextTick(resizeDocumentQueryInputs);
 });
 
+/* ---------------------------------------------------------------- *
+ * Filter / sort bar completion (MongoDB)
+ *
+ * The bars hold a bare query document, so they reuse the same field
+ * and operator tables as the query editor's `find({ … })` completion
+ * — a collection's field names are exactly what is too long to
+ * remember and retype here. Only MongoDB opts in: the other document
+ * stores put their own dialects in these inputs.
+ * ---------------------------------------------------------------- */
+
+type DocumentQueryCompletionTarget = "filter" | "sort";
+
+const DOCUMENT_QUERY_COMPLETION_MENU_LIMIT = 50;
+
+const documentQueryCompletionTarget = ref<DocumentQueryCompletionTarget | null>(null);
+const documentQueryCompletionItems = ref<MongoCompletionItem[]>([]);
+const documentQueryCompletionIndex = ref(0);
+const documentQueryCompletionPosition = ref<DataGridConditionSuggestionPosition>({ left: 0, top: 0, width: 0 });
+const documentQueryCompletionListboxId = `document-query-completions-${uuid()}`;
+const documentQueryCompletionEnabled = computed(() => documentStoreProvider.value.kind === "mongodb");
+const documentQueryCompletionOpen = computed(() => documentQueryCompletionTarget.value !== null && documentQueryCompletionItems.value.length > 0);
+const documentQueryCompletionActiveDescendant = computed(() => (documentQueryCompletionOpen.value ? `${documentQueryCompletionListboxId}-option-${documentQueryCompletionIndex.value}` : undefined));
+// Guards the field lookup: a keystroke that lands while a previous refresh is
+// still awaiting fields must win, and a dismiss must cancel both.
+let documentQueryCompletionRequestId = 0;
+
+function documentQueryCompletionKind(target: DocumentQueryCompletionTarget): MongoDocumentQueryKind {
+  return target === "filter" ? "filter" : "sortKeys";
+}
+
+function documentQueryCompletionInputEl(target: DocumentQueryCompletionTarget): HTMLTextAreaElement | undefined {
+  return target === "filter" ? filterInputRef.value : sortInputRef.value;
+}
+
+function documentQueryCompletionText(target: DocumentQueryCompletionTarget): string {
+  return target === "filter" ? filterInput.value : sortInput.value;
+}
+
+// Walking every loaded document is too much to redo on each keystroke — under
+// infinite scroll `documents` holds every page fetched so far — so the page's
+// fields are derived once per load and reused until the rows change.
+const documentQueryCompletionLocalFields = computed<MongoCompletionField[]>(() => (documentQueryCompletionEnabled.value ? inferMongoCompletionFields(documents.value) : []));
+
+/**
+ * Fields the collection is known to have: those visible in the loaded page,
+ * which carry the types the grid already inferred, plus the store's cached
+ * server-side sample, which also covers fields the current page happens not to
+ * contain.
+ */
+async function documentQueryCompletionFields(): Promise<MongoCompletionField[]> {
+  const byName = new Map(documentQueryCompletionLocalFields.value.map((field) => [field.name, field]));
+  let sampled: MongoCompletionField[] = [];
+  try {
+    sampled = await connectionStore.listMongoCompletionFields(props.connectionId, props.database, props.collection);
+  } catch {
+    sampled = [];
+  }
+  for (const field of sampled) if (!byName.has(field.name)) byName.set(field.name, field);
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function dismissDocumentQueryCompletions() {
+  documentQueryCompletionRequestId++;
+  documentQueryCompletionTarget.value = null;
+  documentQueryCompletionItems.value = [];
+  documentQueryCompletionIndex.value = 0;
+}
+
+async function refreshDocumentQueryCompletions(target: DocumentQueryCompletionTarget, options: { force?: boolean } = {}) {
+  if (!documentQueryCompletionEnabled.value) return;
+  const text = documentQueryCompletionText(target);
+  const cursor = documentQueryCompletionInputEl(target)?.selectionStart ?? text.length;
+  const kind = documentQueryCompletionKind(target);
+
+  // Without `force` (Ctrl/Cmd+Space, or a just-accepted item that opens a new
+  // position) the menu only appears for characters that start something.
+  if (!options.force && !shouldAutoOpenMongoDocumentQueryCompletion(text, cursor, kind)) {
+    dismissDocumentQueryCompletions();
+    return;
+  }
+
+  const context = getMongoDocumentQueryCompletionContext(text, cursor, kind);
+  if (context.mode === "none") {
+    dismissDocumentQueryCompletions();
+    return;
+  }
+
+  const requestId = ++documentQueryCompletionRequestId;
+  const fields = mongoCompletionNeedsFields(context.mode) ? await documentQueryCompletionFields() : [];
+  if (requestId !== documentQueryCompletionRequestId) return;
+
+  const items = buildMongoCompletionItemsFromContext(context, { fields }).slice(0, DOCUMENT_QUERY_COMPLETION_MENU_LIMIT);
+  if (items.length === 0) {
+    dismissDocumentQueryCompletions();
+    return;
+  }
+  documentQueryCompletionTarget.value = target;
+  documentQueryCompletionItems.value = items;
+  documentQueryCompletionIndex.value = 0;
+  updateDocumentQueryCompletionPosition(target);
+}
+
+/**
+ * Anchors the menu to its input in viewport coordinates, which is what a
+ * teleported menu needs: the grid's toolbar clips both axes, so the menu cannot
+ * live next to the input in the DOM.
+ */
+function updateDocumentQueryCompletionPosition(target: DocumentQueryCompletionTarget) {
+  const input = documentQueryCompletionInputEl(target);
+  if (!input) return;
+  documentQueryCompletionPosition.value = getDataGridConditionSuggestionPosition(input.getBoundingClientRect(), {
+    viewportWidth: window.innerWidth,
+    minWidth: 240,
+    maxWidth: 460,
+  });
+}
+
+// Teleported out of the input's box, the menu cannot follow it on its own: the
+// toolbar scrolls horizontally and the window resizes without the input ever
+// being touched.
+function repositionOpenDocumentQueryCompletions() {
+  const target = documentQueryCompletionTarget.value;
+  if (target) updateDocumentQueryCompletionPosition(target);
+}
+
+watch(documentQueryCompletionOpen, (open) => {
+  if (open) {
+    window.addEventListener("scroll", repositionOpenDocumentQueryCompletions, true);
+    window.addEventListener("resize", repositionOpenDocumentQueryCompletions);
+  } else {
+    window.removeEventListener("scroll", repositionOpenDocumentQueryCompletions, true);
+    window.removeEventListener("resize", repositionOpenDocumentQueryCompletions);
+  }
+});
+
+function selectDocumentQueryCompletion(index: number) {
+  if (index < 0 || index >= documentQueryCompletionItems.value.length) return;
+  documentQueryCompletionIndex.value = index;
+  void nextTick(() => {
+    const listbox = document.getElementById(documentQueryCompletionListboxId);
+    const option = document.getElementById(`${documentQueryCompletionListboxId}-option-${index}`);
+    if (!listbox || !option) return;
+    const listboxRect = listbox.getBoundingClientRect();
+    const optionRect = option.getBoundingClientRect();
+    if (optionRect.top < listboxRect.top) listbox.scrollTop -= listboxRect.top - optionRect.top;
+    else if (optionRect.bottom > listboxRect.bottom) listbox.scrollTop += optionRect.bottom - listboxRect.bottom;
+  });
+}
+
+function moveDocumentQueryCompletionSelection(direction: 1 | -1): boolean {
+  if (!documentQueryCompletionOpen.value) return false;
+  const count = documentQueryCompletionItems.value.length;
+  const next = Math.min(Math.max(documentQueryCompletionIndex.value + direction, 0), count - 1);
+  if (next !== documentQueryCompletionIndex.value) selectDocumentQueryCompletion(next);
+  return true;
+}
+
+function documentQueryCompletionInsertion(index = documentQueryCompletionIndex.value) {
+  const target = documentQueryCompletionTarget.value;
+  const item = documentQueryCompletionItems.value[index];
+  if (!target || !item) return null;
+
+  const input = documentQueryCompletionInputEl(target);
+  const text = documentQueryCompletionText(target);
+  const cursor = input?.selectionStart ?? text.length;
+  const context = getMongoDocumentQueryCompletionContext(text, cursor, documentQueryCompletionKind(target));
+  if (context.mode === "none") return null;
+
+  // A quoted key completion writes both of its quotes, so the closing quote the
+  // input already holds has to go with the prefix it belongs to.
+  const to = Math.min((input?.selectionEnd ?? text.length) + (item.replaceClosingQuote ? 1 : 0), text.length);
+  const insertion = plainMongoCompletionInsertion(item.apply ?? item.label, text.slice(to));
+  return { target, text, from: context.from, to, insertion };
+}
+
+function acceptDocumentQueryCompletion(index = documentQueryCompletionIndex.value): boolean {
+  const completion = documentQueryCompletionInsertion(index);
+  if (!completion) return false;
+
+  const { target, text, from, to, insertion } = completion;
+  const next = `${text.slice(0, from)}${insertion.text}${text.slice(to)}`;
+  if (target === "filter") filterInput.value = next;
+  else sortInput.value = next;
+  dismissDocumentQueryCompletions();
+
+  void nextTick(() => {
+    const input = documentQueryCompletionInputEl(target);
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange(from + insertion.selectionStart, from + insertion.selectionEnd);
+    // A field completion ends at `field: `, an operator at its value — both are
+    // fresh positions with their own suggestions, so open the menu again.
+    void refreshDocumentQueryCompletions(target, { force: true });
+  });
+  return true;
+}
+
+/** True when accepting would not change the text, so Enter should run the query instead. */
+function documentQueryCompletionMatchesInput(): boolean {
+  const completion = documentQueryCompletionInsertion();
+  if (!completion) return false;
+  return completion.text.slice(completion.from, completion.to) === completion.insertion.text;
+}
+
+/**
+ * Opens the document around the first character typed into an empty bar, so
+ * `d` becomes `{d}` with the caret left between the braces.
+ *
+ * The bars hold a bare document and a field name only reads as a key once its
+ * braces exist, so typing straight into an empty bar used to land in a position
+ * that classifies as nothing and suggested nothing — the very case #9427
+ * reports. Nothing is lost by writing the braces: an unbraced bar never parses
+ * as a filter either, so that text was a dead query, not a shorter spelling of
+ * one.
+ *
+ * Only a lone character that could start a key qualifies. A paste arrives whole
+ * and usually brings its own braces, and a typed `{` is the user opening the
+ * document themselves — which already suggests.
+ *
+ * The edit has to be an insertion. Backspacing `ab` down to `a` leaves exactly
+ * the same one character and caret as typing `a` into an empty bar, and writing
+ * braces around text the user is in the middle of deleting would hand them two
+ * more characters to delete.
+ */
+function openDocumentQueryDocument(event: InputEvent, target: DocumentQueryCompletionTarget): boolean {
+  if (!documentQueryCompletionEnabled.value) return false;
+  if (!event.inputType?.startsWith("insert")) return false;
+  const text = documentQueryCompletionText(target);
+  const prefix = readMongoPropertyPrefix(text, text.length);
+  if ([...text].length !== 1 || !/^[$_"'\p{L}\p{N}]$/u.test(text) || prefix.from !== 0 || prefix.prefix !== text) return false;
+  if (documentQueryCompletionInputEl(target)?.selectionStart !== text.length) return false;
+
+  if (target === "filter") filterInput.value = `{${text}}`;
+  else sortInput.value = `{${text}}`;
+
+  // Rewriting the model moves the caret to the end, past the `}` we just added,
+  // where there is nothing to complete. Put it back inside before asking.
+  void nextTick(() => {
+    documentQueryCompletionInputEl(target)?.setSelectionRange(text.length + 1, text.length + 1);
+    void refreshDocumentQueryCompletions(target);
+  });
+  return true;
+}
+
+function onDocumentQueryInput(event: Event, target: DocumentQueryCompletionTarget) {
+  // `v-model` holds off on the model until the composition is confirmed, so a
+  // mid-composition refresh would suggest against the text as it was before the
+  // IME opened. Vue re-dispatches `input` once it commits, which is when the
+  // suggestions are worth computing.
+  if ((event as InputEvent).isComposing) return;
+  if (openDocumentQueryDocument(event as InputEvent, target)) return;
+  void refreshDocumentQueryCompletions(target);
+}
+
+/**
+ * Dismissing also cancels whatever refresh is in flight, which is the point:
+ * the target is only set once `documentQueryCompletionFields` has resolved, so
+ * a bar blurred during that first (uncached) backend round trip would otherwise
+ * open its menu afterwards, over a bar that no longer has focus. Nothing else
+ * would take it down — the menu is teleported to `body` and there is no
+ * outside-click handler.
+ */
+function onDocumentQueryBlur(target: DocumentQueryCompletionTarget) {
+  if (documentQueryCompletionTarget.value === null || documentQueryCompletionTarget.value === target) dismissDocumentQueryCompletions();
+}
+
+/**
+ * The suggestions describe the position the caret was in when they were built,
+ * so a caret moved without an edit leaves them describing somewhere else:
+ * accepting one then splices a stale item at a freshly computed offset and
+ * garbles the text. Moving the caret closes the menu instead.
+ */
+function onDocumentQueryCaretMove(target: DocumentQueryCompletionTarget) {
+  if (documentQueryCompletionTarget.value === target) dismissDocumentQueryCompletions();
+}
+
+function onDocumentQueryKeydown(event: KeyboardEvent, target: DocumentQueryCompletionTarget) {
+  if (event.isComposing) return;
+
+  if (documentQueryCompletionEnabled.value) {
+    if ((event.ctrlKey || event.metaKey) && event.code === "Space") {
+      event.preventDefault();
+      void refreshDocumentQueryCompletions(target, { force: true });
+      return;
+    }
+    if (event.key === "Escape" && documentQueryCompletionOpen.value) {
+      event.preventDefault();
+      dismissDocumentQueryCompletions();
+      return;
+    }
+    // These move the caret rather than the selection, so they leave the open
+    // suggestions describing a position the caret has left. The key still does
+    // its normal job — only the menu goes.
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Home" || event.key === "End") {
+      onDocumentQueryCaretMove(target);
+      return;
+    }
+    if (event.key === "ArrowDown" && moveDocumentQueryCompletionSelection(1)) {
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "ArrowUp" && moveDocumentQueryCompletionSelection(-1)) {
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Tab" && !event.shiftKey && documentQueryCompletionOpen.value && acceptDocumentQueryCompletion()) {
+      event.preventDefault();
+      return;
+    }
+    // Enter takes the highlighted suggestion first; a second Enter runs the query.
+    if (event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && documentQueryCompletionOpen.value && !documentQueryCompletionMatchesInput() && acceptDocumentQueryCompletion()) {
+      event.preventDefault();
+      return;
+    }
+  }
+
+  if (event.key !== "Enter") return;
+  const plainEnter = !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey;
+  if (!plainEnter && !((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey)) return;
+  event.preventDefault();
+  dismissDocumentQueryCompletions();
+  applyFilter();
+}
+
 const documentQueryPreview = computed(() => {
   let filter = "{}";
   try {
@@ -626,7 +1357,7 @@ const documentQueryPreview = computed(() => {
     collection: props.collection,
     filterJson: filter,
     sortJson: sortInput.value.trim(),
-    skip: page.value * pageSize.value,
+    skip: documentStoreProvider.value.kind === "elasticsearch" ? 0 : page.value * pageSize.value,
     limit: documentRequestLimit.value,
   });
 });
@@ -667,7 +1398,7 @@ async function applyDocumentStructuredFilters() {
 async function loadElasticsearchMappingFields() {
   if (documentStoreProvider.value.kind !== "elasticsearch") return;
   try {
-    elasticsearchMappingFields.value = await api.getColumns(props.connectionId, props.database, "", props.collection);
+    elasticsearchMappingFields.value = (await api.getColumns(props.connectionId, props.database, "", props.collection)) ?? [];
   } catch {
     elasticsearchMappingFields.value = [];
   }
@@ -723,32 +1454,93 @@ function documentStoreWriteApis(documentType?: string) {
   };
 }
 
+function prepareDynamoDbDocumentIdentity(document: JsonRecord): { document: JsonRecord; id: string } {
+  const table = dynamodbTableDescription.value;
+  if (!table) throw new Error(t("dynamodb.tableMetadataUnavailable"));
+
+  const next = { ...document };
+  const metadataId = next._id && typeof next._id === "object" && !Array.isArray(next._id) ? (next._id as JsonRecord) : undefined;
+  const identity: JsonRecord = {};
+  const keys = [table.partitionKey, table.sortKey].filter((value): value is NonNullable<typeof value> => !!value);
+  for (const key of keys) {
+    const value = next[key.name] ?? metadataId?.[key.name];
+    if (value === undefined || value === null || value === "") {
+      throw new Error(t("dynamodb.keyRequired", { key: key.name }));
+    }
+    next[key.name] = value;
+    identity[key.name] = value;
+  }
+  next._id = identity;
+  return { document: next, id: serializeDocumentStoreId(identity, "dynamodb") };
+}
+
 async function gridSave(changes: DocumentGridChanges) {
+  if (!documentStoreEditable.value) {
+    throw new Error(documentStoreEditDisabledReason.value);
+  }
   const cols = changes.columns;
   const idColIdx = cols.indexOf("_id");
   if (idColIdx < 0) throw new Error("No _id column");
-  const isEs = documentStoreProvider.value.kind === "elasticsearch";
+  const kind = documentStoreProvider.value.kind;
+  const isPathIdentityStore = kind !== "mongodb";
+  const isEs = kind === "elasticsearch";
+
+  if (kind === "meilisearch") {
+    const updates: Array<{ id: string; docJson: string }> = [];
+    const deleteIds: string[] = [];
+    const inserts: string[] = [];
+
+    for (const [rowIdx, dirtyCols] of changes.dirtyRows) {
+      const row = changes.rows[rowIdx];
+      const id = row?.[idColIdx];
+      const doc = documents.value[rowIdx];
+      if (id == null || !doc) continue;
+      const updated = buildPathIdentityUpdatedDocument(doc, dirtyCols, cols, kind);
+      const writeDocument = prepareDocumentStoreWriteDocument(updated, { kind, mode: "update" });
+      updates.push({
+        id: serializeDocumentStoreId(doc._id ?? id, kind),
+        docJson: stringifyDocumentStoreValue(writeDocument, kind),
+      });
+    }
+
+    for (const rowIdx of changes.deletedRows) {
+      const row = changes.rows[rowIdx];
+      const id = row?.[idColIdx];
+      if (id == null) continue;
+      deleteIds.push(serializeDocumentStoreId(documents.value[rowIdx]?._id ?? id, kind));
+    }
+
+    for (const newRow of changes.newRows) {
+      const doc = buildPathIdentityInsertDocument(newRow, cols, kind);
+      const idValue = newRow[idColIdx];
+      if (idValue !== null && idValue !== undefined && idValue !== "") doc._id = parseDocumentStoreInputValue(idValue, kind);
+      inserts.push(stringifyDocumentStoreValue(doc, kind));
+    }
+
+    await api.documentSaveMeilisearchBatch(props.connectionId, props.collection, updates, deleteIds, inserts);
+    await reloadDocumentsAfterMutationOrRefresh();
+    return;
+  }
 
   for (const [rowIdx, dirtyCols] of changes.dirtyRows) {
     const row = changes.rows[rowIdx];
     const id = row?.[idColIdx];
     if (id == null) continue;
 
-    if (isEs) {
+    if (isPathIdentityStore) {
       const doc = documents.value[rowIdx];
       if (!doc) continue;
-      const routing = documentRoutingFromDocument(doc);
-      const updated = { ...doc };
-      for (const [colIdx, newVal] of dirtyCols) {
-        const col = cols[colIdx];
-        if (col === "_id" || col === "_routing") continue;
-        if (newVal === null) {
-          delete updated[col];
-        } else {
-          updated[col] = parseDocumentStoreInputValue(newVal, "elasticsearch");
-        }
+      const routing = isEs ? documentRoutingFromDocument(doc) : undefined;
+      const updated = buildPathIdentityUpdatedDocument(doc, dirtyCols, cols, kind);
+      const documentId = serializeDocumentStoreId(doc._id ?? id, kind);
+      if (kind === "dynamodb") {
+        const normalized = prepareDynamoDbDocumentIdentity(updated);
+        const writeDocument = prepareDocumentStoreWriteDocument(normalized.document, { kind, mode: "update" });
+        await api.documentUpdateDocument(props.connectionId, props.database, props.collection, documentId, stringifyDocumentStoreValue(writeDocument, kind));
+        continue;
       }
-      await api.documentUpdateDocument(props.connectionId, props.database, props.collection, String(id), stringifyDocumentStoreValue(updated, "elasticsearch"), routing);
+      const writeDocument = prepareDocumentStoreWriteDocument(updated, { kind, mode: "update" });
+      await api.documentUpdateDocument(props.connectionId, props.database, props.collection, documentId, stringifyDocumentStoreValue(writeDocument, kind), routing);
       continue;
     }
 
@@ -765,20 +1557,26 @@ async function gridSave(changes: DocumentGridChanges) {
     const document = documents.value[rowIdx];
     const routing = isEs ? documentRoutingFromDocument(document) : undefined;
     const documentType = isEs ? documentTypeFromDocument(document) : undefined;
-    const documentId = isEs ? id : (document?._id ?? id);
-    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, isEs ? String(documentId) : serializeMongoDocumentId(documentId), routing, documentType);
+    const documentId = document?._id ?? id;
+    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, isPathIdentityStore ? serializeDocumentStoreId(documentId, kind) : serializeMongoDocumentId(documentId), routing, documentType);
   }
 
   for (const [newRowIndex, newRow] of changes.newRows.entries()) {
     const newRowMeta = changes.newRowMeta[newRowIndex];
-    const doc = isEs ? buildElasticsearchInsertDocument(newRow, cols) : buildMongoGridInsertDocument(newRow, cols, newRowMeta);
-    if (isEs) {
-      const id = documentIdFromGridValue(newRow[idColIdx]);
-      const routing = documentRoutingFromGridRow(newRow, cols);
-      if (id) {
-        await api.documentUpdateDocument(props.connectionId, props.database, props.collection, id, stringifyDocumentStoreValue(doc, "elasticsearch"), routing);
+    const doc = isPathIdentityStore ? buildPathIdentityInsertDocument(newRow, cols, kind) : buildMongoGridInsertDocument(newRow, cols, newRowMeta);
+    if (isPathIdentityStore) {
+      const idValue = newRow[idColIdx];
+      const id = idValue === null || idValue === undefined || idValue === "" ? null : serializeDocumentStoreId(parseDocumentStoreInputValue(idValue, kind), kind);
+      const routing = isEs ? documentRoutingFromGridRow(newRow, cols) : undefined;
+      if (kind === "dynamodb") {
+        if (idValue !== null && idValue !== undefined && idValue !== "") doc._id = parseDocumentStoreInputValue(idValue, kind);
+        const normalized = prepareDynamoDbDocumentIdentity(doc);
+        const writeDocument = prepareDocumentStoreWriteDocument(normalized.document, { kind, mode: "insert" });
+        await api.documentInsertDocument(props.connectionId, props.database, props.collection, stringifyDocumentStoreValue(writeDocument, kind));
+      } else if (id) {
+        await api.documentUpdateDocument(props.connectionId, props.database, props.collection, id, stringifyDocumentStoreValue(doc, kind), routing);
       } else {
-        await api.documentInsertDocument(props.connectionId, props.database, props.collection, stringifyDocumentStoreValue(doc, "elasticsearch"), routing);
+        await api.documentInsertDocument(props.connectionId, props.database, props.collection, stringifyDocumentStoreValue(doc, kind), routing);
       }
       continue;
     }
@@ -788,18 +1586,33 @@ async function gridSave(changes: DocumentGridChanges) {
   }
 
   if (isEs) resetElasticsearchTotals({ preservePaginationTotal: true });
-  await load();
+  if (kind === "dynamodb") {
+    page.value = 0;
+    resetDynamoDbPagination();
+  }
+  await reloadDocumentsAfterMutationOrRefresh();
 }
 
-function buildElasticsearchInsertDocument(row: MongoInputValue[], columns: string[]): JsonRecord {
+function buildPathIdentityInsertDocument(row: MongoInputValue[], columns: string[], kind: Exclude<DocumentStoreKind, "mongodb">): JsonRecord {
   const doc: JsonRecord = {};
   for (let columnIndex = 0; columnIndex < columns.length; columnIndex += 1) {
     const column = columns[columnIndex];
-    if (!column || column === "_id" || column === "_routing") continue;
+    if (!column || column === "_id" || (kind === "elasticsearch" && column === "_routing")) continue;
     const value = row[columnIndex];
-    if (value !== null) doc[column] = parseDocumentStoreInputValue(value, "elasticsearch");
+    if (value !== null) doc[column] = parseDocumentStoreInputValue(value, kind);
   }
   return doc;
+}
+
+function buildPathIdentityUpdatedDocument(document: JsonRecord, changes: Map<number, MongoInputValue>, columns: string[], kind: Exclude<DocumentStoreKind, "mongodb">): JsonRecord {
+  const updated = { ...document };
+  for (const [columnIndex, newValue] of changes) {
+    const column = columns[columnIndex];
+    if (!column || column === "_id" || (kind === "elasticsearch" && column === "_routing")) continue;
+    if (newValue === null) delete updated[column];
+    else updated[column] = parseDocumentStoreInputValue(newValue, kind);
+  }
+  return updated;
 }
 
 function buildMongoGridInsertDocument(row: MongoInputValue[], columns: string[], meta?: GridNewRowMeta): Record<string, unknown> {
@@ -836,21 +1649,48 @@ function buildElasticsearchPartialUpdateDocument(changes: Map<number, MongoInput
   return document;
 }
 
+function formatDynamoDbOperationPreview(action: "insert" | "put" | "delete", id: unknown, document?: Record<string, unknown>): string {
+  const operation = action === "insert" ? "INSERT ITEM" : action === "put" ? "PUT ITEM" : "DELETE ITEM";
+  const lines = [`DBX DYNAMODB ${operation}`, `table: ${JSON.stringify(props.collection)}`];
+  if (id !== undefined) lines.push("key:", stringifyDocumentStoreValue(id, "dynamodb", 2));
+  if (document) lines.push("item:", stringifyDocumentStoreValue(document, "dynamodb", 2));
+  return lines.join("\n");
+}
+
 async function previewDocumentChanges(changes: DocumentGridChanges): Promise<string[]> {
   const { dirtyRows, deletedRows, newRows, newRowMeta, columns, rows } = changes;
   const idColIdx = columns.indexOf("_id");
   const stmts: string[] = [];
   const coll = props.collection;
-  const isEs = documentStoreProvider.value.kind === "elasticsearch";
+  const kind = documentStoreProvider.value.kind;
+  const isPathIdentityStore = kind !== "mongodb";
+  const isEs = kind === "elasticsearch";
 
   for (const [rowIdx, dirtyCols] of dirtyRows) {
     const row = rows[rowIdx];
     const id = row?.[idColIdx];
     if (id == null) continue;
-    if (isEs) {
-      const updateDoc = buildElasticsearchPartialUpdateDocument(dirtyCols, columns);
-      const routing = documentRoutingFromGridRow(row, columns);
-      stmts.push(`POST /${coll}/_update/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}\n${stringifyDocumentStoreValue({ doc: updateDoc.$set ?? updateDoc }, "elasticsearch", 2)}`);
+    if (isPathIdentityStore) {
+      if (isEs) {
+        const updateDoc = buildElasticsearchPartialUpdateDocument(dirtyCols, columns);
+        const routing = documentRoutingFromGridRow(row, columns);
+        stmts.push(`POST /${coll}/_update/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}\n${stringifyDocumentStoreValue({ doc: updateDoc.$set ?? updateDoc }, "elasticsearch", 2)}`);
+      } else if (kind === "dynamodb") {
+        const sourceDocument = documents.value[rowIdx];
+        if (!sourceDocument) continue;
+        const documentId = sourceDocument._id ?? id;
+        const updated = buildPathIdentityUpdatedDocument(sourceDocument, dirtyCols, columns, "dynamodb");
+        const normalized = prepareDynamoDbDocumentIdentity(updated);
+        const writeDocument = prepareDocumentStoreWriteDocument(normalized.document, { kind: "dynamodb", mode: "update" });
+        stmts.push(formatDynamoDbOperationPreview("put", documentId, writeDocument));
+      } else {
+        const sourceDocument = documents.value[rowIdx];
+        if (!sourceDocument) continue;
+        const documentId = sourceDocument._id ?? id;
+        const updated = buildPathIdentityUpdatedDocument(sourceDocument, dirtyCols, columns, "meilisearch");
+        const writeDocument = prepareDocumentStoreWriteDocument(updated, { kind: "meilisearch", mode: "update" });
+        stmts.push(formatMeilisearchDocumentOperationPreview({ action: "update", index: coll, id: documentId, document: writeDocument }));
+      }
     } else {
       const updateDoc = buildMongoUpdateDocument(dirtyCols, columns, documents.value[rowIdx]);
       stmts.push(`db.${coll}.updateOne({_id: ${formatMongoShellLiteral(documents.value[rowIdx]?._id ?? id)}}, ${formatMongoShellLiteral(updateDoc)})`);
@@ -861,7 +1701,15 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
     const row = rows[rowIdx];
     const id = row?.[idColIdx];
     if (id == null) continue;
-    if (isEs) {
+    if (isPathIdentityStore) {
+      if (kind === "dynamodb") {
+        stmts.push(formatDynamoDbOperationPreview("delete", documents.value[rowIdx]?._id ?? id));
+        continue;
+      }
+      if (!isEs) {
+        stmts.push(formatMeilisearchDocumentOperationPreview({ action: "delete", index: coll, id: documents.value[rowIdx]?._id ?? id }));
+        continue;
+      }
       const routing = documentRoutingFromGridRow(row, columns);
       stmts.push(`DELETE /${coll}/_doc/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}`);
     } else {
@@ -870,8 +1718,22 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
   }
 
   for (const [newRowIndex, newRow] of newRows.entries()) {
-    const doc = isEs ? buildElasticsearchInsertDocument(newRow, columns) : buildMongoGridInsertDocument(newRow, columns, newRowMeta[newRowIndex]);
-    if (isEs) {
+    const doc = isPathIdentityStore ? buildPathIdentityInsertDocument(newRow, columns, kind) : buildMongoGridInsertDocument(newRow, columns, newRowMeta[newRowIndex]);
+    if (isPathIdentityStore) {
+      if (kind === "dynamodb") {
+        const idValue = idColIdx >= 0 ? newRow[idColIdx] : undefined;
+        if (idValue !== null && idValue !== undefined && idValue !== "") doc._id = parseDocumentStoreInputValue(idValue, "dynamodb");
+        const normalized = prepareDynamoDbDocumentIdentity(doc);
+        const writeDocument = prepareDocumentStoreWriteDocument(normalized.document, { kind: "dynamodb", mode: "insert" });
+        stmts.push(formatDynamoDbOperationPreview("insert", JSON.parse(normalized.id), writeDocument));
+        continue;
+      }
+      if (!isEs) {
+        const idValue = idColIdx >= 0 ? newRow[idColIdx] : null;
+        const id = idValue === null || idValue === undefined || idValue === "" ? undefined : parseDocumentStoreInputValue(idValue, "meilisearch");
+        stmts.push(formatMeilisearchDocumentOperationPreview({ action: id === undefined ? "insert" : "upsert", index: coll, id, document: doc }));
+        continue;
+      }
       const id = idColIdx >= 0 ? documentIdFromGridValue(newRow[idColIdx]) : null;
       if (id) {
         stmts.push(`PUT /${coll}/_doc/${elasticsearchPathIdPreview(id)}\n${stringifyDocumentStoreValue(doc, "elasticsearch", 2)}`);
@@ -935,6 +1797,7 @@ function resetElasticsearchTotals(options: { preservePaginationTotal?: boolean }
   paginationTotal.value = nextTotals.paginationTotal;
   total.value = nextTotals.total;
   totalIsExact.value = nextTotals.totalIsExact;
+  resetElasticsearchPagination();
 }
 
 function clampPageToPaginationTotal(): number | undefined {
@@ -1009,7 +1872,7 @@ function applyElasticsearchSearchTotal(searchTotal: number, isExact: boolean, fi
   startElasticsearchExactCount(filter);
 }
 
-async function load(options: { page?: number } = {}) {
+async function load(options: { page?: number; append?: boolean; offset?: number; limit?: number } = {}) {
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
   const requestGeneration = ++documentRequestGeneration;
   const executionId = uuid();
@@ -1027,13 +1890,30 @@ async function load(options: { page?: number } = {}) {
     const collection = props.collection;
     const storeKind = documentStoreProvider.value.kind;
     const filter = currentDocumentFilter();
+    if (storeKind === "dynamodb") {
+      const countKey = dynamodbCountFilterKey(filter);
+      if (dynamodbExactCountKey !== countKey) {
+        dynamodbExactCountKey = countKey;
+        dynamodbExactTotal.value = undefined;
+      }
+    }
     const countRequest: LoadedDocumentQueryTotalCountRequest = { connectionId, database, collection, filter, generation: requestGeneration, storeKind };
     if (storeKind === "elasticsearch" && elasticsearchCountKey !== null && elasticsearchCountKey !== elasticsearchCountFilterKey(filter)) {
       resetElasticsearchTotals();
     }
     const sort = currentDocumentSortJson(sortInput.value);
-    const skip = requestPage * pageSize.value;
-    const result = await api.documentFindDocuments(connectionId, database, collection, skip, documentRequestLimit.value, filter, undefined, sort, undefined, executionId);
+    const cursor = storeKind === "dynamodb" ? dynamodbPageCursors.value[requestPage] : storeKind === "elasticsearch" ? elasticsearchPageCursors.value[requestPage] : undefined;
+    if ((storeKind === "dynamodb" || storeKind === "elasticsearch") && requestPage > 0 && !cursor) {
+      throw new Error(storeKind === "dynamodb" ? t("dynamodb.pageCursorUnavailable") : "Elasticsearch page cursor unavailable; go back to the first page and page forward again");
+    }
+    // Starting a fresh ES first page invalidates any previous PIT cursor stack.
+    if (storeKind === "elasticsearch" && !cursor && requestPage === 0) {
+      resetElasticsearchPagination();
+    }
+    const skip = storeKind === "dynamodb" || storeKind === "elasticsearch" ? 0 : (options.offset ?? requestPage * pageSize.value);
+    const requestedLimit = options.limit ?? pageSize.value;
+    const requestLimit = storeKind === "elasticsearch" ? Math.min(requestedLimit, ELASTICSEARCH_DEFAULT_MAX_RESULT_WINDOW) : requestedLimit;
+    const result = await api.documentFindDocuments(connectionId, database, collection, skip, requestLimit, filter, undefined, sort, undefined, executionId, cursor, storeKind === "elasticsearch");
     if (documentLoadExecutionId.value !== executionId) return;
     if (connectionId !== props.connectionId || database !== props.database || collection !== props.collection || storeKind !== documentStoreProvider.value.kind) return;
     const nextDocuments =
@@ -1050,23 +1930,33 @@ async function load(options: { page?: number } = {}) {
     const nextCopyDocuments = hasTypePreservingCopyDocuments ? result.extended_documents!.map(asRecord) : nextDocuments;
     // Commit page + rows together so stale rows never briefly show last-page indexes.
     if (options.page !== undefined) page.value = options.page;
-    documents.value = nextDocuments;
-    copyDocuments.value = nextCopyDocuments;
-    mongoCopyDocumentsAvailable.value = hasTypePreservingCopyDocuments;
+    commitLoadedDocuments(nextDocuments, nextCopyDocuments, hasTypePreservingCopyDocuments, options.append === true, storeKind);
+    // Mark which conditions these rows belong to, so the unmount capture can
+    // tell a still-valid page from one the user has since edited away.
+    loadedDocumentDataSignature = documentDataSignature();
+    // A replacement dataset must not adopt the previous viewport; an
+    // infinite-scroll append keeps rendering the same logical result.
+    if (options.append !== true || !documentViewGeneration.value) documentViewGeneration.value = uuid();
     loadedDocumentQueryTotalCountRequest = countRequest;
-    if (nextDocuments.length > 0) {
-      const keySet = new Set<string>();
-      keySet.add("_id");
-      for (const doc of nextDocuments) {
-        for (const key of Object.keys(doc)) {
-          if (key !== "_id") keySet.add(key);
-        }
-      }
-      lastGridColumns.value = [...keySet];
-      lastGridColumnTypes.value = storeKind === "mongodb" ? mongoDocumentGridColumnTypes(nextDocuments, lastGridColumns.value) : [];
+    if (storeKind === "dynamodb") {
+      const nextCursors = dynamodbPageCursors.value.slice(0, requestPage + 1);
+      nextCursors[requestPage + 1] = result.next_cursor;
+      dynamodbPageCursors.value = nextCursors;
+      dynamodbHasNextCursor.value = !!result.next_cursor;
     }
     if (storeKind === "elasticsearch") {
+      const nextCursors = elasticsearchPageCursors.value.slice(0, requestPage + 1);
+      nextCursors[requestPage + 1] = result.next_cursor ?? undefined;
+      elasticsearchPageCursors.value = nextCursors;
+      elasticsearchHasNextCursor.value = !!result.next_cursor;
       applyElasticsearchSearchTotal(result.total, result.total_is_exact !== false, filter);
+    } else if (storeKind === "dynamodb") {
+      cancelElasticsearchCount();
+      const lowerBound = requestPage * pageSize.value + nextDocuments.length + (result.next_cursor ? 1 : 0);
+      const exactTotal = dynamodbExactTotal.value ?? (!result.next_cursor ? lowerBound : undefined);
+      total.value = exactTotal ?? lowerBound;
+      totalIsExact.value = exactTotal !== undefined;
+      paginationTotal.value = exactTotal;
     } else {
       cancelElasticsearchCount();
       const totals = resolveDocumentQueryTotals(result.total, result.total_is_exact !== false, {
@@ -1107,10 +1997,14 @@ async function countExactDocumentTotal(): Promise<number | undefined> {
     paginationTotal.value = totals.paginationTotal;
     return exactCount;
   }
-  const exactCount = await api.mongoCountDocuments(request.connectionId, request.database, request.collection, request.filter, "accurate");
+  const exactCount = request.storeKind === "dynamodb" ? await api.documentCountDocuments(request.connectionId, request.collection, request.filter) : await api.mongoCountDocuments(request.connectionId, request.database, request.collection, request.filter, "accurate");
   if (!isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
   if (!Number.isFinite(exactCount) || exactCount < 0) {
     throw new Error("invalid count");
+  }
+  if (request.storeKind === "dynamodb") {
+    dynamodbExactCountKey = dynamodbCountFilterKey(request.filter);
+    dynamodbExactTotal.value = exactCount;
   }
   const totals = resolveDocumentQueryTotals(exactCount, true);
   total.value = totals.total;
@@ -1121,7 +2015,18 @@ async function countExactDocumentTotal(): Promise<number | undefined> {
 
 async function refreshDocuments() {
   if (documentStoreProvider.value.kind === "elasticsearch") resetElasticsearchTotals({ preservePaginationTotal: true });
-  await load();
+  if (documentStoreProvider.value.kind === "dynamodb") resetDynamoDbExactCount();
+  await reloadDocumentsAfterMutationOrRefresh();
+}
+
+async function reloadDocumentsAfterMutationOrRefresh() {
+  if (!settingsStore.editorSettings.infiniteScroll) {
+    await load();
+    return;
+  }
+  page.value = 0;
+  dataGridRef.value?.resetInfiniteScrollState?.();
+  await load({ page: 0, offset: 0 });
 }
 
 async function cancelDocumentLoad() {
@@ -1143,20 +2048,62 @@ async function cancelDocumentLoad() {
 function applyFilter() {
   page.value = 0;
   if (documentStoreProvider.value.kind === "elasticsearch") resetElasticsearchTotals();
+  if (documentStoreProvider.value.kind === "dynamodb") resetDynamoDbPagination();
   void load();
 }
 
-function paginate(offset: number, limit: number) {
+async function paginate(offset: number, limit: number) {
+  const normalizedOffset = Math.max(0, Math.trunc(offset));
   const normalizedLimit = normalizeResultPageSize(limit, pageSize.value);
+  if (documentStoreProvider.value.kind !== "dynamodb" && settingsStore.editorSettings.infiniteScroll && normalizedOffset > 0 && normalizedOffset === documents.value.length) {
+    const requestedPage = Math.floor(normalizedOffset / pageSize.value);
+    const nextPage = clampDocumentPage(requestedPage, pageSize.value, paginationTotal.value);
+    await load({ page: nextPage, append: true, offset: normalizedOffset, limit: normalizedLimit });
+    return;
+  }
+  const pageSizeChanged = normalizedLimit !== pageSize.value;
   pageSize.value = normalizedLimit;
-  const requestedPage = Math.floor(Math.max(0, offset) / normalizedLimit);
+  if (pageSizeChanged && (documentStoreProvider.value.kind === "dynamodb" || documentStoreProvider.value.kind === "elasticsearch")) {
+    page.value = 0;
+    if (documentStoreProvider.value.kind === "dynamodb") {
+      resetDynamoDbPagination({ preserveExactCount: true });
+    } else {
+      resetElasticsearchPagination();
+    }
+    await load({ page: 0 });
+    return;
+  }
+  const requestedPage = Math.floor(normalizedOffset / normalizedLimit);
   const nextPage = clampDocumentPage(requestedPage, normalizedLimit, paginationTotal.value);
-  void load({ page: nextPage });
+  if (documentStoreProvider.value.kind !== "dynamodb" && documentStoreProvider.value.kind !== "elasticsearch") {
+    await load({ page: nextPage, offset: nextPage * normalizedLimit, limit: normalizedLimit });
+    return;
+  }
+  for (let cursorPage = 0; cursorPage <= nextPage; cursorPage += 1) {
+    const pageCursor = documentStoreProvider.value.kind === "dynamodb" ? dynamodbPageCursors.value[cursorPage] : elasticsearchPageCursors.value[cursorPage];
+    if (cursorPage > 0 && !pageCursor) {
+      error.value = documentStoreProvider.value.kind === "dynamodb" ? t("dynamodb.pageCursorUnavailable") : "Elasticsearch page cursor unavailable; go back to the first page and page forward again";
+      return;
+    }
+    if (cursorPage === nextPage) {
+      await load({ page: cursorPage });
+      return;
+    }
+    const nextCursor = documentStoreProvider.value.kind === "dynamodb" ? dynamodbPageCursors.value[cursorPage + 1] : elasticsearchPageCursors.value[cursorPage + 1];
+    if (!nextCursor) {
+      await load({ page: cursorPage });
+    }
+  }
 }
 
 function onSort(column: string, _columnIndex: number, direction: "asc" | "desc" | null) {
+  if (documentStoreProvider.value.kind === "dynamodb" && direction && dynamodbSelectedKey.value?.sortKey?.name !== column) {
+    error.value = t("dynamodb.sortKeyOnly", { key: dynamodbSelectedKey.value?.sortKey?.name || t("dynamodb.none") });
+    return;
+  }
   sortInput.value = documentStoreProvider.value.sortInputForColumn(column, direction);
   page.value = 0;
+  if (documentStoreProvider.value.kind === "dynamodb") resetDynamoDbPagination({ preserveExactCount: true });
   void load();
 }
 
@@ -1170,7 +2117,7 @@ function asRecord(value: unknown): JsonRecord {
 function documentIdentity(doc: JsonRecord | undefined): string | null {
   const id = doc?._id;
   if (id === null || id === undefined) return null;
-  return typeof id === "object" ? JSON.stringify(id) : String(id);
+  return serializeDocumentStoreId(id, documentStoreProvider.value.kind);
 }
 
 function syncSelectedDocumentAfterLoad(previousSelectedIdx: number | null, previousSelectedId: string | null) {
@@ -1280,6 +2227,7 @@ function selectDoc(idx: number) {
 }
 
 function startNew() {
+  if (!documentStoreEditable.value) return;
   selectedIdx.value = null;
   editJson.value = emptyDocumentJson();
   editFields.value = [createEditNode("", "", false, false)];
@@ -1290,6 +2238,7 @@ function startNew() {
 }
 
 function startEdit() {
+  if (!documentStoreEditable.value) return;
   const doc = selectedDoc.value;
   if (!doc) return;
   // Issue #2952: open whole-document JSON editing by default (DBeaver-style), not field tree.
@@ -1458,6 +2407,9 @@ function resolveDocumentStorePathId(id: unknown): string | null {
 
 function resolveWriteIdentityFromEditor(doc: JsonRecord, currentId: unknown, currentRouting: string | undefined): { writeId: string; writeRouting?: string } | null {
   const kind = documentStoreProvider.value.kind;
+  if (kind === "dynamodb") {
+    return { writeId: prepareDynamoDbDocumentIdentity(doc).id };
+  }
   const hasPayloadId = Object.prototype.hasOwnProperty.call(doc, "_id");
   const writeId = hasPayloadId ? resolveDocumentStorePathId(doc._id) : resolveDocumentStorePathId(currentId);
   if (!writeId) return null;
@@ -1466,7 +2418,7 @@ function resolveWriteIdentityFromEditor(doc: JsonRecord, currentId: unknown, cur
 }
 
 async function saveDoc() {
-  if (isSavingDocument.value) return;
+  if (isSavingDocument.value || !documentStoreEditable.value) return;
   error.value = "";
   isSavingDocument.value = true;
   try {
@@ -1474,13 +2426,14 @@ async function saveDoc() {
     if (!doc) return;
 
     const kind = documentStoreProvider.value.kind;
+    const writeDocument = kind === "dynamodb" ? prepareDynamoDbDocumentIdentity(doc).document : doc;
 
     if (isNew.value) {
       const apis = documentStoreWriteApis();
-      const explicitId = kind === "elasticsearch" ? documentIdFromGridValue(documentStoreValueForGrid(doc._id, "elasticsearch")) : null;
+      const explicitId = kind === "mongodb" || writeDocument._id === undefined || writeDocument._id === null || writeDocument._id === "" ? null : resolveDocumentStorePathId(writeDocument._id);
       await insertDocumentStoreDocumentCore({
         kind,
-        document: doc,
+        document: writeDocument,
         explicitId,
         routing: normalizeDocumentStoreRouting(doc._routing),
         apis,
@@ -1500,7 +2453,7 @@ async function saveDoc() {
       }
       const currentRouting = documentRoutingFromDocument(current);
       const apis = documentStoreWriteApis(kind === "elasticsearch" ? documentTypeFromDocument(current) : undefined);
-      const write = resolveWriteIdentityFromEditor(doc, currentId, currentRouting);
+      const write = resolveWriteIdentityFromEditor(writeDocument, currentId, currentRouting);
       if (!write) {
         error.value = t("mongo.jsonIdRequired");
         return;
@@ -1510,8 +2463,7 @@ async function saveDoc() {
         write: { id: write.writeId, routing: write.writeRouting },
         current: { id: deleteId, routing: kind === "elasticsearch" ? currentRouting : undefined },
       });
-      // Rekey writes first then deletes; write failure leaves the old document intact.
-      await applyDocumentStoreIdentityPlan({ kind, plan, document: doc, apis });
+      await applyDocumentStoreIdentityPlan({ kind, plan, document: writeDocument, apis });
     } else {
       return;
     }
@@ -1521,7 +2473,11 @@ async function saveDoc() {
     documentEditMode.value = "fields";
     editFields.value = [];
     if (kind === "elasticsearch") resetElasticsearchTotals({ preservePaginationTotal: true });
-    await load();
+    if (kind === "dynamodb") {
+      page.value = 0;
+      resetDynamoDbPagination();
+    }
+    await reloadDocumentsAfterMutationOrRefresh();
     if (selectedIdx.value !== null && documents.value[selectedIdx.value]) {
       editJson.value = stringifyDocumentStoreValue(documents.value[selectedIdx.value], documentStoreProvider.value.kind, 2);
     }
@@ -1535,7 +2491,7 @@ async function saveDoc() {
 async function applyDeleteDoc(idx: number) {
   const doc = documents.value[idx];
   const id = doc._id;
-  if (!id) return;
+  if (id === undefined || id === null || id === "") return;
   error.value = "";
   try {
     await api.documentDeleteDocument(props.connectionId, props.database, props.collection, serializeDocumentStoreId(id, documentStoreProvider.value.kind), documentRoutingFromDocument(doc), documentStoreProvider.value.kind === "elasticsearch" ? documentTypeFromDocument(doc) : undefined);
@@ -1544,6 +2500,10 @@ async function applyDeleteDoc(idx: number) {
       editJson.value = "";
     }
     if (documentStoreProvider.value.kind === "elasticsearch") resetElasticsearchTotals({ preservePaginationTotal: true });
+    if (documentStoreProvider.value.kind === "dynamodb") {
+      page.value = 0;
+      resetDynamoDbPagination();
+    }
     await load();
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -1551,6 +2511,7 @@ async function applyDeleteDoc(idx: number) {
 }
 
 function requestDeleteDoc(idx: number) {
+  if (!documentStoreEditable.value) return;
   if (!settingsStore.editorSettings.confirmDangerousSqlExecution) {
     void applyDeleteDoc(idx);
     return;
@@ -1583,7 +2544,7 @@ function nextPage() {
 }
 
 function docPreview(doc: JsonRecord): string {
-  const id = doc._id || "";
+  const id = formatDocumentStoreIdLabel(doc._id, documentStoreProvider.value.kind);
   const keys = Object.keys(doc)
     .filter((k) => k !== "_id")
     .slice(0, 3);
@@ -1591,15 +2552,21 @@ function docPreview(doc: JsonRecord): string {
   return `${id} - ${preview}`;
 }
 
-function highlightedJson(json: string): string {
-  return renderDocumentJsonHtml(json, documentSearchOpen.value ? documentSearchQuery.value : "", documentSearchActiveIndex.value);
+async function copyDocument() {
+  try {
+    await copyToClipboard(editJson.value);
+    toast(t("grid.copied"), 1500);
+  } catch (error: unknown) {
+    toast(t("grid.copyFailed", { message: error instanceof Error ? error.message : String(error) }), 3000);
+  }
 }
 
 function handleDocumentViewerDoubleClick(event: MouseEvent) {
   const target = event.target;
   if (!(target instanceof Element)) return;
-  const jsonViewer = target.closest(".json-viewer");
-  if (jsonViewer && target !== jsonViewer) return;
+  // CodeMirror uses .cm-line for rendered document content. Preserve the
+  // existing shortcut only for whitespace around the source, not text itself.
+  if (target.closest(".cm-line")) return;
   const selection = window.getSelection();
   if (selection && !selection.isCollapsed && selection.toString()) return;
   startEdit();
@@ -1614,76 +2581,80 @@ function focusSearch(): boolean {
   if (viewMode.value !== "document" || !documentViewerSearchActive.value) return false;
   if (isEditing.value) return false;
   if (!isNew.value && selectedIdx.value === null) return false;
-  documentSearchOpen.value = true;
-  documentSearchHasNavigated.value = false;
-  void nextTick(() => {
-    documentSearchInputRef.value?.focus();
-    documentSearchInputRef.value?.select();
-  });
-  return true;
+  return documentJsonEditorRef.value?.openSearch() ?? false;
 }
 
-function closeDocumentSearch() {
-  documentSearchOpen.value = false;
-  void nextTick(() => {
-    documentViewerRef.value?.focus();
-  });
-}
-
-function moveDocumentSearchMatch(delta: -1 | 1) {
-  const count = documentSearchMatches.value.length;
-  if (count === 0) return;
-  documentSearchMatchIndex.value = (documentSearchActiveIndex.value + delta + count) % count;
-  documentSearchHasNavigated.value = true;
-  void scrollDocumentSearchMatchIntoView();
-}
-
-function activateDocumentSearchMatch(delta: -1 | 1) {
-  if (documentSearchMatches.value.length === 0) return;
-  if (!documentSearchHasNavigated.value) {
-    documentSearchHasNavigated.value = true;
-    void scrollDocumentSearchMatchIntoView();
-    return;
-  }
-  moveDocumentSearchMatch(delta);
-}
-
-async function scrollDocumentSearchMatchIntoView() {
-  await nextTick();
-  documentViewerRef.value?.querySelector<HTMLElement>('[data-document-search-active="true"]')?.scrollIntoView({ block: "center", inline: "nearest" });
-}
-
-watch([documentSearchQuery, documentSearchText], () => {
-  documentSearchMatchIndex.value = 0;
-  documentSearchHasNavigated.value = false;
-  void scrollDocumentSearchMatchIntoView();
-});
+watch(
+  () => connectionStore.mongoImportCompleted,
+  (completed) => {
+    if (!completed) return;
+    if (completed.connectionId !== props.connectionId || completed.database !== props.database || completed.collection !== props.collection) return;
+    void refreshDocuments();
+  },
+);
 
 watch([viewMode, isEditing, selectedIdx], ([mode, editing, index]) => {
   if (mode === "document" && !editing && index !== null) return;
   documentViewerSearchActive.value = false;
-  documentSearchOpen.value = false;
 });
+
+async function loadDynamoDbTableDescription() {
+  if (documentStoreProvider.value.kind !== "dynamodb") return;
+  try {
+    dynamodbTableDescription.value = await api.dynamodbDescribeTable(props.connectionId, props.collection);
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
+ * The sidebar's "clear index data" action deletes documents behind this tab's
+ * back, so an open browser would keep listing rows that no longer exist.
+ * Reload when the cleared index is the one on screen.
+ */
+function handleElasticsearchIndexCleared(detail: ElasticsearchIndexClearedDetail) {
+  if (detail.connectionId !== props.connectionId) return;
+  // Clearing a grouped node deletes from every index its pattern matches, so a
+  // tab open on any concrete index under the pattern must refresh as well.
+  if (detail.index !== props.collection && !matchesElasticsearchIndexPattern(detail.index, props.collection)) return;
+  void refreshDocuments();
+}
+
+let unsubscribeElasticsearchIndexCleared: (() => void) | undefined;
 
 onMounted(async () => {
   window.addEventListener("pointerdown", handleDocumentBrowserPointerDown, true);
+  unsubscribeElasticsearchIndexCleared = subscribeElasticsearchIndexCleared(handleElasticsearchIndexCleared);
   try {
-    await connectionStore.ensureConnected(props.connectionId);
+    // A restored tab issues no query, so a blocking health probe here would be
+    // the only round trip left on the switch.
+    await connectionStore.ensureConnected(props.connectionId, restoredDocumentData ? { verifyHealth: false } : {});
   } catch (e) {
     console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
   }
+  await loadDynamoDbTableDescription();
   // Mapping metadata enriches the filter builder, but it must not delay the
   // first page of documents when the mapping endpoint is slow.
   void loadElasticsearchMappingFields();
-  void load();
+  // A restored snapshot already holds the rows the last load produced, so a tab
+  // switch must not re-issue the collection query (#8679). Refresh and every
+  // mutation path still force a real load.
+  if (!restoredDocumentData) void load();
   void nextTick(resizeDocumentQueryInputs);
 });
 onBeforeUnmount(() => {
+  persistDocumentBrowserState({ includeData: true });
+  // The open/close watcher cannot run on unmount, so drop the menu's listeners here.
+  window.removeEventListener("scroll", repositionOpenDocumentQueryCompletions, true);
+  window.removeEventListener("resize", repositionOpenDocumentQueryCompletions);
   window.removeEventListener("pointerdown", handleDocumentBrowserPointerDown, true);
+  unsubscribeElasticsearchIndexCleared?.();
+  unsubscribeElasticsearchIndexCleared = undefined;
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
   documentRequestGeneration++;
   loadedDocumentQueryTotalCountRequest = undefined;
   cancelElasticsearchCount();
+  resetElasticsearchPagination();
   stopDocumentLoadingTimer();
   endTableSearchSplitResize();
 });
@@ -1748,7 +2719,26 @@ defineExpose({ focusSearch });
 
       <span class="shrink-0 ml-1">{{ documentStoreLabels.documentsLabel }}</span>
 
-      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="startNew"><Plus class="h-3 w-3" /></Button>
+      <div v-if="documentStoreProvider.kind === 'dynamodb' && dynamodbTableDescription" class="ml-1 flex min-w-0 items-center gap-1.5">
+        <Select :model-value="dynamodbIndexName" @update:model-value="selectDynamoDbIndex">
+          <SelectTrigger class="h-6 w-44 min-w-0 text-xs" :title="t('dynamodb.index')">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem v-for="option in dynamodbIndexOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </SelectItem>
+          </SelectContent>
+        </Select>
+        <span v-if="dynamodbSelectedKey" class="max-w-64 truncate font-mono text-[11px] text-muted-foreground" :title="t('dynamodb.keySummary', { partitionKey: dynamodbSelectedKey.partitionKey.name, sortKey: dynamodbSelectedKey.sortKey?.name || t('dynamodb.none') })">
+          PK: {{ dynamodbSelectedKey.partitionKey.name }}<template v-if="dynamodbSelectedKey.sortKey"> · SK: {{ dynamodbSelectedKey.sortKey.name }}</template>
+        </span>
+        <Badge v-if="dynamodbPartialProjectionReadOnly" variant="outline" class="h-5 rounded border-amber-500/50 px-1.5 text-[10px] text-amber-600 dark:text-amber-400" :title="documentStoreEditDisabledReason">
+          {{ dynamodbSelectedIndex?.projectionType }}
+        </Badge>
+      </div>
+
+      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" :disabled="!documentStoreEditable" :title="documentStoreEditDisabledReason" @click="startNew"><Plus class="h-3 w-3" /></Button>
       <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="refreshDocuments"><RefreshCw class="h-3 w-3" :class="{ 'animate-spin': loading }" /></Button>
 
       <div v-if="viewMode === 'document'" class="flex items-center gap-1 ml-1">
@@ -1772,7 +2762,7 @@ defineExpose({ focusSearch });
             <Wrench class="h-4 w-4" />
           </Button>
         </PopoverTrigger>
-        <PopoverContent align="end" class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-md border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
+        <PopoverContent align="end" :collision-padding="8" class="w-max min-w-44 max-h-[var(--reka-popover-content-available-height)] max-w-[calc(100vw-2rem)] gap-0 overflow-x-hidden overflow-y-auto rounded-md border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
           <div class="border-b bg-muted/40 px-3 py-2">
             <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
           </div>
@@ -1880,6 +2870,13 @@ defineExpose({ focusSearch });
               </button>
             </div>
           </div>
+          <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
+            <div class="min-w-0 flex items-center gap-2 font-medium">
+              <Palette class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <span>{{ t("grid.colorizeDataTypes") }}</span>
+            </div>
+            <Switch size="sm" :model-value="colorizeDataGridCellTypes" :aria-label="t('grid.colorizeDataTypes')" @update:model-value="setColorizeDataGridCellTypes" />
+          </div>
           <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs" :class="{ 'opacity-60': !dataGridRef?.canToggleAllNullColumns }">
             <span class="min-w-0 flex items-center gap-2 font-medium">
               <EyeOff class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -1919,10 +2916,16 @@ defineExpose({ focusSearch });
       :database="props.database"
       :table-meta="props.tableMeta"
       :column-layout-scope-key="documentColumnLayoutScopeKey"
+      :view-state-key="props.stateKey"
+      :view-generation="documentViewGeneration"
+      :local-column-filter-restore-key="documentLocalColumnFilterRestoreKey"
+      :local-column-filter-columns="localColumnFilterColumns"
       context="results"
+      page-size-preference="table-open"
       :database-type="props.databaseType"
+      :mongo-collection-grid="documentStoreProvider.kind === 'mongodb'"
       :mongo-update-target="mongoUpdateTarget"
-      editable
+      :editable="documentStoreEditable"
       :custom-save-handler="customSaveHandler"
       :loading="loading"
       :sql="documentStoreLabels.queryPreview"
@@ -1933,9 +2936,11 @@ defineExpose({ focusSearch });
       :inexact-total-row-count-mode="documentStoreProvider.kind === 'mongodb' ? 'estimated' : 'at-least'"
       :pagination-total-row-count="pageTotal"
       :count-total-rows="countExactDocumentTotal"
+      :full-export-result="documentStoreProvider.kind === 'mongodb' || documentStoreProvider.kind === 'dynamodb' || documentStoreProvider.kind === 'elasticsearch' ? exportAllDocumentStoreDocuments : undefined"
       @sort="onSort"
       @reload="refreshDocuments"
       @paginate="(offset: number, limit: number) => paginate(offset, limit)"
+      @local-column-filters-change="handleLocalColumnFiltersChange"
     >
       <template #search-bar="{ localFilterCount, hasLocalColumnFilters, localFilterSummaries, clearLocalFilter }: { localFilterCount: number; hasLocalColumnFilters: boolean; localFilterSummaries: LocalFilterSummary[]; clearLocalFilter: (columnIndex?: number) => void }">
         <div ref="tableSearchSplitContainerRef" class="flex flex-1 min-w-0">
@@ -2086,7 +3091,7 @@ defineExpose({ focusSearch });
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent position="popper">
-                          <SelectItem v-for="option in documentFilterModeOptions" :key="option.value" :value="option.value">
+                          <SelectItem v-for="option in currentDocumentFilterModeOptions" :key="option.value" :value="option.value">
                             {{ t(option.labelKey) }}
                           </SelectItem>
                         </SelectContent>
@@ -2103,8 +3108,39 @@ defineExpose({ focusSearch });
                         </SelectContent>
                       </Select>
 
+                      <div v-if="documentStoreProvider.kind !== 'elasticsearch' && documentFilterModeUsesRange(rule.mode)" class="flex min-w-0 items-center gap-1.5">
+                        <Input
+                          :model-value="rule.rawValue"
+                          class="h-8 min-w-0 flex-1 text-xs"
+                          :placeholder="t('grid.filterBuilderRangeStart')"
+                          @update:model-value="(value) => updateDocumentFilterRule(rule.id, { rawValue: String(value ?? '') })"
+                          @compositionend="endDocumentFilterImeComposition(`value-start:${rule.id}`)"
+                          @compositionstart="startDocumentFilterImeComposition(`value-start:${rule.id}`)"
+                          @keydown="handleDocumentFilterValueKeydown($event, rule.id)"
+                        />
+                        <span class="shrink-0 text-[10px] text-muted-foreground">—</span>
+                        <Input
+                          :model-value="rule.rawEndValue"
+                          class="h-8 min-w-0 flex-1 text-xs"
+                          :placeholder="t('grid.filterBuilderRangeEnd')"
+                          @update:model-value="(value) => updateDocumentFilterRule(rule.id, { rawEndValue: String(value ?? '') })"
+                          @compositionend="endDocumentFilterImeComposition(`value-end:${rule.id}`)"
+                          @compositionstart="startDocumentFilterImeComposition(`value-end:${rule.id}`)"
+                          @keydown="handleDocumentFilterValueKeydown($event, rule.id)"
+                        />
+                      </div>
+                      <textarea
+                        v-else-if="documentStoreProvider.kind !== 'elasticsearch' && documentFilterModeUsesList(rule.mode)"
+                        :value="rule.rawValue"
+                        rows="2"
+                        class="min-h-8 w-full min-w-0 resize-y rounded-md border bg-background px-2 py-1 text-xs outline-none"
+                        :placeholder="t('grid.filterBuilderValues')"
+                        @input="updateDocumentFilterRule(rule.id, { rawValue: ($event.target as HTMLTextAreaElement).value })"
+                        @keydown.ctrl.enter.prevent="applyDocumentStructuredFilters"
+                        @keydown.meta.enter.prevent="applyDocumentStructuredFilters"
+                      />
                       <Input
-                        v-if="documentStoreProvider.kind === 'elasticsearch' ? elasticsearchQueryTypeNeedsValue(rule.elasticsearchQueryType) : documentFilterModeNeedsValue(rule.mode)"
+                        v-else-if="documentStoreProvider.kind === 'elasticsearch' ? elasticsearchQueryTypeNeedsValue(rule.elasticsearchQueryType) : documentFilterModeNeedsValue(rule.mode)"
                         :model-value="rule.rawValue"
                         class="h-8 min-w-0 text-xs"
                         :placeholder="t('grid.filterBuilderValue')"
@@ -2143,7 +3179,7 @@ defineExpose({ focusSearch });
                 </div>
               </PopoverContent>
             </Popover>
-            <span class="text-blue-600 dark:text-blue-400 text-xs font-medium select-none shrink-0">{{ documentStoreProvider.filterInputLabel }}</span>
+            <span class="text-blue-600 dark:text-blue-400 text-xs font-medium select-none shrink-0">{{ documentStoreLabels.filterInputLabel }}</span>
             <textarea
               ref="filterInputRef"
               v-model="filterInput"
@@ -2153,9 +3189,24 @@ defineExpose({ focusSearch });
               rows="1"
               class="document-query-input flex-1 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
               placeholder="{}"
-              @keydown.enter.exact.prevent="applyFilter"
-              @keydown.ctrl.enter.prevent="applyFilter"
-              @keydown.meta.enter.prevent="applyFilter"
+              :aria-autocomplete="documentQueryCompletionEnabled ? 'list' : undefined"
+              :aria-controls="documentQueryCompletionTarget === 'filter' ? documentQueryCompletionListboxId : undefined"
+              :aria-activedescendant="documentQueryCompletionTarget === 'filter' ? documentQueryCompletionActiveDescendant : undefined"
+              :aria-expanded="documentQueryCompletionEnabled ? documentQueryCompletionTarget === 'filter' : undefined"
+              @blur="onDocumentQueryBlur('filter')"
+              @click="onDocumentQueryCaretMove('filter')"
+              @input="onDocumentQueryInput($event, 'filter')"
+              @keydown="onDocumentQueryKeydown($event, 'filter')"
+            />
+            <DocumentQueryCompletionMenu
+              v-if="documentQueryCompletionOpen && documentQueryCompletionTarget === 'filter'"
+              :items="documentQueryCompletionItems"
+              :selected-index="documentQueryCompletionIndex"
+              :listbox-id="documentQueryCompletionListboxId"
+              :label="documentStoreLabels.filterInputLabel"
+              :position="documentQueryCompletionPosition"
+              @select="selectDocumentQueryCompletion"
+              @accept="acceptDocumentQueryCompletion"
             />
             <button v-if="filterInput.trim()" type="button" class="flex h-5 shrink-0 items-center text-muted-foreground hover:text-foreground" title="Format JSON" aria-label="Format JSON" @click="formatFilterInput">
               <Braces class="w-3 h-3" />
@@ -2182,7 +3233,7 @@ defineExpose({ focusSearch });
             <span class="h-5 w-px bg-border group-hover:bg-primary/60" />
           </button>
           <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0">
-            <span class="text-orange-600 dark:text-orange-400 text-xs font-medium select-none shrink-0">{{ documentStoreProvider.sortInputLabel }}</span>
+            <span class="text-orange-600 dark:text-orange-400 text-xs font-medium select-none shrink-0">{{ documentStoreLabels.sortInputLabel }}</span>
             <textarea
               ref="sortInputRef"
               v-model="sortInput"
@@ -2192,9 +3243,24 @@ defineExpose({ focusSearch });
               rows="1"
               class="document-query-input flex-1 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
               placeholder="{}"
-              @keydown.enter.exact.prevent="applyFilter"
-              @keydown.ctrl.enter.prevent="applyFilter"
-              @keydown.meta.enter.prevent="applyFilter"
+              :aria-autocomplete="documentQueryCompletionEnabled ? 'list' : undefined"
+              :aria-controls="documentQueryCompletionTarget === 'sort' ? documentQueryCompletionListboxId : undefined"
+              :aria-activedescendant="documentQueryCompletionTarget === 'sort' ? documentQueryCompletionActiveDescendant : undefined"
+              :aria-expanded="documentQueryCompletionEnabled ? documentQueryCompletionTarget === 'sort' : undefined"
+              @blur="onDocumentQueryBlur('sort')"
+              @click="onDocumentQueryCaretMove('sort')"
+              @input="onDocumentQueryInput($event, 'sort')"
+              @keydown="onDocumentQueryKeydown($event, 'sort')"
+            />
+            <DocumentQueryCompletionMenu
+              v-if="documentQueryCompletionOpen && documentQueryCompletionTarget === 'sort'"
+              :items="documentQueryCompletionItems"
+              :selected-index="documentQueryCompletionIndex"
+              :listbox-id="documentQueryCompletionListboxId"
+              :label="documentStoreLabels.sortInputLabel"
+              :position="documentQueryCompletionPosition"
+              @select="selectDocumentQueryCompletion"
+              @accept="acceptDocumentQueryCompletion"
             />
             <button v-if="sortInput.trim()" type="button" class="flex h-5 shrink-0 items-center text-muted-foreground hover:text-foreground" title="Format JSON" aria-label="Format JSON" @click="formatSortInput">
               <Braces class="w-3 h-3" />
@@ -2223,7 +3289,7 @@ defineExpose({ focusSearch });
           <div class="flex-1 overflow-y-auto">
             <div v-for="(doc, idx) in documents" :key="idx" class="px-3 py-1.5 border-b text-xs font-mono cursor-pointer hover:bg-accent/50 flex items-center gap-2 group" :class="{ 'bg-accent': selectedIdx === idx }" @click="selectDoc(idx)">
               <span class="truncate flex-1">{{ docPreview(doc) }}</span>
-              <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100 text-destructive shrink-0" @click.stop="requestDeleteDoc(idx)">
+              <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100 text-destructive shrink-0" :disabled="!documentStoreEditable" :title="documentStoreEditDisabledReason" @click.stop="requestDeleteDoc(idx)">
                 <Trash2 class="w-3 h-3" />
               </Button>
             </div>
@@ -2243,7 +3309,10 @@ defineExpose({ focusSearch });
                 <input class="min-w-0 w-full cursor-text select-text appearance-none border-0 bg-transparent p-0 text-inherit outline-none focus:ring-0" :value="selectedDocumentIdLabel" :aria-label="`_id: ${selectedDocumentIdLabel}`" readonly spellcheck="false" />
               </Badge>
               <span class="flex-1" />
-              <Button v-if="!isEditing" variant="ghost" size="sm" class="h-6 text-xs" @click="startEdit">{{ t("mongo.edit") }}</Button>
+              <Button v-if="!isEditing" variant="ghost" size="icon" class="h-6 w-7" :title="t('grid.copy')" @click="copyDocument">
+                <Copy class="h-3.5 w-3.5" />
+              </Button>
+              <Button v-if="!isEditing" variant="ghost" size="sm" class="h-6 text-xs" :disabled="!documentStoreEditable" :title="documentStoreEditDisabledReason" @click="startEdit">{{ t("mongo.edit") }}</Button>
               <template v-if="isEditing">
                 <div class="flex items-center border rounded-md overflow-hidden mr-1">
                   <Button variant="ghost" size="sm" class="h-6 rounded-none px-2 text-xs" :class="{ 'bg-accent': documentEditMode === 'json' }" :disabled="isSavingDocument" @click="setDocumentEditMode('json')">{{ t("mongo.editModeJson") }}</Button>
@@ -2253,23 +3322,6 @@ defineExpose({ focusSearch });
                 <Button variant="ghost" size="sm" class="h-6 text-xs" :disabled="isSavingDocument" @click="cancelEdit">{{ t("grid.discard") }}</Button>
                 <Button size="sm" class="h-6 text-xs" :disabled="isSavingDocument" @click="saveDoc"><Save class="w-3 h-3 mr-1" />{{ t("grid.save") }}</Button>
               </template>
-            </div>
-
-            <div v-if="documentSearchOpen && (!isEditing || documentEditMode === 'json')" data-document-search class="flex h-9 shrink-0 items-center justify-end gap-1 border-b bg-background px-2">
-              <div class="relative w-56 max-w-[45%] min-w-32">
-                <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input ref="documentSearchInputRef" v-model="documentSearchQuery" class="h-7 select-text pl-7 pr-2 text-xs" :placeholder="t('editor.search.find')" @keydown.enter.prevent="activateDocumentSearchMatch($event.shiftKey ? -1 : 1)" @keydown.escape.prevent="closeDocumentSearch" />
-              </div>
-              <span class="w-12 text-center text-[11px] tabular-nums text-muted-foreground">{{ documentSearchStatus }}</span>
-              <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('editor.search.prevMatch')" :disabled="documentSearchMatches.length === 0" @click="moveDocumentSearchMatch(-1)">
-                <ChevronUp class="h-3.5 w-3.5" />
-              </Button>
-              <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('editor.search.nextMatch')" :disabled="documentSearchMatches.length === 0" @click="moveDocumentSearchMatch(1)">
-                <ChevronDown class="h-3.5 w-3.5" />
-              </Button>
-              <Button variant="ghost" size="icon" class="h-7 w-7" @click="closeDocumentSearch">
-                <X class="h-3.5 w-3.5" />
-              </Button>
             </div>
 
             <div v-if="isEditing && documentEditMode === 'json' && !isNew" class="px-4 py-1.5 text-[11px] text-muted-foreground border-b bg-muted/20 shrink-0">
@@ -2293,8 +3345,8 @@ defineExpose({ focusSearch });
               </div>
             </div>
 
-            <div v-else ref="documentViewerRef" data-document-json-viewer tabindex="-1" class="flex-1 overflow-auto bg-muted/10 outline-none" @dblclick="handleDocumentViewerDoubleClick">
-              <pre class="json-viewer min-w-fit select-text p-5" :style="documentFontStyle" v-html="highlightedJson(editJson)" />
+            <div v-else data-document-json-viewer class="flex-1 min-h-0 select-text bg-muted/10 outline-none" @dblclick="handleDocumentViewerDoubleClick">
+              <RedisJsonEditor ref="documentJsonEditorRef" :model-value="editJson" read-only :line-numbers="false" presentation="viewer" class="h-full" />
             </div>
           </template>
           <div v-else class="h-full flex items-center justify-center text-muted-foreground text-sm">
@@ -2317,15 +3369,6 @@ defineExpose({ focusSearch });
   resize: none;
   overflow-y: auto;
   white-space: pre-wrap;
-}
-
-.json-viewer {
-  font-family: var(--dbx-editor-font-family);
-  font-size: var(--dbx-editor-font-size);
-  line-height: 1.6;
-  tab-size: 2;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 
 .json-edit {

@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Text } from "@codemirror/state";
-import { currentStatementFrameRect, FRAME_INSET_PX } from "@/lib/editor/codemirrorCurrentStatementFrameLayer";
+import { currentStatementFrameLayer, currentStatementFrameRect, FRAME_INSET_PX, MAX_FRAME_STATEMENT_LINES } from "@/lib/editor/codemirrorCurrentStatementFrameLayer";
 
 interface CoordRect {
   left: number;
@@ -20,6 +20,8 @@ interface LineBlock {
 
 interface ViewLike {
   coordsAtPos: (pos: number, side?: -1 | 1) => CoordRect | null;
+  contentDOM: { getBoundingClientRect(): DOMRect };
+  defaultLineHeight: number;
   lineBlockAt: (pos: number) => LineBlock;
   defaultCharacterWidth: number;
   state: { doc: ReturnType<typeof Text.of> };
@@ -32,18 +34,37 @@ const CHAR_WIDTH = 9;
 const LINE_HEIGHT = 20;
 const BASE_TOP = 112; // typical editor top on screen
 
-function buildView(lines: string[], scrollTop = 0, coordsAtPosNull: ((pos: number, side: -1 | 1) => boolean) | null = null): ViewLike {
+interface BuildViewOptions {
+  wrapAtColumns?: number;
+  viewportColumns?: number;
+}
+
+function buildView(lines: string[], scrollTop = 0, coordsAtPosNull: ((pos: number, side: -1 | 1) => boolean) | null = null, options: BuildViewOptions = {}): ViewLike {
   const doc = Text.of(lines);
+  const wrapAtColumns = options.wrapAtColumns;
+  const visualRows = lines.map((line) => (wrapAtColumns ? Math.max(1, Math.ceil(line.length / wrapAtColumns)) : 1));
+  const lineTops: number[] = [];
+  let nextLineTop = 0;
+  for (const rows of visualRows) {
+    lineTops.push(nextLineTop);
+    nextLineTop += rows * LINE_HEIGHT;
+  }
+  const viewportWidth = options.viewportColumns ? options.viewportColumns * CHAR_WIDTH : 1000;
   const lineTop = (pos: number) => {
     const line = doc.lineAt(pos);
-    return (line.number - 1) * LINE_HEIGHT;
+    return lineTops[line.number - 1];
   };
   return {
+    contentDOM: {
+      getBoundingClientRect: () => ({ left: 0, top: BASE_TOP, right: viewportWidth, bottom: 1000, width: viewportWidth, height: 1000 }) as DOMRect,
+    },
     defaultCharacterWidth: CHAR_WIDTH,
+    defaultLineHeight: LINE_HEIGHT,
     lineBlockAt(pos: number): LineBlock {
       const top = lineTop(pos);
       const line = doc.lineAt(pos);
-      return { from: line.from, length: line.length, top, bottom: top + LINE_HEIGHT, height: LINE_HEIGHT };
+      const height = visualRows[line.number - 1] * LINE_HEIGHT;
+      return { from: line.from, length: line.length, top, bottom: top + height, height };
     },
     state: { doc },
     scaleX: 1,
@@ -51,17 +72,19 @@ function buildView(lines: string[], scrollTop = 0, coordsAtPosNull: ((pos: numbe
     scrollDOM: {
       scrollLeft: 0,
       scrollTop,
-      getBoundingClientRect: () => ({ left: 0, top: BASE_TOP, right: 1000, bottom: 1000, width: 1000, height: 1000 }) as DOMRect,
+      getBoundingClientRect: () => ({ left: 0, top: BASE_TOP, right: viewportWidth, bottom: 1000, width: viewportWidth, height: 1000 }) as DOMRect,
     },
     coordsAtPos(pos: number, side: -1 | 1 = 1): CoordRect | null {
       if (coordsAtPosNull?.(pos, side)) return null;
-      const col = pos - doc.lineAt(pos).from;
+      const line = doc.lineAt(pos);
+      const offset = pos - line.from;
+      const characterOffset = side === -1 ? Math.max(0, offset - 1) : Math.min(offset, Math.max(0, line.length - 1));
+      const visualRow = wrapAtColumns ? Math.floor(characterOffset / wrapAtColumns) : 0;
+      const col = wrapAtColumns ? characterOffset % wrapAtColumns : characterOffset;
       const left = col * CHAR_WIDTH;
-      const top = lineTop(pos);
+      const top = lineTop(pos) + visualRow * LINE_HEIGHT;
       // Screen coords = content pos - scrollTop + baseTop
-      return side === -1
-        ? { left: left - CHAR_WIDTH, right: left, top: top - scrollTop + BASE_TOP, bottom: top + LINE_HEIGHT - scrollTop + BASE_TOP, height: LINE_HEIGHT }
-        : { left, right: left + CHAR_WIDTH, top: top - scrollTop + BASE_TOP, bottom: top + LINE_HEIGHT - scrollTop + BASE_TOP, height: LINE_HEIGHT };
+      return { left, right: left + CHAR_WIDTH, top: top - scrollTop + BASE_TOP, bottom: top + LINE_HEIGHT - scrollTop + BASE_TOP, height: LINE_HEIGHT };
     },
   };
 }
@@ -93,6 +116,55 @@ describe("currentStatementFrameRect", () => {
     expect(rect!.top).toBe(0 - FRAME_INSET_PX);
     expect(rect!.height).toBe(3 * LINE_HEIGHT + FRAME_INSET_PX * 2);
     expect(rect!.width).toBe(9 * CHAR_WIDTH + FRAME_INSET_PX * 2);
+  });
+
+  it("covers every visual row of one soft-wrapped logical line", () => {
+    const sql = `SELECT ${"x".repeat(20)}`;
+    const view = buildView([sql], 0, null, { wrapAtColumns: 10, viewportColumns: 10 });
+
+    const rect = currentStatementFrameRect(view, 0, sql.length);
+
+    expect(rect).not.toBeNull();
+    expect(rect!.width).toBe(10 * CHAR_WIDTH + FRAME_INSET_PX * 2);
+    expect(rect!.height).toBe(3 * LINE_HEIGHT + FRAME_INSET_PX * 2);
+  });
+
+  it("does not widen a short statement that stays on one visual row of a wrapped logical line", () => {
+    const statement = "SELECT 1;";
+    const view = buildView([`${statement} ${"x".repeat(20)}`], 0, null, { wrapAtColumns: 10, viewportColumns: 10 });
+
+    const rect = currentStatementFrameRect(view, 0, statement.length);
+
+    expect(rect).not.toBeNull();
+    expect(rect!.width).toBe(statement.length * CHAR_WIDTH + FRAME_INSET_PX * 2);
+    expect(rect!.height).toBe(LINE_HEIGHT + FRAME_INSET_PX * 2);
+  });
+
+  it("uses the visual viewport width when one logical line in a multi-line statement wraps", () => {
+    const lines = ["SELECT 1", `  ${"x".repeat(23)}`, "FROM t"];
+    const view = buildView(lines, 0, null, { wrapAtColumns: 10, viewportColumns: 10 });
+
+    const rect = currentStatementFrameRect(view, 0, view.state.doc.length);
+
+    expect(rect).not.toBeNull();
+    expect(rect!.width).toBe(10 * CHAR_WIDTH + FRAME_INSET_PX * 2);
+    expect(rect!.height).toBe(5 * LINE_HEIGHT + FRAME_INSET_PX * 2);
+  });
+
+  it("keeps soft-wrapped frame probes constant for a very long logical line", () => {
+    const shortView = buildView(["x".repeat(201)], 0, null, { wrapAtColumns: 100, viewportColumns: 100 });
+    const longSql = "x".repeat(1_000_001);
+    const longView = buildView([longSql], 0, null, { wrapAtColumns: 100, viewportColumns: 100 });
+    const shortCoords = vi.spyOn(shortView, "coordsAtPos");
+    const longCoords = vi.spyOn(longView, "coordsAtPos");
+
+    currentStatementFrameRect(shortView, 0, shortView.state.doc.length);
+    const rect = currentStatementFrameRect(longView, 0, longSql.length);
+
+    expect(rect?.width).toBe(100 * CHAR_WIDTH + FRAME_INSET_PX * 2);
+    expect(rect?.height).toBe(Math.ceil(longSql.length / 100) * LINE_HEIGHT + FRAME_INSET_PX * 2);
+    expect(longCoords).toHaveBeenCalledTimes(shortCoords.mock.calls.length);
+    expect(longCoords.mock.calls.length).toBeLessThanOrEqual(6);
   });
 
   it("frames a statement interrupted by a blank line", () => {
@@ -146,6 +218,17 @@ describe("currentStatementFrameRect", () => {
     expect(rect!.height).toBe(4 * LINE_HEIGHT + FRAME_INSET_PX * 2);
   });
 
+  it("keeps a wrapped line full-width when its coordinates are off-viewport", () => {
+    const sql = `SELECT ${"x".repeat(20)}`;
+    const view = buildView([sql], 200, () => true, { wrapAtColumns: 10, viewportColumns: 10 });
+
+    const rect = currentStatementFrameRect(view, 0, sql.length);
+
+    expect(rect).not.toBeNull();
+    expect(rect!.width).toBe(10 * CHAR_WIDTH + FRAME_INSET_PX * 2);
+    expect(rect!.height).toBe(3 * LINE_HEIGHT + FRAME_INSET_PX * 2);
+  });
+
   it("handles both start and end off-viewport (deep scroll)", () => {
     // 100 lines; statement spans lines 48-73. Scroll so both are off-screen.
     const lines: string[] = [];
@@ -159,7 +242,7 @@ describe("currentStatementFrameRect", () => {
     const to = Text.of(lines).line(73).to;
 
     // coordsAtPos returns null for both start and end (far off-screen)
-    const view = buildView(lines, 2000, (pos, side) => (pos === from && side === 1) || (pos === to - 1 && side === -1));
+    const view = buildView(lines, 2000, (pos, side) => (pos === from && side === 1) || (pos === to && side === -1));
 
     const rect = currentStatementFrameRect(view, from, to);
     expect(rect).not.toBeNull();
@@ -168,5 +251,90 @@ describe("currentStatementFrameRect", () => {
     // bottom = lineBlockAt(73).bottom = 73 * LINE_HEIGHT
     const expectedHeight = (73 - 47) * LINE_HEIGHT + FRAME_INSET_PX * 2;
     expect(rect!.height).toBe(expectedHeight);
+  });
+
+  it("skips huge multi-thousand-line statements instead of probing every line (dbx#7226)", () => {
+    // A large Oracle package body is parsed as one statement spanning the
+    // whole file. Without a cap, this loop would issue two coordsAtPos
+    // calls per logical line, freezing the UI on every scroll frame.
+    const lineCount = MAX_FRAME_STATEMENT_LINES + 2000;
+    const lines = Array.from({ length: lineCount }, (_, i) => `  proc_body_line_${i};`);
+    const view = buildView(lines);
+    const coords = vi.spyOn(view, "coordsAtPos");
+
+    const rect = currentStatementFrameRect(view, 0, view.state.doc.length);
+
+    expect(rect).toBeNull();
+    expect(coords).not.toHaveBeenCalled();
+  });
+
+  it("still frames a statement right at the line-count cap", () => {
+    const lines = Array.from({ length: MAX_FRAME_STATEMENT_LINES + 1 }, (_, i) => `-- line ${i}`);
+    const view = buildView(lines);
+
+    const rect = currentStatementFrameRect(view, 0, view.state.doc.length);
+
+    expect(rect).not.toBeNull();
+  });
+});
+
+describe("currentStatementFrameLayer", () => {
+  it("renders above line decorations so active-line backgrounds cannot cover the frame", () => {
+    const layer = vi.fn((config) => config);
+    const RectangleMarker = vi.fn();
+
+    currentStatementFrameLayer({ layer, RectangleMarker } as never, () => ({ from: 0, to: 1 }));
+
+    expect(layer).toHaveBeenCalledWith(expect.objectContaining({ above: true, class: "cm-db-currentStatementFrameLayer" }));
+  });
+
+  it("does not rebuild the frame while the cursor stays in the same statement", () => {
+    const layer = vi.fn((config) => config);
+    const RectangleMarker = vi.fn();
+    const view = buildView(["SELECT 1;", "SELECT 2;"]);
+    const resolver = vi.fn(() => ({ from: 0, to: 8 }));
+    const config = currentStatementFrameLayer({ layer, RectangleMarker } as never, resolver) as unknown as {
+      markers: (currentView: typeof view) => unknown;
+      update: (update: { docChanged: boolean; selectionSet: boolean; viewportChanged: boolean; geometryChanged: boolean; transactions: never[]; view: typeof view }) => boolean;
+    };
+
+    config.markers(view);
+
+    expect(
+      config.update({
+        docChanged: false,
+        selectionSet: true,
+        viewportChanged: false,
+        geometryChanged: false,
+        transactions: [],
+        view,
+      }),
+    ).toBe(false);
+    expect(resolver).toHaveBeenCalledTimes(2);
+  });
+
+  it("rebuilds the frame when the cursor enters another statement", () => {
+    const layer = vi.fn((config) => config);
+    const RectangleMarker = vi.fn();
+    const view = buildView(["SELECT 1;", "SELECT 2;"]);
+    let range = { from: 0, to: 8 };
+    const config = currentStatementFrameLayer({ layer, RectangleMarker } as never, () => range) as unknown as {
+      markers: (currentView: typeof view) => unknown;
+      update: (update: { docChanged: boolean; selectionSet: boolean; viewportChanged: boolean; geometryChanged: boolean; transactions: never[]; view: typeof view }) => boolean;
+    };
+
+    config.markers(view);
+    range = { from: 9, to: 17 };
+
+    expect(
+      config.update({
+        docChanged: false,
+        selectionSet: true,
+        viewportChanged: false,
+        geometryChanged: false,
+        transactions: [],
+        view,
+      }),
+    ).toBe(true);
   });
 });

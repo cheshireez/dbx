@@ -1,17 +1,23 @@
 <script setup lang="ts">
 import { ref, nextTick, onBeforeUnmount, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import { EditorSelection } from "@codemirror/state";
 import { setSearchQuery, openSearchPanel as cmOpenSearchPanel, findNext as cmFindNext, findPrevious as cmFindPrevious, replaceNext as cmReplaceNext, replaceAll as cmReplaceAll } from "@codemirror/search";
 import { ChevronUp, ChevronDown, ChevronRight, TextSelect, X } from "@lucide/vue";
 import { collectEditorSearchMatches, countEditorSearchMatches, createEditorSearchQuery, replaceEditorSearchMatches, type EditorSearchMatch } from "@/lib/editor/editorSearchQuery";
 import { appendSearchMatchSelection, findSearchMatch, isSearchAddSelectionModifier, selectionRangesForSearchMatches, type EditorSearchSelectionDirection } from "@/lib/editor/editorSearchSelection";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { vNamingStyleSupport } from "@/directives/vNamingStyleSupport";
 
 const props = defineProps<{
   view: EditorView | null;
   tone?: "app" | "editor";
+}>();
+
+const emit = defineEmits<{
+  open: [];
+  close: [];
 }>();
 
 const { t } = useI18n();
@@ -171,7 +177,10 @@ function findInScope(direction: "next" | "prev"): boolean {
   if (target) {
     v.dispatch({
       selection: EditorSelection.range(target.from, target.to),
-      scrollIntoView: true,
+      // Center the match instead of the default "nearest" alignment, which
+      // often lands the match flush against the viewport edge and makes an
+      // immediate drag-select there trigger CodeMirror's edge autoscroll.
+      effects: EditorView.scrollIntoView(target.from, { y: "center" }),
     });
     return true;
   }
@@ -268,12 +277,13 @@ function scheduleDocumentSearchUpdate() {
 
 function openSearch(): boolean {
   searchVisible.value = true;
+  emit("open");
   const v = props.view;
   if (v) {
     cmOpenSearchPanel(v);
     const sel = v.state.selection.main;
     const selText = v.state.sliceDoc(sel.from, sel.to);
-    if (selText && !selText.includes("\n")) {
+    if (selText) {
       searchText.value = selText;
     }
     // Set scope when there's a multi-line selection
@@ -307,6 +317,10 @@ function openReplace(): boolean {
 
 function closeSearch() {
   const wasVisible = searchVisible.value;
+  // Escape also reaches this command while editing. A hidden panel must not
+  // dispatch a selection reset, which would dismiss completion before its
+  // Escape handler can consume the key and preserve snippet navigation.
+  if (!wasVisible) return false;
   searchVisible.value = false;
   showReplace.value = false;
   clearDocumentSearchUpdate();
@@ -319,6 +333,7 @@ function closeSearch() {
     clearSearchQuery();
     v.focus();
   }
+  if (wasVisible) emit("close");
   return wasVisible;
 }
 
@@ -491,6 +506,7 @@ defineExpose({
           <input
             ref="searchInputRef"
             v-model="searchText"
+            v-naming-style-support
             autocapitalize="off"
             autocorrect="off"
             spellcheck="false"
@@ -546,6 +562,7 @@ defineExpose({
           <input
             ref="replaceInputRef"
             v-model="replaceText"
+            v-naming-style-support
             autocapitalize="off"
             autocorrect="off"
             spellcheck="false"

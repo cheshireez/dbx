@@ -13,6 +13,8 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyStore;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -23,17 +25,28 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.RaftVoterEndpoint;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.clients.admin.TopicListing;
 import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionInfo;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooDefs;
@@ -47,6 +60,369 @@ import org.junit.jupiter.api.io.TempDir;
 class KafkaAgentTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void consumerGroupSnapshotCalculatesLagAndSortsTopicsAndPartitions() {
+        TopicPartition alphaOne = new TopicPartition("alpha", 1);
+        TopicPartition alphaZero = new TopicPartition("alpha", 0);
+        TopicPartition betaZero = new TopicPartition("beta", 0);
+
+        Map<String, Object> group = KafkaAgent.consumerGroupSnapshotRow(
+            "orders-service",
+            "STABLE",
+            false,
+            2,
+            Arrays.asList(betaZero, alphaOne, alphaZero),
+            Map.of(
+                alphaZero, new OffsetAndMetadata(8),
+                alphaOne, new OffsetAndMetadata(20),
+                betaZero, new OffsetAndMetadata(5)
+            ),
+            true,
+            Map.of(alphaZero, 10L, alphaOne, 24L, betaZero, 6L),
+            Collections.emptyList()
+        );
+
+        assertEquals(List.of("alpha", "beta"), group.get("topics"));
+        assertEquals(7L, group.get("totalLag"));
+        assertEquals(true, group.get("lagAvailable"));
+        assertEquals(2, group.get("memberCount"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> partitions = (List<Map<String, Object>>) group.get("partitions");
+        assertEquals(
+            List.of("alpha:0", "alpha:1", "beta:0"),
+            partitions.stream()
+                .map(partition -> partition.get("topic") + ":" + partition.get("partition"))
+                .toList()
+        );
+    }
+
+    @Test
+    void consumerGroupSnapshotDoesNotReportUnknownLagAsZero() {
+        TopicPartition assignedOnly = new TopicPartition("orders", 0);
+        Map<String, Object> group = KafkaAgent.consumerGroupSnapshotRow(
+            "new-consumer",
+            "EMPTY",
+            false,
+            0,
+            Collections.singletonList(assignedOnly),
+            Collections.emptyMap(),
+            true,
+            Collections.singletonMap(assignedOnly, 42L),
+            Collections.emptyList()
+        );
+
+        assertEquals(false, group.get("lagAvailable"));
+        assertNull(group.get("totalLag"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> partitions = (List<Map<String, Object>>) group.get("partitions");
+        assertNull(partitions.get(0).get("currentOffset"));
+        assertNull(partitions.get(0).get("lag"));
+    }
+
+    @Test
+    void consumerGroupSnapshotPreservesPartialFailuresWithoutInventingLag() {
+        TopicPartition partition = new TopicPartition("orders", 0);
+        Map<String, Object> group = KafkaAgent.consumerGroupSnapshotRow(
+            "orders-service",
+            "UNKNOWN",
+            false,
+            null,
+            Collections.emptyList(),
+            Collections.singletonMap(partition, new OffsetAndMetadata(9)),
+            true,
+            Collections.emptyMap(),
+            Collections.singletonList("End offsets unavailable for 1 partition(s)")
+        );
+
+        assertEquals(false, group.get("lagAvailable"));
+        assertNull(group.get("totalLag"));
+        assertNull(group.get("memberCount"));
+        assertEquals("End offsets unavailable for 1 partition(s)", group.get("error"));
+    }
+
+    @Test
+    void consumerGroupListRowsFilterToTheRequestedTopicAndSortByPartition() {
+        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+        offsets.put(new TopicPartition("orders", 2), new OffsetAndMetadata(20));
+        offsets.put(new TopicPartition("payments", 0), new OffsetAndMetadata(5));
+        offsets.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+
+        List<Map<String, Object>> rows = KafkaAgent.offsetRows(offsets, "orders");
+
+        assertEquals(List.of("orders:0", "orders:2"), rows.stream()
+            .map(row -> row.get("topic") + ":" + row.get("partition"))
+            .toList());
+        assertEquals(8L, rows.get(0).get("offset"));
+        assertEquals(20L, rows.get(1).get("offset"));
+    }
+
+    @Test
+    void consumerGroupListRowsKeepEveryPartitionWithoutATopicFilter() {
+        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+        offsets.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+        offsets.put(new TopicPartition("payments", 1), new OffsetAndMetadata(3));
+
+        List<Map<String, Object>> rows = KafkaAgent.offsetRows(offsets, "");
+
+        assertEquals(2, rows.size());
+    }
+
+    @Test
+    void consumerGroupListEndOffsetRowsSkipPartitionsWithoutResolvedEndOffsets() {
+        Map<TopicPartition, OffsetAndMetadata> committed = new HashMap<>();
+        committed.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+        committed.put(new TopicPartition("orders", 1), new OffsetAndMetadata(20));
+        Map<TopicPartition, Long> endOffsets = new HashMap<>();
+        endOffsets.put(new TopicPartition("orders", 1), 24L);
+
+        List<Map<String, Object>> rows = KafkaAgent.endOffsetRows(committed, endOffsets, "orders");
+
+        assertEquals(List.of("orders:1"), rows.stream()
+            .map(row -> row.get("topic") + ":" + row.get("partition"))
+            .toList());
+        assertEquals(24L, rows.get(0).get("offset"));
+    }
+
+    @Test
+    void consumerGroupListEndOffsetRowsFilterToTheRequestedTopic() {
+        Map<TopicPartition, OffsetAndMetadata> committed = new HashMap<>();
+        committed.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+        committed.put(new TopicPartition("payments", 0), new OffsetAndMetadata(4));
+        Map<TopicPartition, Long> endOffsets = new HashMap<>();
+        endOffsets.put(new TopicPartition("orders", 0), 10L);
+        endOffsets.put(new TopicPartition("payments", 0), 9L);
+
+        List<Map<String, Object>> rows = KafkaAgent.endOffsetRows(committed, endOffsets, "orders");
+
+        assertEquals(List.of("orders:0"), rows.stream()
+            .map(row -> row.get("topic") + ":" + row.get("partition"))
+            .toList());
+    }
+
+    @Test
+    void explicitConsumerGroupOffsetsAcceptOneBoundedPartitionOffset() {
+        JsonObject params = JsonParser.parseString("""
+            {"offsets":[{"partition":1,"offset":42}]}
+            """).getAsJsonObject();
+
+        assertEquals(
+            Map.of(new TopicPartition("events", 1), new org.apache.kafka.clients.consumer.OffsetAndMetadata(42L)),
+            KafkaAgent.explicitConsumerGroupOffsets(params, "events")
+        );
+    }
+
+    @Test
+    void explicitConsumerGroupOffsetsRejectMalformedOrNegativeValues() {
+        for (String json : List.of(
+            "{\"offsets\":[{\"partition\":-1,\"offset\":42}]}",
+            "{\"offsets\":[{\"partition\":1,\"offset\":-1}]}",
+            "{\"offsets\":[{\"partition\":1.5,\"offset\":42}]}",
+            "{\"offsets\":[{\"partition\":1,\"offset\":42.5}]}",
+            "{\"offsets\":[{\"partition\":\"1\",\"offset\":42}]}",
+            "{\"offsets\":[{\"partition\":1,\"offset\":\"42\"}]}",
+            "{\"offsets\":[{\"partition\":1}]}",
+            "{\"offsets\":[42]}",
+            "{\"offsets\":[{\"partition\":2147483648,\"offset\":42}]}",
+            "{\"offsets\":[{\"partition\":1,\"offset\":9223372036854775808}]}",
+            "{\"offsets\":[{\"partition\":1,\"offset\":42},{\"partition\":1,\"offset\":43}]}",
+            "{\"offsets\":[]}",
+            "{\"offsets\":{}}"
+        )) {
+            JsonObject params = JsonParser.parseString(json).getAsJsonObject();
+            assertThrows(IllegalArgumentException.class, () -> KafkaAgent.explicitConsumerGroupOffsets(params, "events"), json);
+        }
+    }
+
+    @Test
+    void topicListingFallsBackWhenDescriptionsAreUnsupported() throws Exception {
+        Object result = KafkaAgent.topicListResult(
+            Arrays.asList(
+                new TopicListing("orders", Uuid.randomUuid(), false),
+                new TopicListing("__consumer_offsets", Uuid.randomUuid(), true)
+            ),
+            names -> {
+                throw new ExecutionException(new UnsupportedVersionException("The version of API is not supported."));
+            }
+        );
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> topics = (List<Map<String, Object>>) ((Map<String, Object>) result).get("topics");
+        assertEquals(Arrays.asList("__consumer_offsets", "orders"), topics.stream().map(topic -> topic.get("name")).toList());
+        assertEquals(true, topics.get(0).get("internal"));
+        assertFalse(topics.get(0).containsKey("partitions"));
+        assertFalse(topics.get(1).containsKey("partitions"));
+    }
+
+    @Test
+    void topicListingFallsBackWhenDescriptionsTimeOut() throws Exception {
+        Object result = KafkaAgent.topicListResult(
+            Arrays.asList(
+                new TopicListing("orders", Uuid.randomUuid(), false),
+                new TopicListing("payments", Uuid.randomUuid(), false)
+            ),
+            names -> {
+                throw new java.util.concurrent.TimeoutException("describeTopics timed out");
+            }
+        );
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> topics = (List<Map<String, Object>>) ((Map<String, Object>) result).get("topics");
+        assertEquals(Arrays.asList("orders", "payments"), topics.stream().map(topic -> topic.get("name")).toList());
+        assertFalse(topics.get(0).containsKey("partitions"));
+        assertFalse(topics.get(1).containsKey("replicationFactor"));
+    }
+
+    @Test
+    void topicListingPreservesNonVersionDescriptionErrors() {
+        IllegalStateException failure = new IllegalStateException("metadata authorization failed");
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> KafkaAgent.topicListResult(
+            Collections.singletonList(new TopicListing("orders", Uuid.randomUuid(), false)),
+            names -> {
+                throw failure;
+            }
+        ));
+
+        assertEquals(failure, thrown);
+    }
+
+    @Test
+    void topicListingKeepsDescriptionMetadataWhenSupported() throws Exception {
+        Node leader = new Node(1, "broker-1", 9092);
+        Node replica = new Node(2, "broker-2", 9092);
+        TopicDescription description = new TopicDescription(
+            "orders",
+            false,
+            Collections.singletonList(new TopicPartitionInfo(
+                0,
+                leader,
+                Arrays.asList(leader, replica),
+                Collections.singletonList(leader)
+            ))
+        );
+
+        Object result = KafkaAgent.topicListResult(
+            Collections.singletonList(new TopicListing("orders", Uuid.randomUuid(), false)),
+            names -> Collections.singletonMap("orders", description)
+        );
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> topics = (List<Map<String, Object>>) ((Map<String, Object>) result).get("topics");
+        assertEquals(1, topics.size());
+        assertEquals(1, topics.get(0).get("partitions"));
+        assertEquals(2, topics.get(0).get("replicationFactor"));
+        assertEquals(false, topics.get(0).get("internal"));
+    }
+
+    @Test
+    void legacyStatsFallbackRequiresAnUnsupportedVersionException() {
+        assertTrue(KafkaAgent.hasUnsupportedVersionException(new ExecutionException(
+            new UnsupportedVersionException(
+                "MetadataRequest versions older than 4 don't support the allowAutoTopicCreation field"
+            )
+        )));
+        assertFalse(KafkaAgent.hasUnsupportedVersionException(
+            new IllegalStateException("broker reports unsupported version text")
+        ));
+    }
+
+    @Test
+    void legacyTopicStatsRequireAnExistingTopicFromAllTopicMetadata() {
+        var error = assertThrows(
+            org.apache.kafka.common.errors.UnknownTopicOrPartitionException.class,
+            () -> KafkaAgent.requireExistingTopic(Collections.singleton("payments"), "orders")
+        );
+
+        assertTrue(error.getMessage().contains("orders"));
+    }
+
+    @Test
+    void legacyTopicStatsConsumerUsesCompatibleMetadataOnlyForConnectedSessions() {
+        assertThrows(IllegalStateException.class, () -> KafkaAgent.topicStatsConsumerProperties(null));
+
+        JsonObject connection = new JsonObject();
+        connection.addProperty("bootstrap_servers", "legacy-broker:9092");
+        Properties properties = KafkaAgent.topicStatsConsumerProperties(connection);
+
+        assertEquals("true", properties.getProperty("allow.auto.create.topics"));
+        assertEquals("false", properties.getProperty("enable.auto.commit"));
+    }
+
+    @Test
+    void legacyTopicStatsPreserveTheExistingStatsShape() {
+        Node leader = new Node(1, "broker-1", 9092);
+        Node replica = new Node(2, "broker-2", 9092);
+        PartitionInfo partition = new PartitionInfo(
+            "orders",
+            0,
+            leader,
+            new Node[] { leader, replica },
+            new Node[] { leader }
+        );
+        TopicPartition topicPartition = new TopicPartition("orders", 0);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>) KafkaAgent.legacyTopicStatsResult(
+            "orders",
+            Collections.singletonList(partition),
+            Collections.singletonMap(topicPartition, 4L),
+            Collections.singletonMap(topicPartition, 10L)
+        );
+
+        assertEquals("orders", result.get("name"));
+        assertEquals(1, result.get("partitions"));
+        assertEquals(2, result.get("replicationFactor"));
+        assertEquals(6L, result.get("totalMessages"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> partitionStats = (List<Map<String, Object>>) result.get("partitionStats");
+        assertEquals(List.of(1, 2), partitionStats.get(0).get("replicas"));
+        assertEquals(Collections.singletonList(1), partitionStats.get(0).get("isr"));
+        assertEquals(4L, partitionStats.get(0).get("beginOffset"));
+        assertEquals(10L, partitionStats.get(0).get("endOffset"));
+    }
+
+    @Test
+    void topicConfigReturnsAnExplicitUnsupportedMarkerForLegacyBrokers() throws Exception {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>) KafkaAgent.topicConfigResult(() -> {
+            throw new ExecutionException(new UnsupportedVersionException(
+                "The node does not support DESCRIBE_CONFIGS"
+            ));
+        });
+
+        assertEquals(Collections.emptyMap(), result.get("configs"));
+        assertEquals(false, result.get("configSupported"));
+        assertTrue(((String) result.get("unsupportedReason")).contains("DescribeConfigs"));
+    }
+
+    @Test
+    void topicConfigPreservesModernConfigEntries() throws Exception {
+        Config config = new Config(Collections.singletonList(new ConfigEntry("retention.ms", "60000")));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>) KafkaAgent.topicConfigResult(() -> config);
+        @SuppressWarnings("unchecked")
+        Map<String, Map<String, Object>> configs = (Map<String, Map<String, Object>>) result.get("configs");
+
+        assertEquals("60000", configs.get("retention.ms").get("value"));
+        assertFalse(result.containsKey("configSupported"));
+    }
+
+    @Test
+    void topicConfigPreservesNonVersionFailures() {
+        IllegalStateException failure = new IllegalStateException("broker reports unsupported version text");
+
+        IllegalStateException thrown = assertThrows(
+            IllegalStateException.class,
+            () -> KafkaAgent.topicConfigResult(() -> {
+                throw failure;
+            })
+        );
+
+        assertEquals(failure, thrown);
+    }
 
     @Test
     void resolvesBootstrapServersFromKafka11ZooKeeperRegistrationWithChroot() throws Exception {
@@ -203,6 +579,30 @@ class KafkaAgentTest {
         assertEquals("dbx", kafkaProperties.getProperty("client.id"));
         assertNull(kafkaProperties.getProperty("zookeeper.sasl.client"));
         assertNull(kafkaProperties.getProperty("zookeeper.ssl.trustStore.password"));
+    }
+
+    @Test
+    void producerDefaultsToLegacyCompatibleNonIdempotentDelivery() {
+        JsonObject connection = new JsonObject();
+        connection.addProperty("bootstrap_servers", "legacy-broker:9092");
+
+        Properties properties = KafkaAgent.producerProperties(connection);
+
+        assertEquals("all", properties.getProperty(ProducerConfig.ACKS_CONFIG));
+        assertEquals("false", properties.getProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG));
+    }
+
+    @Test
+    void producerAllowsExplicitIdempotenceForModernBrokers() {
+        JsonObject extraProperties = new JsonObject();
+        extraProperties.addProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+        JsonObject connection = new JsonObject();
+        connection.addProperty("bootstrap_servers", "modern-broker:9092");
+        connection.add("properties", extraProperties);
+
+        Properties properties = KafkaAgent.producerProperties(connection);
+
+        assertEquals("true", properties.getProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG));
     }
 
     @Test
@@ -466,15 +866,23 @@ class KafkaAgentTest {
     }
 
     @Test
-    void boundsThePerPartitionMessageQuotaBeforeTrimmingTheResult() {
-        assertEquals(12, KafkaAgent.recentPeekFetchCount(4, 3));
+    void latestPeekReportsWhetherTheGlobalBudgetCanCoverEveryPartitionQuota() {
+        assertFalse(KafkaAgent.latestPeekBudgetLimited(20, 50));
+        assertTrue(KafkaAgent.latestPeekBudgetLimited(20, 51));
+        assertTrue(KafkaAgent.latestPeekBudgetLimited(100, 11));
         assertEquals(4, KafkaAgent.peekMessagesPerPartition(10, 3));
     }
 
     @Test
-    void peekRejectsAWindowThatExceedsTheScanLimit() {
-        assertThrows(IllegalArgumentException.class, () ->
-            KafkaAgent.peekScanLimit(100, 1_001));
+    void latestPeekSharesTheGlobalScanBudgetAcrossManyPartitions() {
+        assertEquals(20, KafkaAgent.latestPeekMessagesPerPartition(20, 3));
+        assertEquals(19, KafkaAgent.latestPeekMessagesPerPartition(20, 51));
+        assertEquals(16, KafkaAgent.latestPeekMessagesPerPartition(20, 60));
+        assertEquals(10, KafkaAgent.latestPeekMessagesPerPartition(20, 100));
+        assertEquals(90, KafkaAgent.latestPeekMessagesPerPartition(100, 11));
+        assertEquals(1_000, KafkaAgent.peekScanLimit(
+            100, 11, KafkaAgent.PeekStartPosition.LATEST
+        ));
     }
 
     @Test
@@ -547,6 +955,25 @@ class KafkaAgentTest {
     }
 
     @Test
+    void resolvePeekPartitionsRejectsMissingPartitionBeforeOffsetLookup() {
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () ->
+            KafkaAgent.resolvePeekPartitions("events", 5, List.of(0, 1, 2))
+        );
+
+        assertEquals(
+            "Kafka partition 5 does not exist for topic 'events'. Available partitions: 0, 1, 2",
+            error.getMessage()
+        );
+    }
+
+    @Test
+    void resolvePeekPartitionsKeepsRequestedPartitionAfterMetadataLookup() {
+        var partitions = KafkaAgent.resolvePeekPartitions("events", 1, List.of(0, 1, 2));
+
+        assertEquals(List.of(1), partitions.stream().map(TopicPartition::partition).toList());
+    }
+
+    @Test
     void resolvePeekPartitionsUsesAllPartitionsWhenUnspecified() {
         var partitions = KafkaAgent.resolvePeekPartitions("events", null, List.of(2, 0, 1));
         assertEquals(List.of(0, 1, 2), partitions.stream().map(org.apache.kafka.common.TopicPartition::partition).toList());
@@ -578,9 +1005,45 @@ class KafkaAgentTest {
 
         assertEquals(20L, messages.get(0).get("timestamp"));
         assertEquals(0, messages.get(1).get("partition"));
-        assertEquals(2L, messages.get(1).get("offset"));
-        assertEquals(5L, messages.get(2).get("offset"));
+        assertEquals(5L, messages.get(1).get("offset"));
+        assertEquals(2L, messages.get(2).get("offset"));
         assertEquals(1, messages.get(3).get("partition"));
+    }
+
+    @Test
+    void latestPeekKeepsTheFullQuotaWhenItFitsTheGlobalScanBudget() {
+        assertEquals(1_000, KafkaAgent.peekScanLimit(
+            100, 10, KafkaAgent.PeekStartPosition.LATEST
+        ));
+        assertEquals(100, KafkaAgent.latestPeekMessagesPerPartition(100, 10));
+        assertEquals(20, KafkaAgent.latestPeekMessagesPerPartition(20, 50));
+    }
+
+    @Test
+    void latestPeekRejectsTopicsWhosePartitionCountAloneExceedsTheScanBudget() {
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () ->
+            KafkaAgent.latestPeekMessagesPerPartition(20, 1_001)
+        );
+
+        assertTrue(error.getMessage().contains("select a partition"));
+    }
+
+    @Test
+    void latestPeekGloballyMergesInterleavedPartitionTimelinesBeforeLimiting() {
+        var messages = new java.util.ArrayList<Map<String, Object>>();
+        messages.add(Map.of("timestamp", 101L, "partition", 0, "offset", 8L));
+        messages.add(Map.of("timestamp", 105L, "partition", 1, "offset", 3L));
+        messages.add(Map.of("timestamp", 103L, "partition", 2, "offset", 9L));
+        messages.add(Map.of("timestamp", 104L, "partition", 0, "offset", 9L));
+        messages.add(Map.of("timestamp", 102L, "partition", 1, "offset", 2L));
+
+        List<Map<String, Object>> latest = KafkaAgent.sortAndLimitPeekedMessages(
+            messages, 3, KafkaAgent.PeekStartPosition.LATEST
+        );
+
+        assertEquals(List.of(105L, 104L, 103L), latest.stream()
+            .map(message -> ((Number) message.get("timestamp")).longValue())
+            .toList());
     }
 
     @Test
@@ -909,6 +1372,46 @@ class KafkaAgentTest {
             "com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true keyTab=\"/tmp/user.keytab\" principal=\"user@EXAMPLE.COM\";",
             props.getProperty("sasl.jaas.config")
         );
+    }
+
+    @Test
+    void skipTlsVerificationDisablesHostnameAndCertificateChainValidation() throws Exception {
+        Properties props = new Properties();
+        KafkaAgent.applyConnectionProperties(JsonParser.parseString("""
+            {
+              "security_protocol": "SASL_SSL",
+              "tls_skip_verify": true,
+              "properties": {
+                "ssl.endpoint.identification.algorithm": "https",
+                "ssl.trustmanager.algorithm": "PKIX"
+              }
+            }
+            """).getAsJsonObject(), props);
+
+        assertEquals("", props.getProperty("ssl.endpoint.identification.algorithm"));
+        assertEquals(
+            DbxInsecureTrustManagerFactory.ALGORITHM,
+            props.getProperty("ssl.trustmanager.algorithm")
+        );
+
+        TrustManagerFactory factory = TrustManagerFactory.getInstance(DbxInsecureTrustManagerFactory.ALGORITHM);
+        factory.init((KeyStore) null);
+        X509TrustManager trustManager = (X509TrustManager) factory.getTrustManagers()[0];
+        assertDoesNotThrow(() -> trustManager.checkServerTrusted(new X509Certificate[0], "RSA"));
+    }
+
+    @Test
+    void verifiedTlsKeepsKafkaDefaultTrustAndHostnameValidation() {
+        Properties props = new Properties();
+        KafkaAgent.applyConnectionProperties(JsonParser.parseString("""
+            {
+              "security_protocol": "SASL_SSL",
+              "tls_skip_verify": false
+            }
+            """).getAsJsonObject(), props);
+
+        assertNull(props.getProperty("ssl.endpoint.identification.algorithm"));
+        assertNull(props.getProperty("ssl.trustmanager.algorithm"));
     }
 
     @Test

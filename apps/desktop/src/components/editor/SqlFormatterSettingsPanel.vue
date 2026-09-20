@@ -9,6 +9,8 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/composables/useToast";
 import { copyToClipboard } from "@/lib/common/clipboard";
+import { saveTextFile } from "@/lib/export/saveTextFile";
+import { searchKeymapWithoutModD } from "@/lib/editor/codemirrorSearchKeymap";
 import {
   DEFAULT_SQL_FORMATTER_SETTINGS,
   SQL_FORMATTER_CONFIG_FORMATTER,
@@ -107,6 +109,7 @@ const sqlFormatterOptionLabelKeys: Record<keyof SqlFormatterOptionSettings, stri
   fromClauseLayout: "settings.sqlFormatterFromClauseLayout",
   expressionWidth: "settings.sqlFormatterExpressionWidth",
   linesBetweenQueries: "settings.sqlFormatterLinesBetweenQueries",
+  preserveEmptyLines: "settings.sqlFormatterPreserveEmptyLines",
   denseOperators: "settings.sqlFormatterDenseOperators",
   newlineBeforeSemicolon: "settings.sqlFormatterNewlineBeforeSemicolon",
   paramTypes: "settings.sqlFormatterParamTypes",
@@ -299,16 +302,8 @@ async function onImportFile(event: Event) {
   }
 }
 
-function exportConfig() {
-  const blob = new Blob([serializeSqlFormatterConfig(settings.value)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "dbx-sql-formatter.json";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+async function exportConfig() {
+  await saveTextFile(serializeSqlFormatterConfig(settings.value), "dbx-sql-formatter.json", "JSON", "json");
 }
 
 async function copyJsonDraft() {
@@ -368,7 +363,7 @@ function jsonEditorKeymapExtension(modules: CodeMirrorModules) {
   const { keymap } = modules.view;
   const commands = modules.commands;
   const search = modules.search;
-  return keymap.of([...search.searchKeymap, ...commands.historyKeymap, ...commands.defaultKeymap]);
+  return keymap.of([...searchKeymapWithoutModD(search.searchKeymap), ...commands.historyKeymap, ...commands.defaultKeymap]);
 }
 
 async function initJsonEditor() {
@@ -673,6 +668,11 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="grid gap-3 md:grid-cols-2">
+          <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+            <Label for="sql-formatter-preserve-empty-lines">{{ t("settings.sqlFormatterPreserveEmptyLines") }}</Label>
+            <Switch id="sql-formatter-preserve-empty-lines" :model-value="settings.preserveEmptyLines" @update:model-value="(value: boolean) => updateOption('preserveEmptyLines', value)" />
+          </div>
+
           <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
             <Label for="sql-formatter-dense-operators">{{ t("settings.sqlFormatterDenseOperators") }}</Label>
             <Switch id="sql-formatter-dense-operators" :model-value="settings.denseOperators" @update:model-value="(value: boolean) => updateOption('denseOperators', value)" />

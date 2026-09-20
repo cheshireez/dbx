@@ -1,11 +1,11 @@
 import type { ComposerTranslation } from "vue-i18n";
 import { normalizeJsonArgument } from "@dbx-app/mongo-shell";
-import { isElasticsearchCompatibleDatabaseType, type DatabaseType } from "@/types/database";
+import { isElasticsearchCompatibleDatabaseType, isMeilisearchDatabaseType, type DatabaseType } from "@/types/database";
 import { quoteUnquotedObjectKeys } from "@/lib/mongo/mongoShellCommand";
 import { formatMongoShellLiteral } from "@/lib/mongo/mongoDocumentValues";
 
-export type DocumentStoreKind = "mongodb" | "elasticsearch";
-export type DocumentFilterMode = "equals" | "not-equals" | "like" | "not-like" | "greater-than" | "greater-than-or-equal" | "less-than" | "less-than-or-equal" | "is-null" | "is-not-null";
+export type DocumentStoreKind = "mongodb" | "dynamodb" | "elasticsearch" | "meilisearch";
+export type DocumentFilterMode = "equals" | "not-equals" | "like" | "not-like" | "begins-with" | "ends-with" | "greater-than" | "greater-than-or-equal" | "less-than" | "less-than-or-equal" | "in" | "not-in" | "between" | "not-between" | "is-null" | "is-not-null";
 export type DocumentFilterValueType = "auto" | "string" | "number" | "boolean" | "object-id" | "date" | "int32" | "int64" | "decimal128" | "json";
 export type ElasticsearchBoolClause = "filter" | "must" | "should" | "must_not";
 export type ElasticsearchQueryType = "term" | "terms" | "match" | "match_phrase" | "wildcard" | "range_gt" | "range_gte" | "range_lt" | "range_lte" | "exists";
@@ -15,6 +15,7 @@ export type DocumentFilterRule = {
   fieldName: string;
   mode: DocumentFilterMode;
   rawValue: string;
+  rawEndValue?: string;
   conjunction: "AND" | "OR";
   valueType?: DocumentFilterValueType;
   elasticsearchClause?: ElasticsearchBoolClause;
@@ -56,13 +57,32 @@ export const documentFilterModeOptions: Array<{ value: DocumentFilterMode; label
   { value: "not-equals", labelKey: "grid.filterBuilderNotEquals" },
   { value: "like", labelKey: "grid.filterBuilderContains" },
   { value: "not-like", labelKey: "grid.filterBuilderNotContains" },
+  { value: "begins-with", labelKey: "grid.filterBuilderBeginsWith" },
+  { value: "ends-with", labelKey: "grid.filterBuilderEndsWith" },
   { value: "greater-than", labelKey: "grid.filterBuilderGreaterThan" },
   { value: "greater-than-or-equal", labelKey: "grid.filterBuilderGreaterThanOrEqual" },
   { value: "less-than", labelKey: "grid.filterBuilderLessThan" },
   { value: "less-than-or-equal", labelKey: "grid.filterBuilderLessThanOrEqual" },
+  { value: "in", labelKey: "grid.filterBuilderIn" },
+  { value: "not-in", labelKey: "grid.filterBuilderNotIn" },
+  { value: "between", labelKey: "grid.filterBuilderBetween" },
+  { value: "not-between", labelKey: "grid.filterBuilderNotBetween" },
   { value: "is-null", labelKey: "grid.filterBuilderIsNull" },
   { value: "is-not-null", labelKey: "grid.filterBuilderIsNotNull" },
 ];
+
+/**
+ * Operators that are only expressible in MongoDB filter documents. The other
+ * document stores keep their previous operator set so their query builders are
+ * not offered predicates they cannot express.
+ */
+const MONGO_ONLY_DOCUMENT_FILTER_MODES = new Set<DocumentFilterMode>(["begins-with", "ends-with", "in", "not-in", "between", "not-between"]);
+
+export function documentFilterModeOptionsFor(kind: DocumentStoreKind): Array<{ value: DocumentFilterMode; labelKey: string }> {
+  if (kind === "meilisearch") return documentFilterModeOptions.filter((option) => option.value !== "like" && option.value !== "not-like" && !MONGO_ONLY_DOCUMENT_FILTER_MODES.has(option.value));
+  if (kind === "mongodb") return documentFilterModeOptions;
+  return documentFilterModeOptions.filter((option) => !MONGO_ONLY_DOCUMENT_FILTER_MODES.has(option.value));
+}
 
 export const documentFilterValueTypeOptions: Array<{ value: DocumentFilterValueType; labelKey: string }> = [
   { value: "auto", labelKey: "grid.filterBuilderValueTypeAuto" },
@@ -130,8 +150,54 @@ const elasticsearchDocumentProvider: DocumentStoreProvider = {
   sortInputForColumn: mongoDocumentProvider.sortInputForColumn,
 };
 
+const meilisearchDocumentProvider: DocumentStoreProvider = {
+  kind: "meilisearch",
+  filterInputLabel: "filter",
+  sortInputLabel: "sort",
+  documentsLabel: ({ total }) => `${total} Documents`,
+  queryPreview: ({ collection, filterJson, sortJson, skip, limit }) => {
+    const lines = ["DBX MEILISEARCH FETCH DOCUMENTS", `index: ${JSON.stringify(collection)}`, `offset: ${skip}`, `limit: ${limit}`];
+    const filter = documentStorePreviewJson(filterJson);
+    if (filter) lines.push("filter:", filter);
+    const sort = documentStorePreviewJson(sortJson);
+    if (sort) lines.push("sort:", sort);
+    return lines.join("\n");
+  },
+  sortInputForColumn: mongoDocumentProvider.sortInputForColumn,
+};
+
+const dynamodbDocumentProvider: DocumentStoreProvider = {
+  kind: "dynamodb",
+  filterInputLabel: "filter",
+  sortInputLabel: "sort key",
+  documentsLabel: ({ total, totalIsExact, t }) => `${totalIsExact ? "" : "≥"}${t("dynamodb.items", { count: total })}`,
+  queryPreview: ({ collection, filterJson, sortJson, limit }) => {
+    const filter = documentStorePreviewJson(filterJson);
+    const sort = documentStorePreviewJson(sortJson);
+    const operation = filterJson?.includes('"$index"') || (filterJson && filterJson !== "{}") ? "QUERY / SCAN" : "SCAN";
+    const lines = [`DBX DYNAMODB ${operation}`, `table: ${JSON.stringify(collection)}`, `limit: ${limit}`];
+    if (filter) lines.push("filter:", filter);
+    if (sort) lines.push("sort:", sort);
+    return lines.join("\n");
+  },
+  sortInputForColumn: mongoDocumentProvider.sortInputForColumn,
+};
+
+function documentStorePreviewJson(value?: string): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed === "{}") return null;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
+  }
+}
+
 export function documentStoreProviderFor(databaseType?: DatabaseType): DocumentStoreProvider {
-  return isElasticsearchCompatibleDatabaseType(databaseType) ? elasticsearchDocumentProvider : mongoDocumentProvider;
+  if (databaseType === "dynamodb") return dynamodbDocumentProvider;
+  if (isElasticsearchCompatibleDatabaseType(databaseType)) return elasticsearchDocumentProvider;
+  if (isMeilisearchDatabaseType(databaseType)) return meilisearchDocumentProvider;
+  return mongoDocumentProvider;
 }
 
 export function defaultDocumentFilterRule(id: string, fieldName = ""): DocumentFilterRule {
@@ -140,6 +206,7 @@ export function defaultDocumentFilterRule(id: string, fieldName = ""): DocumentF
     fieldName,
     mode: "equals",
     rawValue: "",
+    rawEndValue: "",
     conjunction: "AND",
     valueType: "auto",
     elasticsearchClause: "filter",
@@ -149,6 +216,16 @@ export function defaultDocumentFilterRule(id: string, fieldName = ""): DocumentF
 
 export function documentFilterModeNeedsValue(mode: DocumentFilterMode): boolean {
   return mode !== "is-null" && mode !== "is-not-null";
+}
+
+/** List predicates take a comma/newline separated value list. */
+export function documentFilterModeUsesList(mode: DocumentFilterMode): boolean {
+  return mode === "in" || mode === "not-in";
+}
+
+/** Range predicates take a start and an end value. */
+export function documentFilterModeUsesRange(mode: DocumentFilterMode): boolean {
+  return mode === "between" || mode === "not-between";
 }
 
 type DocumentFieldPathAccumulatorNode = {
@@ -442,17 +519,36 @@ type DocumentFilterParseOptions = {
 export function buildDocumentFilterCondition(rule: DocumentFilterRule, options: DocumentFilterParseOptions = {}): Record<string, unknown> | null {
   if (!rule.fieldName) return null;
   if (documentFilterModeNeedsValue(rule.mode) && !rule.rawValue.trim()) return null;
-  const value = documentFilterModeNeedsValue(rule.mode) ? parseDocumentFilterValue(rule.rawValue, { ...options, valueType: rule.valueType }) : null;
-  const textValue = documentFilterModeNeedsValue(rule.mode) ? String(parseDocumentFilterValue(rule.rawValue)) : "";
+  if (documentFilterModeUsesRange(rule.mode) && !(rule.rawEndValue ?? "").trim()) return null;
+  // Range and list predicates parse their raw input inside their own case, so the
+  // single-value parse must not run for them (it would reject "18, 30" as a number).
+  const parsesSingleValue = documentFilterModeNeedsValue(rule.mode) && !documentFilterModeUsesList(rule.mode) && !documentFilterModeUsesRange(rule.mode);
+  const value = parsesSingleValue ? parseDocumentFilterValue(rule.rawValue, { ...options, valueType: rule.valueType }) : null;
+  const textValue = parsesSingleValue ? String(parseDocumentFilterValue(rule.rawValue)) : "";
   switch (rule.mode) {
     case "equals":
       return { [rule.fieldName]: value };
     case "not-equals":
       return { [rule.fieldName]: { $ne: value } };
     case "like":
+      if (options.kind === "dynamodb") return { [rule.fieldName]: { $contains: value } };
+      if (options.kind === "mongodb" && mongoFilterValueIsNumeric(rule.valueType, options.sampleValue)) {
+        return mongoNumericContainsCondition(rule.fieldName, textValue);
+      }
       return { [rule.fieldName]: { $regex: escapeRegexLiteral(textValue), $options: "i" } };
     case "not-like":
+      if (options.kind === "dynamodb") return { [rule.fieldName]: { $notContains: value } };
+      if (options.kind === "mongodb" && mongoFilterValueIsNumeric(rule.valueType, options.sampleValue)) {
+        return mongoNumericContainsCondition(rule.fieldName, textValue, true);
+      }
       return { [rule.fieldName]: { $not: { $regex: escapeRegexLiteral(textValue), $options: "i" } } };
+    case "begins-with":
+    case "ends-with": {
+      if (!mongoDocumentFilterKind(options)) return null;
+      const pattern = `${rule.mode === "begins-with" ? "^" : ""}${escapeRegexLiteral(textValue)}${rule.mode === "ends-with" ? "$" : ""}`;
+      if (mongoFilterValueIsNumeric(rule.valueType, options.sampleValue)) return mongoNumericRegexCondition(rule.fieldName, pattern);
+      return { [rule.fieldName]: { $regex: pattern, $options: "i" } };
+    }
     case "greater-than":
       return { [rule.fieldName]: { $gt: value } };
     case "greater-than-or-equal":
@@ -461,6 +557,27 @@ export function buildDocumentFilterCondition(rule: DocumentFilterRule, options: 
       return { [rule.fieldName]: { $lt: value } };
     case "less-than-or-equal":
       return { [rule.fieldName]: { $lte: value } };
+    case "in":
+    case "not-in": {
+      if (!mongoDocumentFilterKind(options)) return null;
+      const values = parseDocumentFilterValueList(rule.rawValue, { ...options, valueType: rule.valueType });
+      if (values.length === 0) return null;
+      return { [rule.fieldName]: rule.mode === "in" ? { $in: values } : { $nin: values } };
+    }
+    case "between": {
+      if (!mongoDocumentFilterKind(options)) return null;
+      const start = parseDocumentFilterValue(rule.rawValue, { ...options, valueType: rule.valueType });
+      const end = parseDocumentFilterValue(rule.rawEndValue ?? "", { ...options, valueType: rule.valueType });
+      return { [rule.fieldName]: { $gte: start, $lte: end } };
+    }
+    case "not-between": {
+      if (!mongoDocumentFilterKind(options)) return null;
+      // "Outside range" is the complement of [start, end]; `$not` cannot wrap a
+      // multi-operator predicate, so the two open-ended bounds are OR-ed.
+      const start = parseDocumentFilterValue(rule.rawValue, { ...options, valueType: rule.valueType });
+      const end = parseDocumentFilterValue(rule.rawEndValue ?? "", { ...options, valueType: rule.valueType });
+      return { $or: [{ [rule.fieldName]: { $lt: start } }, { [rule.fieldName]: { $gt: end } }] };
+    }
     case "is-null":
       return { [rule.fieldName]: null };
     case "is-not-null":
@@ -470,6 +587,72 @@ export function buildDocumentFilterCondition(rule: DocumentFilterRule, options: 
 
 function escapeRegexLiteral(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mongoDocumentFilterKind(options: DocumentFilterParseOptions): boolean {
+  return options.kind === undefined || options.kind === "mongodb";
+}
+
+/** Splits a comma/newline separated filter value list, keeping quoted values intact. */
+function parseDocumentFilterValueList(raw: string, options: DocumentFilterParseOptions): unknown[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index] ?? "";
+    const next = raw[index + 1];
+    if (quote) {
+      current += char;
+      if (char === quote) {
+        if (next === quote) {
+          current += next;
+          index += 1;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if ((char === "'" || char === '"') && current.trim().length === 0) {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "," || char === "\n" || char === "\r") {
+      tokens.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  tokens.push(current);
+  return tokens
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0)
+    .map((token) => parseDocumentFilterValue(unquoteSingleQuotedListToken(token), options));
+}
+
+/** Mongo shell style single-quoted list values are unquoted; double quotes stay for the JSON parser. */
+function unquoteSingleQuotedListToken(token: string): string {
+  if (token.length >= 2 && token.startsWith("'") && token.endsWith("'")) return token.slice(1, -1).replace(/''/g, "'");
+  return token;
+}
+
+function mongoFilterValueIsNumeric(valueType?: DocumentFilterValueType, sampleValue?: unknown): boolean {
+  if (valueType === "number" || valueType === "int32" || valueType === "int64" || valueType === "decimal128") return true;
+  if (typeof sampleValue === "number") return true;
+  if (!isPlainRecord(sampleValue)) return false;
+  const keys = Object.keys(sampleValue);
+  return keys.length === 1 && ["$numberInt", "$numberLong", "$numberDouble", "$numberDecimal"].includes(keys[0]);
+}
+
+function mongoNumericContainsCondition(fieldName: string, textValue: string, negate = false): Record<string, unknown> {
+  return mongoNumericRegexCondition(fieldName, escapeRegexLiteral(textValue), negate);
+}
+
+function mongoNumericRegexCondition(fieldName: string, regex: string, negate = false): Record<string, unknown> {
+  const regexMatch = { $regexMatch: { input: { $convert: { input: `$${fieldName}`, to: "string", onError: "", onNull: "" } }, regex, options: "i" } };
+  return negate ? { $expr: { $not: [regexMatch] } } : { $expr: regexMatch };
 }
 
 export function combineDocumentFilterConditions(conditions: Record<string, unknown>[], rules: Pick<DocumentFilterRule, "conjunction">[], arrayObjectParents: Array<string | null> = []): Record<string, unknown> | null {
@@ -638,7 +821,9 @@ type DocumentQueryInputNormalizer = (input: string) => string | null;
 
 const documentQueryInputNormalizers: Record<DocumentStoreKind, DocumentQueryInputNormalizer> = {
   mongodb: normalizeJsonArgument,
+  dynamodb: quoteUnquotedObjectKeys,
   elasticsearch: quoteUnquotedObjectKeys,
+  meilisearch: quoteUnquotedObjectKeys,
 };
 
 function normalizeDocumentQueryObjectInput(input: string, kind?: DocumentStoreKind): string {

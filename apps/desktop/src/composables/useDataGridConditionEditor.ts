@@ -45,6 +45,7 @@ export interface UseDataGridConditionEditorOptions {
   suggestionProvider?: DataGridConditionSuggestionProvider;
   suggestionDebounceMs?: number;
   suggestionLimit?: number;
+  suggestionsEnabled?: MaybeRefOrGetter<boolean>;
 }
 
 const WHERE_TOKEN_PATTERN = /([^\s,()><=!&|]+)$/;
@@ -282,7 +283,7 @@ export function useDataGridConditionEditor(options: UseDataGridConditionEditorOp
       const providerValues = values ? [...new Set(values)] : undefined;
       suggestions.value = providerValues ? (providerValues.some((value) => value.toLowerCase() === target.token.toLowerCase()) ? [] : providerValues.slice(0, limit).map((suggestion) => ({ value: suggestion, kind: "column" }))) : defaultSuggestions(target).slice(0, limit);
       replacementRange.value = { from: target.from, to: target.to };
-      highlightedIndex.value = -1;
+      highlightedIndex.value = options.kind === "where" && suggestions.value[0]?.kind === "column" ? 0 : -1;
     } catch (error) {
       if (!controller.signal.aborted && requestId === suggestionRequestId) {
         suggestions.value = [];
@@ -299,6 +300,7 @@ export function useDataGridConditionEditor(options: UseDataGridConditionEditorOp
     suggestions.value = [];
     highlightedIndex.value = -1;
     historyOpen.value = false;
+    if (options.suggestionsEnabled !== undefined && !toValue(options.suggestionsEnabled)) return;
     if (!value.trim()) return;
 
     const target = conditionCompletionTarget(options.kind, value, selectionStart, selectionEnd, toValue(options.identifierQuote));

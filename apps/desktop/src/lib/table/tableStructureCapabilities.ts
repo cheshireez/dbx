@@ -15,6 +15,7 @@ export interface TableStructureCapabilities {
   alterType: boolean;
   alterNullability: boolean;
   alterDefault: boolean;
+  addPrimaryKey: boolean;
   alterPrimaryKey: boolean;
   reorderColumn: boolean;
   comment: boolean;
@@ -25,6 +26,7 @@ export interface TableStructureCapabilities {
   indexInclude: boolean;
   indexFilter: boolean;
   indexComment: boolean;
+  indexConcurrent: boolean;
   foreignKey: boolean;
 }
 
@@ -39,6 +41,7 @@ const unsupportedCapabilities: TableStructureCapabilities = {
   alterType: false,
   alterNullability: false,
   alterDefault: false,
+  addPrimaryKey: false,
   alterPrimaryKey: false,
   reorderColumn: false,
   comment: false,
@@ -49,6 +52,7 @@ const unsupportedCapabilities: TableStructureCapabilities = {
   indexInclude: false,
   indexFilter: false,
   indexComment: false,
+  indexConcurrent: false,
   foreignKey: false,
 };
 
@@ -56,6 +60,9 @@ function capabilities(overrides: Partial<TableStructureCapabilities>): TableStru
   const resolved = { ...unsupportedCapabilities, ...overrides };
   if (overrides.alterStrategy === undefined && resolved.alterExistingColumn) {
     resolved.alterStrategy = "direct";
+  }
+  if (resolved.alterPrimaryKey) {
+    resolved.addPrimaryKey = true;
   }
   return resolved;
 }
@@ -115,6 +122,7 @@ const postgresCapabilities = capabilities({
 const postgresBefore11Capabilities = capabilities({
   ...postgresCapabilities,
   indexInclude: false,
+  indexConcurrent: true,
 });
 
 const redshiftCapabilities = capabilities({
@@ -126,6 +134,7 @@ const redshiftCapabilities = capabilities({
   indexInclude: false,
   indexFilter: false,
   indexComment: false,
+  addPrimaryKey: false,
   alterPrimaryKey: false,
 });
 
@@ -179,7 +188,7 @@ const sqlserverCapabilities = capabilities({
   indexComment: true,
 });
 
-const oracleCapabilities = capabilities({
+const oracleCompatibleCapabilities = capabilities({
   dialect: "oracle",
   createTable: true,
   addColumn: true,
@@ -196,15 +205,20 @@ const oracleCapabilities = capabilities({
   indexType: true,
 });
 
+const oracleCapabilities = capabilities({
+  ...oracleCompatibleCapabilities,
+  addPrimaryKey: true,
+});
+
 // Dameng (DM8): ALTER TABLE ... DROP PRIMARY KEY / ADD PRIMARY KEY is official DDL.
-// Keep separate from oracleCapabilities so UI cannot enable PK edit without BE drop SQL.
+// Keep separate from Oracle-compatible engines so UI cannot enable PK edits without verified DDL.
 const damengCapabilities = capabilities({
-  ...oracleCapabilities,
+  ...oracleCompatibleCapabilities,
   alterPrimaryKey: true,
 });
 
 const irisCapabilities = capabilities({
-  ...oracleCapabilities,
+  ...oracleCompatibleCapabilities,
   // IRIS exposes %DESCRIPTION at definition time but cannot alter persisted descriptions.
   comment: false,
 });
@@ -318,7 +332,7 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   oscar: damengCapabilities,
   databend: mysqlCapabilities,
   gbase: gbaseCapabilities,
-  postgres: postgresCapabilities,
+  postgres: capabilities({ ...postgresCapabilities, indexConcurrent: true }),
   gaussdb: postgresCapabilities,
   kwdb: postgresCapabilities,
   opengauss: postgresCapabilities,
@@ -337,10 +351,10 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   sqlserver: sqlserverCapabilities,
   oracle: oracleCapabilities,
   dameng: damengCapabilities,
-  "oceanbase-oracle": oracleCapabilities,
+  "oceanbase-oracle": oracleCompatibleCapabilities,
   iris: irisCapabilities,
-  yashandb: oracleCapabilities,
-  xugu: oracleCapabilities,
+  yashandb: oracleCompatibleCapabilities,
+  xugu: oracleCompatibleCapabilities,
   h2: h2Capabilities,
   access: accessCapabilities,
   clickhouse: clickhouseCapabilities,

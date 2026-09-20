@@ -19,7 +19,33 @@ export interface FrameRect {
   height: number;
 }
 
-type Viewish = Pick<EditorView, "coordsAtPos" | "state" | "scrollDOM" | "scaleX" | "lineBlockAt" | "defaultCharacterWidth">;
+type Viewish = Pick<EditorView, "coordsAtPos" | "scaleX" | "defaultCharacterWidth" | "defaultLineHeight"> & {
+  state: Pick<EditorView["state"], "doc">;
+  lineBlockAt: (pos: number) => Pick<ReturnType<EditorView["lineBlockAt"]>, "top" | "bottom" | "height">;
+  scrollDOM: Pick<HTMLElement, "scrollLeft" | "scrollTop" | "getBoundingClientRect">;
+  contentDOM: Pick<HTMLElement, "getBoundingClientRect">;
+};
+
+type PositionRect = NonNullable<ReturnType<EditorView["coordsAtPos"]>>;
+
+function spansVisualRows(start: PositionRect, end: PositionRect): boolean {
+  const startMid = (start.top + start.bottom) / 2;
+  const endMid = (end.top + end.bottom) / 2;
+  const startHeight = start.bottom - start.top;
+  const endHeight = end.bottom - end.top;
+  return Math.abs(startMid - endMid) > Math.max(2, Math.min(startHeight, endHeight) / 2);
+}
+
+/**
+ * Statements spanning more logical lines than this render no frame. The
+ * horizontal-bounds loop below does a constant number of geometry probes
+ * per logical line, so its cost is O(logical lines) — fine for ordinary
+ * statements, but a multi-thousand-line PL/SQL package body (Oracle, and
+ * other dialects with BEGIN/END routine bodies) is parsed as a single
+ * statement spanning the whole file, turning routine scrolling into
+ * thousands of `coordsAtPos` calls per frame. See dbx#7226.
+ */
+export const MAX_FRAME_STATEMENT_LINES = 500;
 
 /**
  * Measure the pixel rectangle of one statement rendered in `view`.
@@ -32,10 +58,12 @@ type Viewish = Pick<EditorView, "coordsAtPos" | "state" | "scrollDOM" | "scaleX"
  * always reliable regardless of viewport position).
  *
  * **Horizontal bounds**: use `coordsAtPos` for visible lines (exact on tabs,
- * CJK/fullwidth glyphs and non-monospaced fonts). For off-viewport lines,
- * estimate using an offset calibrated from the first visible line's
- * `coordsAtPos` result, so estimates account for editor padding, gutter
- * width, and zoom.
+ * CJK/fullwidth glyphs and non-monospaced fonts). A soft-wrapped logical line
+ * includes the content viewport bounds because intermediate visual rows reach
+ * the wrap edge even when the final row is short. For off-viewport lines,
+ * estimate using an offset calibrated from the first visible line start.
+ * This keeps measurement O(logical lines) with a constant number of geometry
+ * probes per line, independent of statement length and visual-row count.
  *
  * All four sides get a symmetric `FRAME_INSET_PX` breathing room.
  */
@@ -45,6 +73,7 @@ export function currentStatementFrameRect(view: Viewish, from: number, to: numbe
 
   const startLine = doc.lineAt(from);
   const endLine = doc.lineAt(to);
+  if (endLine.number - startLine.number > MAX_FRAME_STATEMENT_LINES) return null;
   const base = view.scrollDOM.getBoundingClientRect();
 
   // Vertical bounds: convert screen coords to content-layer coords.
@@ -55,7 +84,7 @@ export function currentStatementFrameRect(view: Viewish, from: number, to: numbe
   const startCoords = view.coordsAtPos(from, 1);
   const top = startCoords ? startCoords.top - base.top + view.scrollDOM.scrollTop : view.lineBlockAt(from).top;
 
-  const endCoords = view.coordsAtPos(Math.max(from, to - 1), -1);
+  const endCoords = view.coordsAtPos(to, -1);
   const bottom = endCoords ? endCoords.bottom - base.top + view.scrollDOM.scrollTop : view.lineBlockAt(to).bottom;
 
   if (bottom - top <= 0) return null;
@@ -66,6 +95,7 @@ export function currentStatementFrameRect(view: Viewish, from: number, to: numbe
   let right = -Infinity;
   const charWidth = view.defaultCharacterWidth;
   let calibratedOffset: number | null = null;
+  let contentBounds: DOMRect | null = null;
 
   for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
     const line = doc.line(lineNumber);
@@ -77,20 +107,27 @@ export function currentStatementFrameRect(view: Viewish, from: number, to: numbe
     if (lineLeft) {
       left = Math.min(left, lineLeft.left);
       right = Math.max(right, lineRight?.right ?? lineLeft.left);
-      // Calibrate offset from the first visible line
       if (calibratedOffset === null && charWidth > 0) {
-        const indent = line.text.match(/^\s*/)?.[0].length || 0;
-        calibratedOffset = lineLeft.left - indent * charWidth;
+        const lineStart = anchorFrom === line.from ? lineLeft : view.coordsAtPos(line.from, 1);
+        calibratedOffset = lineStart?.left ?? lineLeft.left - (anchorFrom - line.from) * charWidth;
       }
     } else if (calibratedOffset !== null && charWidth > 0) {
-      // Estimate: use calibrated offset + (indent + text.length) * charWidth
-      const indent = line.text.match(/^\s*/)?.[0].length || 0;
-      const estimatedRight = calibratedOffset + (indent + line.text.length) * charWidth;
+      const estimatedRight = calibratedOffset + line.length * charWidth;
       right = Math.max(right, estimatedRight);
+    }
+
+    const fullLogicalLine = anchorFrom === line.from && anchorTo === line.to;
+    const wrappedFromCoordinates = !!lineLeft && !!lineRight && spansVisualRows(lineLeft, lineRight);
+    const wrappedFromLineBlock = (!lineLeft || !lineRight) && fullLogicalLine && view.lineBlockAt(anchorFrom).height > view.defaultLineHeight * 1.5;
+    if (wrappedFromCoordinates || wrappedFromLineBlock) {
+      contentBounds ??= view.contentDOM.getBoundingClientRect();
+      left = Math.min(left, contentBounds.left);
+      right = Math.max(right, contentBounds.right);
     }
   }
 
-  // If no lines were measurable (entire statement off-viewport), skip frame
+  // If no endpoints were measurable and no wrapped block supplied viewport
+  // bounds, skip the frame.
   if (!isFinite(left) || !isFinite(right)) return null;
 
   const leftOffset = base.left - view.scrollDOM.scrollLeft * view.scaleX;
@@ -111,21 +148,45 @@ interface CurrentStatementFrameModule {
 /**
  * Draw one continuous green rectangle around the current executable
  * statement. `resolve` decides visibility and returns the statement range;
- * returning null hides the frame.
+ * returning null hides the frame. `options.shouldRefresh` forces a repaint on
+ * updates that change statement boundaries without touching the document
+ * (e.g. a debounced boundary rebuild landing after a typing pause).
  */
-export function currentStatementFrameLayer(viewModule: CurrentStatementFrameModule, resolve: StatementFrameResolver): Extension {
+export function currentStatementFrameLayer(viewModule: CurrentStatementFrameModule, resolve: StatementFrameResolver, options?: { shouldRefresh?: (update: ViewUpdate) => boolean }): Extension {
+  let lastRequest: StatementFrameRequest | null | undefined;
+
+  const sameRequest = (left: StatementFrameRequest | null | undefined, right: StatementFrameRequest | null): boolean => left === right || (!!left && !!right && left.from === right.from && left.to === right.to);
+
   return viewModule.layer({
-    above: false,
+    // Keep the outline above line decorations so opaque active-line colors
+    // from editor themes cannot cover the frame border.
+    above: true,
     class: "cm-db-currentStatementFrameLayer",
     markers(view) {
       const request = resolve(view);
+      lastRequest = request;
       if (!request || request.to < request.from) return [];
       const rect = currentStatementFrameRect(view, request.from, request.to);
       if (!rect) return [];
       return [new viewModule.RectangleMarker("cm-db-currentStatementFrame", rect.left, rect.top, rect.width, rect.height)];
     },
     update(update) {
-      return update.docChanged || update.selectionSet || update.viewportChanged || update.geometryChanged || update.transactions.some((transaction) => transaction.reconfigured);
+      if (update.docChanged || update.viewportChanged || update.geometryChanged || update.transactions.some((transaction) => transaction.reconfigured)) {
+        lastRequest = undefined;
+        return true;
+      }
+      if (options?.shouldRefresh?.(update)) {
+        lastRequest = undefined;
+        return true;
+      }
+      if (!update.selectionSet) return false;
+
+      // Moving inside one statement does not change its frame. Avoid repeating
+      // the per-line DOM geometry probes for every auto-repeated key event.
+      const request = resolve(update.view);
+      if (sameRequest(lastRequest, request)) return false;
+      lastRequest = undefined;
+      return true;
     },
   });
 }

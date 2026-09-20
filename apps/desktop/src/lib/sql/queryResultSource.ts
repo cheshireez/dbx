@@ -7,14 +7,22 @@ export interface QueryResultSourceLabelOptions {
   databaseType?: DatabaseType;
 }
 
-export function queryResultNameFromPreamble(preamble: string): string | undefined {
-  let name: string | undefined;
-  const withoutBlockComments = preamble.replace(/\/\*[\s\S]*?\*\//g, "");
-  for (const line of withoutBlockComments.split(/\r?\n/)) {
-    const candidate = line.match(/^\s*--\s*name\s*:\s*(.*)$/i)?.[1]?.trim();
-    if (candidate) name = candidate;
-  }
-  return name;
+const HASH_COMMENT_DATABASE_TYPES = new Set<DatabaseType>(["mysql"]);
+
+export function queryResultNameFromPreamble(preamble: string, options: Pick<QueryResultSourceLabelOptions, "databaseType"> = {}): string | undefined {
+  const beforeStatementLine = preamble.replace(/[ \t]*$/, "");
+  const previousLine =
+    beforeStatementLine
+      .replace(/\r?\n$/, "")
+      .split(/\r?\n/)
+      .pop() ?? "";
+  const commentMatch = previousLine.match(/^\s*(--|#)\s*(.*)$/);
+  if (commentMatch?.[1] === "#" && !HASH_COMMENT_DATABASE_TYPES.has(options.databaseType!)) return undefined;
+  const comment = commentMatch?.[2]?.trim();
+  if (!comment) return undefined;
+
+  const nameMatch = comment.match(/^name\s*:\s*(.*)$/i);
+  return nameMatch ? nameMatch[1]?.trim() || undefined : comment;
 }
 
 function firstSourceOfKind(sources: SqlSemanticRowSource[], kind: SqlSemanticRowSource["kind"]): SqlSemanticRowSource | undefined {

@@ -6,7 +6,9 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import * as api from "@/lib/backend/api";
 import type { SqlFileEntry } from "@/lib/backend/api";
-import { getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
+import { getSqlFileFilter, getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
+import { composeGlobalSearchRoots, getGlobalSearchExtensions, globalSearchSettingsVersion } from "@/lib/globalSearch/globalSearchSettings";
+import { containsHan, pinyinFirstLetters } from "@/lib/common/pinyin";
 import i18n from "@/i18n";
 
 const REMOTE_SEARCH_DEBOUNCE_MS = 180;
@@ -19,11 +21,14 @@ const QUICK_OPEN_MAX_RESULTS = 200;
 const INITIAL_SQL_LIBRARY_LIMIT = 20;
 const INITIAL_SQL_FILE_LIMIT = 20;
 
-const REMOTE_SEARCH_UNSUPPORTED_TYPES = new Set<ConnectionConfig["db_type"]>(["redis", "mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "neo4j", "influxdb", "victoriametrics", "etcd", "zookeeper", "mq", "nacos", "consul"]);
+const CONTENT_SEARCH_DEBOUNCE_MS = 200;
+const CONTENT_SEARCH_MAX_RESULTS = 500;
+
+const REMOTE_SEARCH_UNSUPPORTED_TYPES = new Set<ConnectionConfig["db_type"]>(["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "neo4j", "influxdb", "victoriametrics", "etcd", "zookeeper", "mq", "nacos", "consul"]);
 
 export interface QuickOpenItem {
   id: string;
-  type: "connection" | "database" | "schema" | "table" | "view" | "materialized_view" | "procedure" | "function" | "sequence" | "package" | "package-body" | "sql_file" | "sql_library_file";
+  type: "connection" | "database" | "schema" | "table" | "view" | "materialized_view" | "procedure" | "function" | "sequence" | "package" | "package-body" | "sql_file" | "sql_library_file" | "content_match";
   label: string;
   description?: string;
   connectionId: string;
@@ -35,44 +40,204 @@ export interface QuickOpenItem {
   searchText: string; // Lowercase text for searching
   filePath?: string; // For external SQL files
   sqlFileId?: string; // For saved SQL library files
+  fileName?: string; // For content matches: file name shown in the group header
+  line?: number; // For content matches: 1-based line
+  column?: number; // For content matches: 1-based char column
+  matchText?: string; // For content matches: matched slice
+  lineText?: string; // For content matches: full matching line
+  highlightIndices?: [number, number]; // For content matches: [start, end) chars into lineText to highlight
 }
 
-/**
- * Fuzzy match function that checks if query matches text
- * Returns the matched indices for highlighting
- */
-function fuzzyMatch(query: string, text: string): { score: number; indices: number[] } | null {
-  const lowerQuery = query.toLowerCase();
-  const lowerText = text.toLowerCase();
+export type QuickOpenMatchKind = "exact" | "initials" | "prefix" | "word-prefix" | "substring" | "fuzzy";
 
-  if (!lowerQuery) return { score: Infinity, indices: [] };
-  if (lowerText.includes(lowerQuery)) {
-    // Exact substring match gets highest score
-    const startIdx = lowerText.indexOf(lowerQuery);
-    return {
-      score: 1,
-      indices: Array.from({ length: lowerQuery.length }, (_, i) => startIdx + i),
-    };
+export interface QuickOpenMatch {
+  kind: QuickOpenMatchKind;
+  score: number;
+  indices: number[];
+}
+
+interface IdentifierWord {
+  text: string;
+  start: number;
+}
+
+const IDENTIFIER_SEPARATOR_RE = /[_\-. /\\]/;
+
+function identifierWords(text: string): IdentifierWord[] {
+  const words: IdentifierWord[] = [];
+  let start = -1;
+
+  function pushWord(end: number): void {
+    if (start < 0 || end <= start) return;
+    words.push({ text: text.slice(start, end), start });
   }
 
-  // Fuzzy match: find all characters in order
-  let queryIdx = 0;
-  const indices: number[] = [];
-  let score = 0;
-  let lastMatchIdx = -1;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (IDENTIFIER_SEPARATOR_RE.test(char)) {
+      pushWord(index);
+      start = -1;
+      continue;
+    }
+    if (start < 0) {
+      start = index;
+      continue;
+    }
+    const previous = text[index - 1];
+    if (previous >= "a" && previous <= "z" && char >= "A" && char <= "Z") {
+      pushWord(index);
+      start = index;
+    }
+  }
+  pushWord(text.length);
+  return words;
+}
 
-  for (let i = 0; i < lowerText.length && queryIdx < lowerQuery.length; i++) {
-    if (lowerText[i] === lowerQuery[queryIdx]) {
-      indices.push(i);
-      // Score based on proximity (consecutive chars score better)
-      score += lastMatchIdx === i - 1 ? 2 : 1;
-      lastMatchIdx = i;
-      queryIdx++;
+function rangeIndices(start: number, length: number): number[] {
+  return Array.from({ length }, (_, index) => start + index);
+}
+
+const PINYIN_QUERY_RE = /^[a-z0-9]+$/;
+
+/**
+ * Original-text indices of the characters that feed `pinyinFirstLetters(text)`, in order.
+ * Iterates by Unicode code point (like `pinyinFirstLetters`), not UTF-16 code unit, so
+ * supplementary-plane Han characters (surrogate pairs) stay aligned with the letters they produce.
+ */
+function pinyinLetterPositions(text: string): number[] {
+  const positions: number[] = [];
+  let index = 0;
+  for (const char of text) {
+    if (/[\p{Script=Han}a-z0-9]/iu.test(char)) positions.push(index);
+    index += char.length;
+  }
+  return positions;
+}
+
+function matchWordPrefixes(words: IdentifierWord[], query: string): number[] | null {
+  interface PrefixState {
+    queryIndex: number;
+    firstWordIndex: number;
+    lastWordIndex: number;
+    usedWords: number;
+    indices: number[];
+  }
+
+  function stateScore(state: PrefixState): number {
+    if (state.usedWords === 0) return 0;
+    return (state.lastWordIndex - state.firstWordIndex - state.usedWords + 1) * 10 + state.usedWords;
+  }
+
+  function retainBest(states: Map<string, PrefixState>, candidate: PrefixState): void {
+    const key = `${candidate.queryIndex}:${candidate.usedWords}`;
+    const current = states.get(key);
+    if (!current || stateScore(candidate) < stateScore(current)) states.set(key, candidate);
+  }
+
+  let states = new Map<string, PrefixState>([["0:0", { queryIndex: 0, firstWordIndex: -1, lastWordIndex: -1, usedWords: 0, indices: [] }]]);
+  for (let wordIndex = 0; wordIndex < words.length; wordIndex++) {
+    const nextStates = new Map(states);
+    const word = words[wordIndex];
+    const lowerWord = word.text.toLowerCase();
+    for (const state of states.values()) {
+      const maxLength = Math.min(lowerWord.length, query.length - state.queryIndex);
+      for (let length = 1; length <= maxLength; length++) {
+        if (lowerWord.slice(0, length) !== query.slice(state.queryIndex, state.queryIndex + length)) break;
+        retainBest(nextStates, {
+          queryIndex: state.queryIndex + length,
+          firstWordIndex: state.usedWords === 0 ? wordIndex : state.firstWordIndex,
+          lastWordIndex: wordIndex,
+          usedWords: state.usedWords + 1,
+          indices: [...state.indices, ...rangeIndices(word.start, length)],
+        });
+      }
+    }
+    states = nextStates;
+  }
+
+  return [...states.values()].filter((state) => state.queryIndex === query.length && state.usedWords >= 2).sort((a, b) => stateScore(a) - stateScore(b))[0]?.indices ?? null;
+}
+
+/** Match one quick-open field and return label-relative highlight indices. */
+export function matchQuickOpenText(query: string, text: string): QuickOpenMatch | null {
+  const lowerQuery = query.trim().toLowerCase();
+  const lowerText = text.toLowerCase();
+  if (!lowerQuery) return { kind: "exact", score: Infinity, indices: [] };
+
+  if (lowerText === lowerQuery) {
+    return { kind: "exact", score: 1, indices: rangeIndices(0, text.length) };
+  }
+
+  const words = identifierWords(text);
+  const initials = words.map((word) => word.text[0]?.toLowerCase() ?? "").join("");
+  if (words.length >= 2 && initials === lowerQuery) {
+    return { kind: "initials", score: 100 + Math.min(words.length, 99), indices: words.map((word) => word.start) };
+  }
+
+  if (lowerText.startsWith(lowerQuery)) {
+    return { kind: "prefix", score: 200 + Math.min(text.length - lowerQuery.length, 99), indices: rangeIndices(0, lowerQuery.length) };
+  }
+
+  // DataGrip-style pinyin-initials matching for Chinese identifiers, e.g. "总租金" via "zzj".
+  // Only tried after literal matches fail, so a mixed Han+Latin name that literally prefix-matches
+  // (e.g. "abc表" via "abc") keeps its better literal-prefix score instead of being intercepted here.
+  const isPinyinQuery = PINYIN_QUERY_RE.test(lowerQuery) && containsHan(text);
+  if (isPinyinQuery) {
+    const pinyinLetters = pinyinFirstLetters(text);
+    if (pinyinLetters === lowerQuery) {
+      return { kind: "initials", score: 150 + Math.min(text.length, 99), indices: pinyinLetterPositions(text) };
+    }
+    if (pinyinLetters.startsWith(lowerQuery)) {
+      return { kind: "prefix", score: 250 + Math.min(text.length - lowerQuery.length, 99), indices: pinyinLetterPositions(text).slice(0, lowerQuery.length) };
     }
   }
 
-  if (queryIdx === lowerQuery.length) {
-    return { score: score / lowerQuery.length, indices };
+  const wordPrefixIndices = matchWordPrefixes(words, lowerQuery);
+  if (wordPrefixIndices) {
+    return { kind: "word-prefix", score: 300 + Math.min(text.length - lowerQuery.length, 99), indices: wordPrefixIndices };
+  }
+
+  const substringIndex = lowerText.indexOf(lowerQuery);
+  if (substringIndex >= 0) {
+    return { kind: "substring", score: 400 + Math.min(substringIndex, 99), indices: rangeIndices(substringIndex, lowerQuery.length) };
+  }
+
+  if (lowerQuery.length < 2) return null;
+  const indices: number[] = [];
+  let queryIndex = 0;
+  for (let index = 0; index < lowerText.length && queryIndex < lowerQuery.length; index++) {
+    if (lowerText[index] !== lowerQuery[queryIndex]) continue;
+    indices.push(index);
+    queryIndex++;
+  }
+  if (queryIndex === lowerQuery.length) {
+    const span = indices[indices.length - 1] - indices[0] + 1;
+    return { kind: "fuzzy", score: 500 + Math.min(span - lowerQuery.length, 99), indices };
+  }
+
+  // Non-contiguous pinyin-initials fallback, e.g. "zj" matching "总租金" (pinyin initials "zzj"),
+  // matching the ordered-subsequence behavior every other pinyin call site in the app already has.
+  if (isPinyinQuery) {
+    const pinyinLetters = pinyinFirstLetters(text);
+    const positions = pinyinLetterPositions(text);
+    const letterIndices: number[] = [];
+    let letterQueryIndex = 0;
+    let letterCount = 0;
+    // Iterate the initials by code point, keeping letterCount aligned with
+    // positions: unmapped supplementary-plane Han characters occupy two code
+    // units in pinyinLetters but still correspond to exactly one position.
+    for (const letter of pinyinLetters) {
+      if (letterQueryIndex >= lowerQuery.length) break;
+      if (letter === lowerQuery[letterQueryIndex]) {
+        letterIndices.push(positions[letterCount] ?? letterCount);
+        letterQueryIndex += 1;
+      }
+      letterCount += 1;
+    }
+    if (letterQueryIndex === lowerQuery.length) {
+      const pinyinSpan = letterIndices[letterIndices.length - 1] - letterIndices[0] + 1;
+      return { kind: "fuzzy", score: 500 + Math.min(pinyinSpan - lowerQuery.length, 99), indices: letterIndices };
+    }
   }
 
   return null;
@@ -118,6 +283,106 @@ export function useQuickOpen() {
   let sqlFilesLoadingPromise: Promise<void> | null = null;
   let sqlFilesLoadGeneration = 0;
 
+  // --- Content search mode (global search of local SQL/text file contents) ---
+  const contentMode = ref(false);
+  const contentSearching = ref(false);
+  const contentItems = ref<MatchedItem[]>([]);
+  let contentSearchGeneration = 0;
+  let contentSearchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  interface ContentGroup {
+    header: string;
+    filePath: string;
+    matches: MatchedItem[];
+  }
+
+  const contentGroups = computed<ContentGroup[]>(() => {
+    const groups: ContentGroup[] = [];
+    const indexByPath = new Map<string, ContentGroup>();
+    for (const item of contentItems.value) {
+      const path = item.filePath;
+      if (!path) continue;
+      let group = indexByPath.get(path);
+      if (!group) {
+        group = { header: item.fileName || item.label, filePath: path, matches: [] };
+        indexByPath.set(path, group);
+        groups.push(group);
+      }
+      group.matches.push(item);
+    }
+    for (const group of groups) {
+      group.matches.sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+    }
+    return groups;
+  });
+
+  const selectableContentItems = computed<MatchedItem[]>(() => contentGroups.value.flatMap((group) => group.matches));
+
+  function clearContentResults(): void {
+    contentItems.value = [];
+    contentSearching.value = false;
+  }
+
+  async function runContentSearch(query: string, generation: number): Promise<void> {
+    const roots = composeGlobalSearchRoots();
+    if (roots.length === 0) {
+      if (generation === contentSearchGeneration) clearContentResults();
+      return;
+    }
+    contentSearching.value = true;
+    try {
+      const matches = await api.globalSearch({
+        roots,
+        query,
+        extensions: getGlobalSearchExtensions(),
+        limit: CONTENT_SEARCH_MAX_RESULTS,
+      });
+      if (generation !== contentSearchGeneration) return;
+      contentItems.value = matches.map((match) => {
+        const isFileName = match.line === 0;
+        const highlightIndices: [number, number] = [Math.max(0, match.column - 1), Math.max(match.column - 1, match.column - 1 + match.matchText.length)];
+        return {
+          id: `content-${match.path}-${match.line}-${match.column}`,
+          type: "content_match" as const,
+          label: match.fileName,
+          description: match.fileName,
+          connectionId: "",
+          filePath: match.path,
+          fileName: match.fileName,
+          line: match.line,
+          column: match.column,
+          matchText: match.matchText,
+          lineText: isFileName ? match.fileName : match.lineText,
+          highlightIndices,
+          searchText: match.lineText,
+          matchScore: 0,
+          matchIndices: [],
+        };
+      });
+    } catch {
+      if (generation === contentSearchGeneration) contentItems.value = [];
+    } finally {
+      if (generation === contentSearchGeneration) contentSearching.value = false;
+    }
+  }
+
+  function setContentMode(enabled: boolean): void {
+    if (contentMode.value === enabled) return;
+    contentMode.value = enabled;
+    selectedIndex.value = 0;
+    if (enabled) {
+      const query = searchQuery.value.trim();
+      if (query) {
+        const generation = ++contentSearchGeneration;
+        void runContentSearch(query, generation);
+      } else {
+        clearContentResults();
+      }
+    } else {
+      clearContentResults();
+    }
+  }
+
   function getConnectionLabel(connectionId: string): string {
     if (!connectionId) return i18n.global.t("sqlLibrary.unassociated");
     const conn = connectionStore.connections.find((c) => c.id === connectionId);
@@ -162,7 +427,7 @@ export function useQuickOpen() {
         const allEntries: Array<{ entry: SqlFileEntry; rootFolder: string }> = [];
         for (const folderPath of folderPaths) {
           try {
-            const entries = await api.listSqlFilesInFolder(folderPath);
+            const entries = await api.listSqlFilesInFolder(folderPath, getSqlFileFilter());
             const collected: SqlFileEntry[] = [];
             collectSqlFileEntries(entries, collected);
             const rootName = folderNameFromPath(folderPath);
@@ -574,6 +839,7 @@ export function useQuickOpen() {
   watch(
     searchQuery,
     (query) => {
+      selectedIndex.value = 0;
       const generation = ++remoteSearchGeneration;
       cancelStaleRemoteRequestWaiters(generation);
       if (remoteSearchTimer) clearTimeout(remoteSearchTimer);
@@ -616,12 +882,14 @@ export function useQuickOpen() {
       const key = quickOpenItemKey(item);
       if (seen.has(key)) continue;
       seen.add(key);
-      const result = fuzzyMatch(searchQuery.value, item.searchText);
+      const labelMatch = matchQuickOpenText(searchQuery.value, item.label);
+      const metadataMatch = labelMatch ? null : matchQuickOpenText(searchQuery.value, item.searchText);
+      const result = labelMatch ?? metadataMatch;
       if (result) {
         matched.push({
           ...item,
-          matchScore: result.score,
-          matchIndices: result.indices,
+          matchScore: result.score + (labelMatch ? 0 : 1000),
+          matchIndices: labelMatch ? result.indices : [],
         });
       }
     }
@@ -646,8 +914,13 @@ export function useQuickOpen() {
         "package-body": 10,
         sql_library_file: 11,
         sql_file: 12,
+        content_match: 13,
       };
-      return typeOrder[a.type] - typeOrder[b.type];
+      const typeDifference = typeOrder[a.type] - typeOrder[b.type];
+      if (typeDifference !== 0) return typeDifference;
+      const lengthDifference = a.label.length - b.label.length;
+      if (lengthDifference !== 0) return lengthDifference;
+      return a.label.localeCompare(b.label);
     });
 
     return matched.slice(0, QUICK_OPEN_MAX_RESULTS);
@@ -660,8 +933,15 @@ export function useQuickOpen() {
     return filteredItems.value[selectedIndex.value];
   });
 
+  const contentSelectedItem = computed((): MatchedItem | null => {
+    if (!contentMode.value) return null;
+    if (selectedIndex.value < 0 || selectedIndex.value >= selectableContentItems.value.length) return null;
+    return selectableContentItems.value[selectedIndex.value];
+  });
+
   function selectNext(): void {
-    if (selectedIndex.value < filteredItems.value.length - 1) {
+    const length = contentMode.value ? selectableContentItems.value.length : filteredItems.value.length;
+    if (selectedIndex.value < length - 1) {
       selectedIndex.value++;
     }
   }
@@ -681,11 +961,56 @@ export function useQuickOpen() {
     resetSelection();
   }
 
+  // Content search: debounced full-text search fired from the shared query.
+  watch(
+    searchQuery,
+    (query) => {
+      selectedIndex.value = 0;
+      const generation = ++contentSearchGeneration;
+      if (contentSearchTimer) clearTimeout(contentSearchTimer);
+      contentSearchTimer = undefined;
+      if (!contentMode.value) {
+        clearContentResults();
+        return;
+      }
+      const normalizedQuery = query.trim();
+      if (!normalizedQuery) {
+        clearContentResults();
+        return;
+      }
+      contentSearchTimer = setTimeout(() => {
+        contentSearchTimer = undefined;
+        void runContentSearch(normalizedQuery, generation);
+      }, CONTENT_SEARCH_DEBOUNCE_MS);
+    },
+    { flush: "sync" },
+  );
+
+  // Re-run the current content search when search roots or extensions change.
+  watch(globalSearchSettingsVersion, () => {
+    if (contentMode.value && searchQuery.value.trim()) {
+      const generation = ++contentSearchGeneration;
+      void runContentSearch(searchQuery.value.trim(), generation);
+    }
+  });
+
+  watch(sqlFileFoldersVersion, () => {
+    if (contentMode.value && searchQuery.value.trim()) {
+      const generation = ++contentSearchGeneration;
+      void runContentSearch(searchQuery.value.trim(), generation);
+    }
+  });
+
   return {
     searchQuery,
     filteredItems,
     selectedIndex,
     selectedItem,
+    contentMode,
+    contentSearching,
+    contentGroups,
+    contentSelectedItem,
+    setContentMode,
     selectNext,
     selectPrevious,
     resetSelection,

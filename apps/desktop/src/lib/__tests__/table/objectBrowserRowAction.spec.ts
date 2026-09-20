@@ -39,8 +39,30 @@ describe("singleClickRowAction", () => {
     expect(singleClickRowAction(row("PACKAGE_BODY", "pkg_body_test"))).toBe("open-source");
   });
 
-  it.each(["TRIGGER", "TYPE", "TYPE_BODY"] as const)("returns open-source for %s", (type) => {
-    expect(singleClickRowAction(row(type, "programmable_test"))).toBe("open-source");
+  it.each(["TRIGGER", "TYPE", "TYPE_BODY"] as const)("returns open-source for %s on Xugu", (type) => {
+    expect(singleClickRowAction(row(type, "programmable_test"), "xugu")).toBe("open-source");
+  });
+
+  it("only Xugu TYPE rows open source", () => {
+    expect(singleClickRowAction(row("TYPE", "app_status"), "xugu")).toBe("open-source");
+    expect(doubleClickRowAction(row("TYPE", "app_status"), "xugu")).toBe("open-source");
+    expect(singleClickRowAction(row("TYPE_BODY", "app_status"), "xugu")).toBe("open-source");
+    for (const dbType of ["postgres", "opengauss", "gaussdb", "kingbase", "vastbase"] as const) {
+      // Verified PG-family TYPE rows open the read-only details panel.
+      expect(singleClickRowAction(row("TYPE", "app_status"), dbType), String(dbType)).toBe("type-info");
+      expect(doubleClickRowAction(row("TYPE", "app_status"), dbType), String(dbType)).toBe("type-info");
+      // TYPE_BODY has no backend getter on these databases.
+      expect(singleClickRowAction(row("TYPE_BODY", "app_status"), dbType), String(dbType)).toBe("none");
+    }
+    // Unknown connection type keeps the conservative no-action behavior.
+    expect(singleClickRowAction(row("TYPE", "app_status"), undefined)).toBe("none");
+    expect(doubleClickRowAction(row("TYPE", "app_status"), undefined)).toBe("none");
+  });
+
+  it("keeps source actions for non-type rows on PG-family databases", () => {
+    for (const type of ["VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"] as const) {
+      expect(singleClickRowAction(row(type), "postgres"), type).toBe("open-source");
+    }
   });
 
   it("returns none for null/undefined", () => {
@@ -54,8 +76,8 @@ describe("doubleClickRowAction", () => {
     expect(doubleClickRowAction(row("TABLE", "orders"))).toBe("open-table");
   });
 
-  it("returns open-source for VIEW", () => {
-    expect(doubleClickRowAction(row("VIEW", "v_orders"))).toBe("open-source");
+  it.each(["VIEW", "MATERIALIZED_VIEW"] as const)("returns open-table for %s like the sidebar data nodes", (type) => {
+    expect(doubleClickRowAction(row(type, "v_orders"))).toBe("open-table");
   });
 
   it("returns open-source for PROCEDURE", () => {
@@ -101,9 +123,9 @@ describe("resolveRowClickAction", () => {
       expect(result.isDouble).toBe(false);
     });
 
-    it("double click on VIEW returns open-source", () => {
+    it("double click on VIEW returns open-table", () => {
       const result = resolveRowClickAction(viewRow, 2, "single");
-      expect(result.action).toBe("open-source");
+      expect(result.action).toBe("open-table");
       expect(result.isDouble).toBe(true);
     });
   });
@@ -127,9 +149,9 @@ describe("resolveRowClickAction", () => {
       expect(result.isDouble).toBe(true);
     });
 
-    it("double click on VIEW returns open-source", () => {
+    it("double click on VIEW returns open-table", () => {
       const result = resolveRowClickAction(viewRow, 2, "double");
-      expect(result.action).toBe("open-source");
+      expect(result.action).toBe("open-table");
       expect(result.isDouble).toBe(true);
     });
   });
@@ -143,8 +165,12 @@ describe("shouldDeferSingleClick", () => {
     expect(shouldDeferSingleClick(tableRow, "table-info")).toBe(true);
   });
 
-  it("does not defer VIEW open-source (same single/double action)", () => {
-    expect(shouldDeferSingleClick(viewRow, "open-source")).toBe(false);
+  it("defers VIEW open-source (distinct single/double actions)", () => {
+    expect(shouldDeferSingleClick(viewRow, "open-source")).toBe(true);
+  });
+
+  it("does not defer PROCEDURE open-source (same single/double action)", () => {
+    expect(shouldDeferSingleClick(row("PROCEDURE", "sp_run"), "open-source")).toBe(false);
   });
 
   it("does not defer none action", () => {
@@ -153,6 +179,14 @@ describe("shouldDeferSingleClick", () => {
 
   it("does not defer when action is not the single-click action", () => {
     expect(shouldDeferSingleClick(tableRow, "open-table")).toBe(false);
+  });
+
+  it("opens MongoDB collections instead of SQL table-info", () => {
+    expect(singleClickRowAction(tableRow, "mongodb")).toBe("open-table");
+    expect(doubleClickRowAction(tableRow, "mongodb")).toBe("open-table");
+    expect(singleClickRowAction(viewRow, "mongodb")).toBe("open-table");
+    expect(doubleClickRowAction(viewRow, "mongodb")).toBe("open-table");
+    expect(shouldDeferSingleClick(tableRow, "open-table", "mongodb")).toBe(false);
   });
 
   it("handles null/undefined row", () => {

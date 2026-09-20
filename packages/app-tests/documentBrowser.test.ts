@@ -87,13 +87,20 @@ test("document table wires on-demand exact total counting for estimated mongo to
 
 test("document pagination commits page index with fetched rows", () => {
   const source = documentBrowserSource();
-  assert.match(source, /async function load\(options: \{ page\?: number \} = \{\}\)/);
-  assert.match(source, /void load\(\{ page: nextPage \}\)/);
+  assert.match(source, /async function load\(options: \{ page\?: number; append\?: boolean; offset\?: number; limit\?: number \} = \{\}\)/);
+  assert.match(source, /await load\(\{ page: nextPage, append: true, offset: normalizedOffset, limit: normalizedLimit \}\)/);
+  assert.match(source, /await load\(\{ page: nextPage, offset: nextPage \* normalizedLimit, limit: normalizedLimit \}\)/);
   assert.match(source, /if \(options\.page !== undefined\) page\.value = options\.page;/);
 });
 
 test("document query inputs apply on Enter and reserve Shift+Enter for newlines", () => {
   const source = documentBrowserSource();
-  assert.equal(source.match(/@keydown\.enter\.exact\.prevent="applyFilter"/g)?.length, 2);
+  // Both bars route every key through one handler, because Enter has to pick a
+  // pending completion before it may run the query.
+  assert.equal(source.match(/@keydown="onDocumentQueryKeydown\(\$event, '(?:filter|sort)'\)"/g)?.length, 2);
+  assert.match(source, /const plainEnter = !event\.ctrlKey && !event\.metaKey && !event\.altKey && !event\.shiftKey;/);
+  // Plain Enter and Ctrl/Cmd+Enter apply; Shift+Enter and Alt+Enter fall
+  // through to the textarea so they still insert a newline.
+  assert.match(source, /if \(!plainEnter && !\(\(event\.ctrlKey \|\| event\.metaKey\) && !event\.altKey && !event\.shiftKey\)\) return;/);
   assert.doesNotMatch(source, /@keydown\.shift\.enter\.prevent="applyFilter"/);
 });

@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::state::WebState;
+use dbx_core::db::redis_driver::RedisKeysExpiryResult;
 
 /// Check if a connection is read-only and return an error if so.
 async fn ensure_writable(
@@ -78,6 +79,15 @@ pub struct RedisKeyRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RedisRenameKeyRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub new_key_raw: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RedisStreamEntriesRequest {
     pub connection_id: String,
     pub db: u32,
@@ -137,6 +147,17 @@ pub struct RedisHashRequest {
     pub field: String,
     pub value: Option<String>,
     pub ttl: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisHashFieldUpdateRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub old_field: String,
+    pub new_field: String,
+    pub value: String,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +260,24 @@ pub struct RedisSetExpireAtRequest {
     pub connection_id: String,
     pub db: u32,
     pub key_raw: String,
+    pub expire_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisKeysTtlRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raws: Vec<String>,
+    pub ttl: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisKeysExpireAtRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raws: Vec<String>,
     pub expire_at: i64,
 }
 
@@ -484,6 +523,23 @@ pub async fn delete_key(
     Ok(Json(()))
 }
 
+pub async fn rename_key(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisRenameKeyRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "RENAMENX").await?;
+    dbx_core::redis_ops::redis_rename_key_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.new_key_raw,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
 pub async fn hash_set(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashRequest>,
@@ -512,6 +568,25 @@ pub async fn hash_del(
     dbx_core::redis_ops::redis_hash_del_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.field)
         .await
         .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+pub async fn hash_field_update(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisHashFieldUpdateRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "Atomic hash field update").await?;
+    dbx_core::redis_ops::redis_hash_field_update_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.old_field,
+        &req.new_field,
+        &req.value,
+    )
+    .await
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -733,6 +808,40 @@ pub async fn set_expire_at(
     .await
     .map_err(AppError::from)?;
     Ok(Json(()))
+}
+
+pub async fn set_keys_ttl(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisKeysTtlRequest>,
+) -> Result<Json<RedisKeysExpiryResult>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "EXPIRE").await?;
+    let result = dbx_core::redis_ops::redis_set_keys_ttl_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raws,
+        req.ttl,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn set_keys_expire_at(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisKeysExpireAtRequest>,
+) -> Result<Json<RedisKeysExpiryResult>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "EXPIREAT").await?;
+    let result = dbx_core::redis_ops::redis_set_keys_expire_at_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raws,
+        req.expire_at,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
 }
 
 pub async fn delete_keys(

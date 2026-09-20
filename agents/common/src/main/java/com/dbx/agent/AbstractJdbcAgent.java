@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 
 public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     private static final String GAUSSDB_COMPATIBILITY_SQL =
@@ -89,14 +90,26 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         return unchecked(() -> {
             loadDriver(params);
             try (Connection conn = openTestConnection(params)) {
-                boolean valid = conn != null && conn.isValid(5);
+                String validationQuery = connectionValidationQuery();
+                boolean valid = isConnectionValid(conn, 5);
                 Map<String, Object> result = new LinkedHashMap<>();
                 result.put("ok", valid);
+                result.put(
+                    "validation",
+                    validationQuery == null || validationQuery.isBlank() ? "jdbc_connection_isValid" : validationQuery
+                );
                 if (valid) {
                     Map<String, String> databaseInfo = JdbcDatabaseInfo.from(conn);
                     if (!databaseInfo.isEmpty()) {
                         result.put("databaseInfo", databaseInfo);
                     }
+                } else {
+                    result.put(
+                        "error",
+                        "Connection opened, but validation failed (method: "
+                            + (validationQuery == null || validationQuery.isBlank() ? "Connection.isValid" : validationQuery)
+                            + ")"
+                    );
                 }
                 return result;
             }
@@ -183,7 +196,9 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
             options.getMaxRows(),
             options.getFetchSize(),
             options.getTimeoutSecs(),
-            resultValueReader()
+            resultValueReader(),
+            JdbcExecutor.StatementMessageReader.NONE,
+            advancePastUpdateCounts()
         );
     }
 
@@ -198,7 +213,8 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
             this::setSchemaSQL,
             this::resetSchemaSQL,
             options,
-            resultValueReader()
+            resultValueReader(),
+            advancePastUpdateCounts()
         );
     }
 
@@ -239,13 +255,19 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryResult executeTransaction(List<String> statements, String schema) {
-        return TransactionExecutor.executeUpdateStatements(
-            requireConnected(),
-            statements,
-            schema,
-            this::setSchemaSQL,
-            this::resetSchemaSQL
-        );
+        Connection conn = requireConnected();
+        return unchecked(() -> {
+            if (!conn.getAutoCommit()) {
+                throw new IllegalStateException("Cannot start a one-shot transaction while a manual transaction is open");
+            }
+            return TransactionExecutor.executeUpdateStatements(
+                conn,
+                statements,
+                schema,
+                this::setSchemaSQL,
+                this::resetSchemaSQL
+            );
+        });
     }
 
     @Override
@@ -272,6 +294,31 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     public boolean supportsConnectionPooling() {
         return true;
+    }
+
+    final boolean isConnectionValid(Connection connection, int timeoutSecs) {
+        if (connection == null) {
+            return false;
+        }
+        try {
+            if (connection.isClosed()) {
+                return false;
+            }
+            String validationQuery = connectionValidationQuery();
+            if (validationQuery == null || validationQuery.isBlank()) {
+                return connection.isValid(timeoutSecs);
+            }
+            try (Statement statement = connection.createStatement()) {
+                try {
+                    statement.setQueryTimeout(timeoutSecs);
+                } catch (Exception | AbstractMethodError ignored) {
+                }
+                statement.execute(validationQuery);
+                return true;
+            }
+        } catch (Exception | AbstractMethodError ignored) {
+            return false;
+        }
     }
 
     final synchronized boolean usesConnectionPool() {
@@ -336,7 +383,9 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         JdbcExecutor executor,
         boolean succeeded,
         boolean requiresSessionAffinity,
-        boolean evictAfterRequest
+        boolean evictAfterRequest,
+        boolean endsSessionAffinity,
+        boolean preservesSchemaContext
     ) {
         if (poolRegistry == null) {
             return;
@@ -348,7 +397,12 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         }
         if (succeeded && requiresSessionAffinity) {
             sessionAffinity = true;
-            JdbcSchemaSwitcher.forget(connection);
+            if (!preservesSchemaContext) {
+                JdbcSchemaSwitcher.forget(connection);
+            }
+        }
+        if (succeeded && endsSessionAffinity) {
+            sessionAffinity = false;
         }
         if (pooledLease == null) {
             connection = null;
@@ -400,7 +454,57 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         }
         try {
             String quote = connection.getMetaData().getIdentifierQuoteString();
-            return quote == null || quote.trim().isEmpty() ? "" : quote.trim();
+            if (quote == null || quote.trim().isEmpty()) {
+                return "";
+            }
+            return sanitizeInformixFamilyBacktickQuote(params, connection, quote.trim());
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    // GBase 8s and other Informix-family JDBC drivers report "`" from
+    // getIdentifierQuoteString() even though their servers reject backtick-quoted
+    // identifiers with "illegal character in statement" outside MySQL compatibility
+    // mode (SQLMODE=mysql). An empty quote makes clients emit unquoted identifiers,
+    // which both SQL modes accept.
+    private static String sanitizeInformixFamilyBacktickQuote(ConnectParams params, Connection connection, String quote) {
+        if (!"`".equals(quote) || !isInformixFamilyJdbc(params, connection) || isInformixFamilyMysqlCompat(params, connection)) {
+            return quote;
+        }
+        return "";
+    }
+
+    private static boolean isInformixFamilyJdbc(ConnectParams params, Connection connection) {
+        StringBuilder identity = new StringBuilder();
+        appendJdbcIdentity(identity, params.getConnection_string());
+        appendJdbcIdentity(identity, params.getJdbc_driver_class());
+        List<String> driverPaths = params.getJdbc_driver_paths();
+        if (driverPaths != null) {
+            for (String path : driverPaths) {
+                appendJdbcIdentity(identity, path);
+            }
+        }
+        appendJdbcIdentity(identity, connectionUrl(connection));
+        String normalized = identity.toString().toLowerCase(Locale.ROOT);
+        return normalized.contains("jdbc:gbasedbt")
+            || normalized.contains("jdbc:informix")
+            || normalized.contains("com.gbasedbt")
+            || normalized.contains("com.informix");
+    }
+
+    private static boolean isInformixFamilyMysqlCompat(ConnectParams params, Connection connection) {
+        if (params.isMysql_compat_mode()) {
+            return true;
+        }
+        String identity = (params.getConnection_string() + "\n" + connectionUrl(connection)).toLowerCase(Locale.ROOT);
+        return identity.contains("sqlmode=mysql");
+    }
+
+    private static String connectionUrl(Connection connection) {
+        try {
+            String url = connection.getMetaData().getURL();
+            return url == null ? "" : url;
         } catch (Exception ignored) {
             return "";
         }
@@ -457,7 +561,18 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     protected abstract String buildJdbcUrl(ConnectParams params);
 
     protected Connection openConnection(ConnectParams params) throws Exception {
-        return DriverManager.getConnection(buildJdbcUrl(params), params.getUsername(), params.getPassword());
+        return DriverManager.getConnection(buildJdbcUrl(params), buildConnectionProperties(params));
+    }
+
+    protected Properties buildConnectionProperties(ConnectParams params) {
+        Properties properties = new Properties();
+        if (params.getUsername() != null) {
+            properties.setProperty("user", params.getUsername());
+        }
+        if (params.getPassword() != null) {
+            properties.setProperty("password", params.getPassword());
+        }
+        return properties;
     }
 
     protected Connection openTestConnection(ConnectParams params) throws Exception {
@@ -473,7 +588,19 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     protected void afterDisconnect() throws Exception {
     }
 
+    protected String connectionValidationQuery() {
+        return null;
+    }
+
     protected void beforeQueryExecution(Connection connection, int timeoutSecs) throws Exception {
+    }
+
+    /** Called for each session RPC before its SQL can replace the connection's last trace ID. */
+    protected void beforeAgentMethod(String method, String querySessionId) {
+    }
+
+    protected boolean advancePastUpdateCounts() {
+        return false;
     }
 
     protected void beforePooledConnectionReturn(Connection connection) throws Exception {
@@ -574,6 +701,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         return registry.borrow(
             identity,
             JdbcSessionRole.from(params.getSessionRole()),
+            connectionValidationQuery(),
             () -> openInitializedConnection(params)
         );
     }
@@ -638,6 +766,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
                 appendPoolIdentity(identity, "driverPath" + index, driverPaths.get(index));
             }
         }
+        appendPoolIdentity(identity, "driverProfile", params.getDriver_profile());
         return identity.toString();
     }
 

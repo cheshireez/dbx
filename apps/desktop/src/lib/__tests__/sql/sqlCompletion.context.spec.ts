@@ -1,8 +1,54 @@
 import { describe, expect, it } from "vitest";
-import { buildSelectStarExpansion, buildSqlCompletionItems, getSqlCompletionContext, selectStarResultColumnsMatch, shouldAutoOpenSqlCompletion } from "@/lib/sql/sqlCompletion";
+import {
+  buildPostgresSequenceLiteralCompletionItems,
+  buildSelectStarExpansion,
+  buildSqlCompletionItems,
+  buildSqlCompletionItemsFromContext,
+  getPostgresSequenceLiteralCompletionContext,
+  getSqlCompletionContext,
+  prepareSqlCompletionReplacement,
+  selectStarResultColumnsMatch,
+  shouldAutoOpenSqlCompletion,
+} from "@/lib/sql/sqlCompletion";
 import { sqlCompletionContextFromSemantic } from "@/lib/sql/semantic/completion";
 import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { originForSqlCompletionProvider, originForTypedSqlCompletionStart, shouldAllowSqlCompletionTrigger, type SqlCompletionTriggerFacts } from "@/lib/sql/sqlCompletionTriggerPolicy";
+
+describe("SQL completion replacement", () => {
+  const columnItem = { label: "price", type: "column" as const, apply: "price", boost: 0 };
+
+  it("marks a standalone SELECT wildcard for replacement", () => {
+    const sql = "SELECT * FROM users";
+    const cursor = sql.indexOf("*");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(prepareSqlCompletionReplacement(sql, cursor, context, [columnItem]).items[0]).toMatchObject({ replaceSelectWildcard: true });
+  });
+
+  it("does not mark the multiplication operator before an untyped right operand", () => {
+    const sql = "SELECT *qty FROM users";
+    const cursor = sql.indexOf("*");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(prepareSqlCompletionReplacement(sql, cursor, context, [columnItem]).items[0]).not.toHaveProperty("replaceSelectWildcard");
+  });
+
+  it("does not mark an expression operator after another projection operand", () => {
+    const sql = "SELECT amount + * FROM users";
+    const cursor = sql.indexOf("*");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(prepareSqlCompletionReplacement(sql, cursor, context, [columnItem]).items[0]).not.toHaveProperty("replaceSelectWildcard");
+  });
+
+  it("marks a standalone wildcard after a SELECT modifier", () => {
+    const sql = "SELECT DISTINCT * FROM users";
+    const cursor = sql.indexOf("*");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(prepareSqlCompletionReplacement(sql, cursor, context, [columnItem]).items[0]).toMatchObject({ replaceSelectWildcard: true });
+  });
+});
 
 describe("sqlCompletion keyword snippets", () => {
   it("auto-opens and suggests SELECT when typing sel", () => {
@@ -14,6 +60,189 @@ describe("sqlCompletion keyword snippets", () => {
 
     expect(shouldAutoOpenSqlCompletion(sql, sql.length)).toBe(true);
     expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "select *", type: "snippet" }), expect.objectContaining({ label: "SELECT", type: "keyword" })]));
+  });
+
+  it("offers DuckDB-specific query and statement keywords", () => {
+    const expectedKeywords = ["QUALIFY", "SUMMARIZE", "PIVOT", "UNPIVOT", "ASOF", "POSITIONAL", "FROM"];
+
+    for (const keyword of expectedKeywords) {
+      const prefix = keyword.slice(0, 4);
+      const sql = keyword === "FROM" || keyword === "SUMMARIZE" ? prefix : `SELECT * FROM items ${prefix}`;
+      const items = buildSqlCompletionItems(sql, sql.length, {
+        tables: [],
+        columnsByTable: new Map(),
+        databaseType: "duckdb",
+      });
+
+      expect(items, keyword).toEqual(expect.arrayContaining([expect.objectContaining({ label: keyword, type: "keyword" })]));
+    }
+  });
+
+  it("does not expose DuckDB-only keywords to other databases", () => {
+    const sql = "SELECT * FROM items qua";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "postgres",
+    });
+
+    expect(items.some((item) => item.label === "QUALIFY")).toBe(false);
+  });
+});
+
+describe("SQL Server datepart completion", () => {
+  it.each(["DATEADD", "DATEDIFF", "DATEPART", "DATENAME"])("suggests datepart values for the first %s argument", (functionName) => {
+    const sql = `SELECT ${functionName}(d`;
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "sqlserver",
+      dialect: "sqlserver",
+      keywordCase: "lower",
+    });
+
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "day", type: "keyword" }), expect.objectContaining({ label: "dayofyear", type: "keyword" })]));
+    expect(items.some((item) => item.label === "deadlock_priority")).toBe(false);
+  });
+
+  it("auto-opens the datepart list immediately after the opening parenthesis", () => {
+    const sql = "SELECT DATEADD(";
+
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, { databaseType: "sqlserver", dialect: "sqlserver" })).toBe(true);
+  });
+
+  it("stops offering datepart values after the first argument", () => {
+    const sql = "SELECT DATEADD(day, d";
+
+    expect(getSqlCompletionContext(sql, sql.length, { databaseType: "sqlserver", dialect: "sqlserver" }).preferredValueKeywords).toBeUndefined();
+  });
+
+  it("does not apply SQL Server datepart values to other dialects", () => {
+    const sql = "SELECT DATEADD(d";
+
+    expect(getSqlCompletionContext(sql, sql.length, { databaseType: "mysql", dialect: "mysql" }).preferredValueKeywords).toBeUndefined();
+  });
+});
+
+describe("MySQL DESCRIBE table completion", () => {
+  it.each(["DESC", "DESCRIBE"])("treats %s as a table-name context", (keyword) => {
+    const sql = `${keyword} ord`;
+    const options = { databaseType: "mysql", dialect: "mysql" } as const;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length, options), getSqlCompletionContext(sql, sql.length, options));
+    expect(context.suggestTables).toBe(true);
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, options)).toBe(true);
+    expect(
+      buildSqlCompletionItemsFromContext(context, {
+        tables: [{ name: "orders" }],
+        columnsByTable: new Map(),
+        ...options,
+      }),
+    ).toEqual(expect.arrayContaining([expect.objectContaining({ label: "orders", type: "table" })]));
+  });
+
+  it("does not treat PostgreSQL ORDER BY DESC as a table-name context", () => {
+    const sql = "SELECT * FROM users ORDER BY name DESC ord";
+    const options = { databaseType: "postgres", dialect: "postgres" } as const;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length, options), getSqlCompletionContext(sql, sql.length, options));
+
+    expect(context.suggestTables).toBe(false);
+    expect(
+      buildSqlCompletionItemsFromContext(context, {
+        tables: [{ name: "orders" }],
+        columnsByTable: new Map(),
+        ...options,
+      }).some((item) => item.type === "table"),
+    ).toBe(false);
+  });
+});
+
+describe("PostgreSQL sequence literal completion", () => {
+  it.each(["nextval", "currval", "setval"])("recognizes the first %s regclass literal", (functionName) => {
+    const sql = `SELECT ${functionName}('public.order_`;
+    const context = getPostgresSequenceLiteralCompletionContext(sql, sql.length, "postgres");
+
+    expect(context).toEqual(
+      expect.objectContaining({
+        prefix: "order_",
+        schema: "public",
+        schemaQuoted: false,
+        nameQuoted: false,
+      }),
+    );
+    expect(context?.from).toBe(sql.lastIndexOf("order_"));
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, { databaseType: "postgres" })).toBe(true);
+  });
+
+  it("preserves quoted mixed-case schema and sequence identifiers", () => {
+    const sql = `SELECT pg_catalog.nextval('"App"."Order`;
+    const context = getPostgresSequenceLiteralCompletionContext(sql, sql.length, "postgres");
+
+    expect(context).toEqual(
+      expect.objectContaining({
+        prefix: "Order",
+        schema: "App",
+        schemaQuoted: true,
+        nameQuoted: true,
+        nameQuoteClosed: false,
+      }),
+    );
+    expect(
+      buildPostgresSequenceLiteralCompletionItems(context!, [
+        { name: "OrderSequence", schema: "App", type: "sequence" },
+        { name: "order_sequence", schema: "App", type: "sequence" },
+      ]),
+    ).toEqual([
+      expect.objectContaining({
+        label: "OrderSequence",
+        apply: 'OrderSequence"',
+        replaceClosingQuote: '"',
+        detail: "sequence in App",
+      }),
+    ]);
+  });
+
+  it("keeps doubled apostrophes inside the sequence identifier and escapes insertion", () => {
+    const sql = `SELECT nextval('"customer''s_`;
+    const context = getPostgresSequenceLiteralCompletionContext(sql, sql.length, "postgres");
+
+    expect(context).toEqual(expect.objectContaining({ prefix: "customer's_", nameQuoted: true }));
+    expect(buildPostgresSequenceLiteralCompletionItems(context!, [{ name: "customer's_seq", schema: "public", type: "sequence" }])).toEqual([expect.objectContaining({ label: "customer's_seq", apply: `customer''s_seq"` })]);
+  });
+
+  it("quotes an accepted mixed-case identifier in an unquoted literal", () => {
+    const sql = "SELECT nextval('mix";
+    const context = getPostgresSequenceLiteralCompletionContext(sql, sql.length, "postgres");
+
+    expect(buildPostgresSequenceLiteralCompletionItems(context!, [{ name: "MixedSequence", schema: "public", type: "sequence" }])).toEqual([expect.objectContaining({ label: "MixedSequence", filterText: "MixedSequence", apply: '"MixedSequence"' })]);
+  });
+
+  it("does not expose sequence metadata through ordinary SQL object completion", () => {
+    const sql = "SELECT order_";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [],
+      objects: [{ name: "order_seq", schema: "public", type: "sequence" }],
+      columnsByTable: new Map(),
+      databaseType: "postgres",
+      dialect: "postgres",
+    });
+
+    expect(items.some((item) => item.label === "order_seq")).toBe(false);
+  });
+
+  it.each([
+    ["SELECT 'order_", "postgres"],
+    ["SELECT nextval('order_", "mysql"],
+    ["SELECT nextval('order_') || 'suffix", "postgres"],
+    ["SELECT setval(42, 'order_", "postgres"],
+    ["SELECT app.nextval('order_", "postgres"],
+    ["SELECT app. nextval('order_", "postgres"],
+    ["SELECT app.pg_catalog.nextval('order_", "postgres"],
+    [`SELECT "PG_CATALOG".nextval('order_`, "postgres"],
+    ["SELECT $$ nextval('order_", "postgres"],
+    ["SELECT $body$ nextval('order_", "postgres"],
+  ] as const)("does not enable sequence completion for unrelated literals: %s (%s)", (sql, databaseType) => {
+    expect(getPostgresSequenceLiteralCompletionContext(sql, sql.length, databaseType)).toBeNull();
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, { databaseType })).toBe(false);
   });
 });
 
@@ -142,7 +371,76 @@ describe("SELECT star expansion", () => {
         qualifierSql,
         databaseType,
       ),
-    ).toBe(`id, ${qualifierSql}.${quotedColumn}`);
+    ).toBe(`${databaseType === "oracle" ? '"id"' : "id"}, ${qualifierSql}.${quotedColumn}`);
+  });
+
+  it("does not quote all-uppercase Oracle columns when expanding alias.* (regression #9163)", () => {
+    const sql = "SELECT t.* FROM device_table AS t";
+    const cursor = sql.indexOf("*") + 1;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, { databaseType: "oracle", dialect: "mysql" }), getSqlCompletionContext(sql, cursor, { databaseType: "oracle", dialect: "mysql" }));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "device_table",
+            [
+              { name: "AGENT_NAME", table: "device_table" },
+              { name: "PROTOCOL", table: "device_table" },
+              { name: "created at", table: "device_table" },
+            ],
+          ],
+        ]),
+        "mysql",
+        "t",
+        "oracle",
+      ),
+    ).toBe('AGENT_NAME, t.PROTOCOL, t."created at"');
+  });
+
+  it("does not quote all-uppercase Oracle columns for an unqualified star when only databaseType is set", () => {
+    const sql = "SELECT * FROM device_table";
+    const cursor = "SELECT *".length;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, { databaseType: "oracle" }), getSqlCompletionContext(sql, cursor, { databaseType: "oracle" }));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "device_table",
+            [
+              { name: "AGENT_NAME", table: "device_table" },
+              { name: "SPARE1", table: "device_table" },
+            ],
+          ],
+        ]),
+        undefined,
+        undefined,
+        "oracle",
+      ),
+    ).toBe("AGENT_NAME, SPARE1");
+  });
+
+  it.each([
+    ["oracle", "mysql"],
+    ["oracle", undefined],
+    [undefined, "oracle"],
+  ] as const)("preserves required Oracle column quotes with databaseType %s and dialect %s", (databaseType, dialect) => {
+    const columnsByTable = new Map([["orders", ["OrderId", "order_id", "AGENT_NAME", "SELECT", "created at", "ACCOUNT$SYS"].map((name) => ({ name, table: "orders" }))]]);
+    const contextOptions = { databaseType, dialect: "mysql" as const };
+
+    for (const [sql, expected] of [
+      ["SELECT o.* FROM orders o", '"OrderId", o."order_id", o.AGENT_NAME, o."SELECT", o."created at", o.ACCOUNT$SYS'],
+      ["SELECT * FROM orders", '"OrderId", "order_id", AGENT_NAME, "SELECT", "created at", ACCOUNT$SYS'],
+    ]) {
+      const cursor = sql.indexOf("*") + 1;
+      const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, contextOptions), getSqlCompletionContext(sql, cursor, contextOptions));
+
+      expect(buildSelectStarExpansion(context, columnsByTable, dialect, context.qualifier, databaseType)).toBe(expected);
+      expect(buildSelectStarExpansion(context, new Map(), dialect, context.qualifier, databaseType)).toBeNull();
+    }
   });
 
   it("expands an unqualified star from result columns when the table has an alias", () => {
@@ -376,7 +674,7 @@ describe("sqlCompletion table aliases", () => {
     });
 
     const table = items.find((item) => item.label === "materials_order_item" && item.type === "table");
-    expect(table?.apply).toBe("materials_order_item AS moi");
+    expect(table?.apply).toBe("materials_order_item moi");
   });
 
   it("uses every word initial for longer multi-word names", () => {
@@ -388,7 +686,7 @@ describe("sqlCompletion table aliases", () => {
     });
 
     const table = items.find((item) => item.label === "super_long_customer_order_history_archive_snapshot_daily_replica" && item.type === "table");
-    expect(table?.apply).toBe("super_long_customer_order_history_archive_snapshot_daily_replica AS slcohasdr");
+    expect(table?.apply).toBe("super_long_customer_order_history_archive_snapshot_daily_replica slcohasdr");
   });
 
   it("applies generated aliases to table completions when enabled", () => {
@@ -400,7 +698,7 @@ describe("sqlCompletion table aliases", () => {
     });
 
     const table = items.find((item) => item.label === "order_items" && item.type === "table");
-    expect(table?.apply).toBe("order_items AS oi");
+    expect(table?.apply).toBe("order_items oi");
   });
 
   it("omits AS from Oracle table alias completions", () => {
@@ -413,7 +711,32 @@ describe("sqlCompletion table aliases", () => {
     });
 
     const table = items.find((item) => item.label === "order_items" && item.type === "table");
-    expect(table?.apply).toBe("order_items oi");
+    // The lowercase table name must stay quoted (#9526); the generated alias is a new identifier and stays bare.
+    expect(table?.apply).toBe('"order_items" oi');
+  });
+
+  it("never adds generated aliases to Cassandra table completions", () => {
+    const sql = "SELECT * FROM ord";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "order_items", type: "table" }],
+      columnsByTable: new Map(),
+      databaseType: "cassandra",
+      autoAliasTables: true,
+    });
+
+    const table = items.find((item) => item.label === "order_items" && item.type === "table");
+    expect(table?.apply).toBe("order_items");
+  });
+
+  it("does not suggest table aliases for Cassandra", () => {
+    const sql = "SELECT * FROM order_items ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "order_items", type: "table" }],
+      columnsByTable: new Map(),
+      databaseType: "cassandra",
+    });
+
+    expect(items.some((item) => item.type === "snippet" && item.detail === "alias for order_items")).toBe(false);
   });
 
   it("keeps plain table completions when generated aliases are disabled", () => {
@@ -449,7 +772,7 @@ describe("sqlCompletion table aliases", () => {
     });
 
     const table = items.find((item) => item.label === "order_items" && item.type === "table");
-    expect(table?.apply).toBe("order_items AS oi2");
+    expect(table?.apply).toBe("order_items oi2");
   });
 
   it("applies generated aliases in comma-separated FROM table lists", () => {
@@ -461,7 +784,7 @@ describe("sqlCompletion table aliases", () => {
     });
 
     const table = items.find((item) => item.label === "order_items" && item.type === "table");
-    expect(table?.apply).toBe("order_items AS oi");
+    expect(table?.apply).toBe("order_items oi");
   });
 
   it("does not apply generated aliases to non-query table completions", () => {
@@ -474,6 +797,25 @@ describe("sqlCompletion table aliases", () => {
 
     const table = items.find((item) => item.label === "order_items" && item.type === "table");
     expect(table?.apply).toBe("order_items");
+  });
+
+  it("emits table aliases without AS on every dialect (issue #9525)", () => {
+    // `FROM orders AS o` is rejected by Oracle and the Oracle-compatible profiles, while the
+    // implicit form is accepted everywhere, so generated SQL must use it for all dialects.
+    for (const databaseType of ["postgres", "mysql", "sqlserver", "oracle", "sqlite", "clickhouse"] as const) {
+      const sql = "SELECT * FROM ord";
+      const items = buildSqlCompletionItems(sql, sql.length, {
+        databaseType,
+        tables: [{ name: "order_items", type: "table" }],
+        columnsByTable: new Map(),
+        autoAliasTables: true,
+      });
+
+      const table = items.find((item) => item.label === "order_items" && item.type === "table");
+      // Oracle additionally double-quotes the identifier to preserve its stored case.
+      expect(table?.apply, databaseType).not.toContain(" AS ");
+      expect(table?.apply, databaseType).toMatch(/order_items"? oi$/);
+    }
   });
 });
 
@@ -565,6 +907,207 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.suggestRoutines).toBe(true);
   });
 
+  it("classifies unqualified WHERE field input as column context for unquoted non-ASCII table/schema names", () => {
+    const options = { databaseType: "mysql" } as const;
+
+    const tableOnly = getSqlCompletionContext("SELECT * FROM 用户表 WHERE ", "SELECT * FROM 用户表 WHERE ".length, options);
+    expect(tableOnly.contextKind).toBe("column");
+    expect(tableOnly.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "用户表" })]));
+    expect(tableOnly.suggestColumns).toBe(true);
+
+    const withSchema = getSqlCompletionContext("SELECT * FROM 中文库.用户表 WHERE ", "SELECT * FROM 中文库.用户表 WHERE ".length, options);
+    expect(withSchema.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "中文库", name: "用户表" })]));
+    expect(withSchema.suggestColumns).toBe(true);
+  });
+
+  it("does not treat a non-ASCII 'from' phrase inside a string literal as a referenced table", () => {
+    const sql = "SELECT * FROM real_table WHERE note = 'from 测试表' AND ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "测试表")).toBe(false);
+  });
+
+  it("does not treat a non-ASCII 'from' phrase inside a line comment as a referenced table", () => {
+    const sql = "SELECT *\nFROM real_table\n-- from 测试表\nWHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "测试表")).toBe(false);
+  });
+
+  it("does not treat a 'from' phrase inside a block comment as a referenced table", () => {
+    const sql = "SELECT *\nFROM real_table\n/* from ghost_table */\nWHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "ghost_table")).toBe(false);
+  });
+
+  it("does not let a quote inside a line comment desync literal/comment masking", () => {
+    const sql = "SELECT * FROM real_table -- it's a comment\nWHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+  });
+
+  it("does not let a comment-like sequence inside a string literal swallow real SQL", () => {
+    const sql = "SELECT * FROM t1 WHERE note = '-- not a comment' AND ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "t1" })]));
+  });
+
+  it("does not match unquoted non-ASCII table names for ANSI-strict dialects", () => {
+    const sql = "SELECT * FROM 用户表 WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "clickhouse" });
+    expect(context.referencedTables.some((t) => t.name === "用户表")).toBe(false);
+  });
+
+  it("masks a double-quoted value right after an operator from being read as a table reference (mysql)", () => {
+    const sql = 'SELECT * FROM real_table WHERE note = "from 测试表" AND ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "测试表")).toBe(false);
+  });
+
+  it("treats a double-quoted FROM target as a table reference regardless of MySQL's sql_mode (position-aware masking)", () => {
+    // sql_mode (and therefore whether "..." is ANSI_QUOTES identifier quoting or a string literal)
+    // isn't observable at parse time, so "..." right after FROM/JOIN/UPDATE/etc. is always treated
+    // as a potential table identifier -- matching ANSI_QUOTES-enabled MySQL -- while "..." elsewhere
+    // (function args, CASE branches, operator-adjacent values) is still masked as a value, matching
+    // MySQL's actual default sql_mode. See maskSqlLiteralsAndComments's doc comment.
+    const sql = 'SELECT * FROM "orders" WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "orders" })]));
+  });
+
+  it("keeps resolving a double-quoted FROM target as a table when a comment sits between FROM and it (mysql)", () => {
+    const sql = 'SELECT * FROM /* c */ "orders" WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "orders" })]));
+  });
+
+  it("resolves a double-quoted, dotted schema-qualified table reference (mysql)", () => {
+    const sql = 'SELECT * FROM "db"."orders" WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "db", name: "orders" })]));
+  });
+
+  it("resolves both an unquoted and a double-quoted table across a JOIN, alongside a plain alias (mysql)", () => {
+    const sql = 'SELECT * FROM a JOIN "orders" o ON a.id = o.id WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "a" }), expect.objectContaining({ name: "orders", alias: "o" })]));
+  });
+
+  it("resolves a double-quoted UPDATE target as a referenced table while still masking a double-quoted value in SET (mysql)", () => {
+    const sql = 'UPDATE "orders" SET status = "x" WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "orders" })]));
+    expect(context.referencedTables.some((t) => t.name === "x")).toBe(false);
+  });
+
+  it("does not desync the token stream on a backslash-escaped quote inside a double-quoted value (mysql)", () => {
+    const sql = 'SELECT * FROM real_table WHERE note = "she said \\"hi\\"" ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.preferredKeywords).toEqual(expect.arrayContaining(["AND", "OR"]));
+  });
+
+  it("does not desync the token stream on a backslash-escaped quote inside a double-quoted value (hive)", () => {
+    // Hive isn't in MYSQL_DASH_COMMENT_DIALECTS, so "..." here is (and was, before this fix) always
+    // a quoted_identifier, masked only via the operator-adjacency fallback -- this test isn't about
+    // that masking decision, it's about whether reading the "..." span itself (now always routed
+    // through readQuotedString, see tokens.ts) still finds the true closing quote for a
+    // mysqlBackslashEscape dialect outside MYSQL_DASH_COMMENT_DIALECTS. Before this fix, hive read
+    // "..." with the doubled-quote-only reader regardless of mysqlBackslashEscape, so this span
+    // would desync at the first backslash-escaped quote and corrupt everything parsed after it.
+    const sql = 'SELECT * FROM real_table WHERE note = "she said \\"hi\\"" ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "hive" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.preferredKeywords).toEqual(expect.arrayContaining(["AND", "OR"]));
+  });
+
+  it("masks a double-quoted string used as a function argument from being read as a table reference (mysql)", () => {
+    const sql = 'SELECT CONCAT("from ghost_table", name) FROM real_table WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "ghost_table")).toBe(false);
+  });
+
+  it("masks a double-quoted CASE branch value from being read as a table reference (mysql)", () => {
+    const sql = 'SELECT CASE WHEN enabled THEN "from ghost_case" ELSE "ok" END FROM real_table WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "ghost_case")).toBe(false);
+  });
+
+  it("masks a double-quoted string nested inside a parenthesized expression from being read as a table reference (mysql)", () => {
+    const sql = 'SELECT * FROM real_table WHERE (status = "open" AND note = CONCAT("from ghost_nested", 1)) AND ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "ghost_nested")).toBe(false);
+  });
+
+  it("masks a double-quoted value right after an operator from being read as a table reference (postgres)", () => {
+    const sql = 'SELECT * FROM real_table WHERE note = "from 测试表" AND ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "postgres" });
+    // Postgres treats "..." as a quoted identifier, not a string literal -- but a "..." span
+    // right after "=" is unambiguously a value position regardless of dialect, so this is masked
+    // the same way as mysql above, not left as a (harmless but avoidable) false-positive parse.
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "real_table" })]));
+    expect(context.referencedTables.some((t) => t.name === "测试表")).toBe(false);
+  });
+
+  it("keeps a double-quoted table name intact for dialects where they aren't string literals (postgres)", () => {
+    const sql = 'SELECT * FROM "orders" WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "postgres" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "orders", nameQuoted: true })]));
+  });
+
+  it("does not let a MySQL backslash-escaped quote desync the literal scan", () => {
+    const sql = "SELECT * FROM t1 WHERE note = 'it\\'s a test' UNION SELECT * FROM real_table2 WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "t1" }), expect.objectContaining({ name: "real_table2" })]));
+  });
+
+  it("does not treat MySQL's unspaced '--' double-negation as a comment", () => {
+    const sql = "SELECT * FROM t1 WHERE x = 1--1 FROM real_table3 WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "t1" }), expect.objectContaining({ name: "real_table3" })]));
+  });
+
+  it("still treats a bare '--' as a comment for non-MySQL dialects", () => {
+    const sql = "SELECT * FROM t1 WHERE x = 1--1 FROM real_table3 WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "postgres" });
+    expect(context.referencedTables.some((t) => t.name === "real_table3")).toBe(false);
+  });
+
+  it("does not let a doubled single-quote escape desync the literal scan", () => {
+    const sql = "SELECT * FROM t1 WHERE note = 'it''s a test' AND ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "t1" })]));
+  });
+
+  it("does not let a backslash-escaped quote desync the literal scan for MySQL-family dialects outside the dash-comment allowlist (hive)", () => {
+    const sql = "SELECT * FROM t1 WHERE note = 'it\\'s a test' UNION SELECT * FROM real_table2 WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "hive" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "t1" }), expect.objectContaining({ name: "real_table2" })]));
+  });
+
+  it("defaults to ASCII-only unquoted identifiers when databaseType is not yet known", () => {
+    const sql = "SELECT * FROM 用户表 WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, {});
+    expect(context.referencedTables.some((t) => t.name === "用户表")).toBe(false);
+  });
+
+  it("does not let a special character inside a double-quoted qualified table name desync the scan (postgres)", () => {
+    const sql = 'SELECT * FROM "mydb"."orders" WHERE ';
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "postgres" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "mydb", name: "orders" })]));
+  });
+
+  it("does not let a special character inside a backtick-quoted qualified table name desync the scan (mysql)", () => {
+    const sql = "SELECT * FROM `mydb`.`orders` WHERE ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "mydb", name: "orders" })]));
+  });
+
   it("auto-opens column completion after WHERE whitespace before LIMIT", () => {
     const sql = "SELECT *\nFROM t_0001 AS t0 WHERE \nLIMIT 100;";
     const cursor = "SELECT *\nFROM t_0001 AS t0 WHERE ".length;
@@ -575,6 +1118,24 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "t_0001", alias: "t0" })]));
     expect(context.suggestColumns).toBe(true);
     expect(shouldAutoOpenSqlCompletion(sql, cursor)).toBe(true);
+  });
+
+  it("does not let a trailing comment's stray 'and'/'or' text suppress the AND/OR keyword suggestion", () => {
+    const sql = "SELECT * FROM t WHERE id = 1 # mentions where and or\n";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.preferredKeywords).toEqual(expect.arrayContaining(["AND", "OR"]));
+  });
+
+  it("does not let a special character inside a backtick-quoted table name break WHERE-clause keyword detection", () => {
+    const sql = "SELECT * FROM `my's table` t WHERE t.id = 1 ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+    expect(context.preferredKeywords).toEqual(expect.arrayContaining(["AND", "OR"]));
+  });
+
+  it("does not let a trailing comment's stray 'where' text auto-open column completion with no active clause", () => {
+    const sql = "SELECT * FROM t_0001 t0 -- mentions where\n";
+    const cursor = sql.length;
+    expect(shouldAutoOpenSqlCompletion(sql, cursor, { databaseType: "mysql" })).toBe(false);
   });
 
   it("classifies CALL routine contexts", () => {
@@ -637,6 +1198,57 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "recent_orders", columns: ["id", "total"] }), expect.objectContaining({ name: "recent_orders", alias: "ro" })]));
   });
 
+  it("scopes CTE bodies out of the outer query's referenced tables", () => {
+    const sql = "WITH cte AS (SELECT id, name FROM orders) SELECT id, na FROM cte";
+    const cursor = sql.indexOf(" FROM cte");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(context.referencedTables.map((table) => table.name)).toEqual(["cte"]);
+  });
+
+  it("suggests bare CTE column names instead of forcing a cte. qualifier (issue #7396)", () => {
+    const sql = "WITH cte AS (SELECT id, name FROM orders) SELECT id, na FROM cte";
+    const cursor = sql.indexOf(" FROM cte");
+    const items = buildSqlCompletionItems(sql, cursor, {
+      tables: [],
+      columnsByTable: new Map([
+        [
+          "orders",
+          [
+            { name: "id", table: "orders", dataType: "int" },
+            { name: "name", table: "orders", dataType: "text" },
+          ],
+        ],
+        [
+          "cte",
+          [
+            { name: "id", table: "cte" },
+            { name: "name", table: "cte" },
+          ],
+        ],
+      ]),
+    });
+
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "name", type: "column" })]));
+    expect(items.filter((item) => item.type === "column").map((item) => item.label)).not.toContain("orders.name");
+  });
+
+  it("keeps the CTE body's own tables while completing inside that body", () => {
+    const sql = "WITH cte AS (SELECT id, na FROM orders) SELECT * FROM cte";
+    const cursor = sql.indexOf(" FROM orders");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(context.referencedTables.map((table) => table.name)).toEqual(expect.arrayContaining(["orders", "cte"]));
+  });
+
+  it("keeps the underlying table when a CTE body projects an unresolved star", () => {
+    const sql = "WITH cte AS (SELECT * FROM orders) SELECT na FROM cte";
+    const cursor = sql.indexOf(" FROM cte");
+    const context = getSqlCompletionContext(sql, cursor);
+
+    expect(context.referencedTables.map((table) => table.name)).toEqual(expect.arrayContaining(["orders", "cte"]));
+  });
+
   it("extracts subquery aliases and projected columns", () => {
     const sql = "SELECT * FROM (SELECT id, name AS user_name FROM users) sq WHERE sq.";
     const context = getSqlCompletionContext(sql, sql.length);
@@ -670,6 +1282,52 @@ describe("sqlCompletion scoped context classification", () => {
 });
 
 describe("sqlCompletion scoped metadata ranking", () => {
+  it("shows a table metadata detail in the completion item", () => {
+    const sql = "SELECT * FROM orders";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "orders", type: "table", detail: "→ Customer orders" }],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(items).toEqual([expect.objectContaining({ label: "orders", detail: "→ Customer orders" })]);
+  });
+
+  it("hides the redundant table type while preserving view and schema details", () => {
+    const simpleItems = buildSqlCompletionItems("SELECT * FROM orders", "SELECT * FROM orders".length, {
+      tables: [{ name: "orders", schema: "public", type: "table" }],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(simpleItems.find((item) => item.label === "orders")?.detail).toBeUndefined();
+
+    const viewItems = buildSqlCompletionItems("SELECT * FROM order_view", "SELECT * FROM order_view".length, {
+      tables: [{ name: "order_view", schema: "public", type: "view" }],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(viewItems.find((item) => item.label === "order_view")?.detail).toBe("view");
+
+    const duplicateItems = buildSqlCompletionItems("SELECT * FROM orders", "SELECT * FROM orders".length, {
+      tables: [
+        { name: "orders", schema: "archive", type: "table" },
+        { name: "orders", schema: "sales", type: "table" },
+      ],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(duplicateItems.map((item) => item.detail).sort()).toEqual(["archive.orders", "sales.orders"]);
+
+    const annotatedDuplicateItems = buildSqlCompletionItems("SELECT * FROM orders", "SELECT * FROM orders".length, {
+      tables: [
+        { name: "orders", schema: "archive", type: "table", detail: "→ Archived orders" },
+        { name: "orders", schema: "sales", type: "table", detail: "→ Current orders" },
+      ],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(annotatedDuplicateItems.map((item) => item.detail).sort()).toEqual(["archive.orders  → Archived orders", "sales.orders  → Current orders"]);
+  });
+
   it("ranks exact and prefix table matches ahead of contains/fuzzy matches", () => {
     const sql = "SELECT * FROM Temp";
     const items = buildSqlCompletionItems(sql, sql.length, {
@@ -861,5 +1519,153 @@ describe("originForSqlCompletionProvider", () => {
   it("preserves the active session independently of the current provider flag", () => {
     expect(originForSqlCompletionProvider("typing", true)).toBe("typing");
     expect(originForSqlCompletionProvider("explicit", false)).toBe("explicit");
+  });
+});
+
+describe("select alias visibility", () => {
+  it("prioritizes SELECT aliases inside HAVING for MySQL", () => {
+    const sql = "SELECT COUNT(*) AS cnt, g FROM orders GROUP BY g HAVING cnt > ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.prioritizeSelectAliases).toBe(true);
+    expect(context.selectAliases).toContain("cnt");
+  });
+
+  it("prioritizes SELECT aliases inside ORDER BY even with later clauses", () => {
+    const sql = "SELECT SUM(price) AS total FROM orders ORDER BY total LIMIT 10";
+    const cursor = sql.indexOf("total", sql.indexOf("ORDER BY")) + "total".length;
+    const context = getSqlCompletionContext(sql, cursor, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.prioritizeSelectAliases).toBe(true);
+    expect(context.selectAliases).toContain("total");
+  });
+
+  it("does not prioritize SELECT aliases inside WHERE", () => {
+    const sql = "SELECT id AS uid FROM orders WHERE uid > ";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.prioritizeSelectAliases).toBe(false);
+    expect(context.selectAliases).toEqual([]);
+  });
+
+  it("offers HAVING alias completion items", () => {
+    const sql = "SELECT COUNT(*) AS cnt, g FROM orders GROUP BY g HAVING cn";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      dialect: "mysql",
+      tables: [{ name: "orders", type: "table" }],
+      columnsByTable: new Map([["orders", [{ name: "g" } as never]]]),
+    });
+
+    expect(items.some((item) => item.label === "cnt")).toBe(true);
+  });
+
+  it("does not prioritize HAVING aliases for dialects that reject them", () => {
+    const sql = "SELECT COUNT(*) AS cnt, g FROM orders GROUP BY g HAVING cnt > ";
+    for (const databaseType of ["postgres", "sqlserver", "db2", "oracle"] as const) {
+      const context = getSqlCompletionContext(sql, sql.length, { databaseType });
+
+      expect(context.prioritizeSelectAliases, databaseType).toBe(false);
+      expect(context.selectAliases, databaseType).toEqual([]);
+    }
+  });
+
+  it("keeps HAVING alias priority for SQLite-family and DuckDB dialects", () => {
+    const sql = "SELECT COUNT(*) AS cnt, g FROM orders GROUP BY g HAVING cnt > ";
+    for (const databaseType of ["duckdb", "sqlite", "doris", "bigquery"] as const) {
+      const context = getSqlCompletionContext(sql, sql.length, { databaseType });
+
+      expect(context.prioritizeSelectAliases, databaseType).toBe(true);
+      expect(context.selectAliases, databaseType).toContain("cnt");
+    }
+  });
+
+  it("does not anchor alias visibility on identifiers containing HAVING", () => {
+    const sql = "SELECT id AS uid FROM orders WHERE having_count > 1";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
+
+    expect(context.prioritizeSelectAliases).toBe(false);
+    expect(context.selectAliases).toEqual([]);
+  });
+
+  it("keeps alias visibility in ORDER BY after an identifier containing HAVING", () => {
+    const sql = "SELECT id AS uid FROM orders WHERE having_count > 1 ORDER BY uid";
+    const cursor = sql.length;
+    const context = getSqlCompletionContext(sql, cursor, { databaseType: "mysql" });
+
+    expect(context.prioritizeSelectAliases).toBe(true);
+    expect(context.selectAliases).toContain("uid");
+  });
+
+  it("keeps HAVING alias priority for unlisted dialects (deny-list polarity)", () => {
+    const sql = "SELECT COUNT(*) AS cnt, g FROM orders GROUP BY g HAVING cnt > ";
+    for (const databaseType of ["spark", "databricks", "snowflake", "hive"] as const) {
+      const context = getSqlCompletionContext(sql, sql.length, { databaseType });
+
+      expect(context.prioritizeSelectAliases, databaseType).toBe(true);
+      expect(context.selectAliases, databaseType).toContain("cnt");
+    }
+    // No database type at all keeps the permissive legacy behavior.
+    const untyped = getSqlCompletionContext(sql, sql.length, {});
+    expect(untyped.prioritizeSelectAliases).toBe(true);
+    expect(untyped.selectAliases).toContain("cnt");
+  });
+});
+
+describe("line block statement boundary", () => {
+  it.each(["-- explanatory comment", "/* explanatory comment */", "/*\n explanatory comment\n*/"])("keeps column sources after %s", (comment) => {
+    const sql = `select na\n${comment}\nfrom users`;
+    const cursor = "select na".length;
+    const context = getSqlCompletionContext(sql, cursor, { databaseType: "iris" });
+
+    expect(context.referencedTables.map((table) => table.name)).toEqual(["users"]);
+    const items = buildSqlCompletionItems(sql, cursor, {
+      databaseType: "iris",
+      tables: [{ name: "users", type: "table" }],
+      columnsByTable: new Map([["users", [{ name: "name", table: "users", key: "name" } as never]]]),
+    });
+    expect(items.some((item) => item.label === "name")).toBe(true);
+  });
+
+  it("still ends the block at a real blank line", () => {
+    const sql = "select na\n\nfrom users";
+    const context = getSqlCompletionContext(sql, "select na".length, { databaseType: "iris" });
+    expect(context.referencedTables).toEqual([]);
+  });
+
+  it("stops the active block at a top-level statement line without a semicolon", () => {
+    // t8y2/dbx#9370: two semicolon-free SELECT lines — completion at the first
+    // statement's WHERE must not pull the second statement's table in.
+    const sql = "select * from CT_Nation where\nselect * from CT_CityArea";
+    const cursor = sql.indexOf("where") + "where".length;
+    const context = getSqlCompletionContext(sql, cursor, { databaseType: "iris" });
+
+    expect(context.referencedTables.map((table) => table.name)).toEqual(["CT_Nation"]);
+  });
+
+  it("keeps column completion unqualified once the second statement is excluded", () => {
+    const sql = "select * from CT_Nation where c\nselect * from CT_CityArea";
+    const cursor = sql.indexOf("where") + "where c".length;
+    const items = buildSqlCompletionItems(sql, cursor, {
+      databaseType: "iris",
+      tables: [
+        { name: "CT_Nation", type: "table" },
+        { name: "CT_CityArea", type: "table" },
+      ],
+      columnsByTable: new Map([
+        ["CT_Nation", [{ name: "CTNAT_Code", table: "CT_Nation", key: "k1" } as never]],
+        ["CT_CityArea", [{ name: "CITAREA_Code", table: "CT_CityArea", key: "k2" } as never]],
+      ]),
+    });
+
+    expect(items.some((item) => item.label === "CT_CityArea.CITAREA_Code")).toBe(false);
+    expect(items.some((item) => item.label === "CTNAT_Code")).toBe(true);
+  });
+
+  it("does not end the block at a SELECT line inside parentheses", () => {
+    const sql = "select *\nfrom (\n  select id from users\n) x\nwhere |";
+    const cursor = sql.length;
+    const context = getSqlCompletionContext(sql, cursor, { databaseType: "mysql" });
+
+    expect(context.referencedTables.map((table) => table.name)).toEqual(expect.arrayContaining(["users"]));
   });
 });

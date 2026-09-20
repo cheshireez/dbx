@@ -78,8 +78,9 @@ type connectionConfig struct {
 }
 
 type sessionClient struct {
-	session iotdbSession
-	dialect string
+	session            iotdbSession
+	dialect            string
+	timestampPrecision string
 }
 
 func parseConnectionConfig(params connectParams) (connectionConfig, error) {
@@ -215,10 +216,9 @@ func parseConnectionConfig(params connectParams) (connectionConfig, error) {
 func newSessionClient(config connectionConfig) (*sessionClient, error) {
 	var session client.Session
 	var err error
-	database := config.Database
-	if config.Dialect == client.TableSqlDialect {
-		database = ""
-	}
+	// DBX applies a table database with USE after switching dialects. Do not
+	// include a tree database in openSession: IoTDB 2.x rejects it there, while
+	// DBX still retains it for metadata and path qualification.
 	if len(config.NodeURLs) > 1 {
 		session, err = client.NewClusterSession(&client.ClusterConfig{
 			NodeUrls:        config.NodeURLs,
@@ -227,7 +227,6 @@ func newSessionClient(config connectionConfig) (*sessionClient, error) {
 			FetchSize:       config.FetchSize,
 			TimeZone:        config.TimeZone,
 			ConnectRetryMax: config.ConnectRetryMax,
-			Database:        database,
 			TLSConfig:       config.TLSConfig,
 		})
 		if err == nil {
@@ -242,7 +241,6 @@ func newSessionClient(config connectionConfig) (*sessionClient, error) {
 			FetchSize:       config.FetchSize,
 			TimeZone:        config.TimeZone,
 			ConnectRetryMax: config.ConnectRetryMax,
-			Database:        database,
 			TLSConfig:       config.TLSConfig,
 		})
 		err = session.Open(config.EnableCompression, config.ConnectTimeoutMS)
@@ -266,7 +264,62 @@ func newSessionClient(config connectionConfig) (*sessionClient, error) {
 			}
 		}
 	}
+	precisionTimeout := min(time.Duration(config.ConnectTimeoutMS)*time.Millisecond, 5*time.Second)
+	precisionCtx, precisionCancel := context.WithTimeout(context.Background(), precisionTimeout)
+	connected.timestampPrecision, _ = queryTimestampPrecision(precisionCtx, wrapped)
+	precisionCancel()
 	return connected, nil
+}
+
+func queryTimestampPrecision(ctx context.Context, session iotdbSession) (string, error) {
+	dataset, err := session.ExecuteQueryStatement(ctx, "SHOW VARIABLES", nil)
+	if err != nil {
+		return "", err
+	}
+	defer dataset.Close()
+	columns := dataset.GetColumnNames()
+	variableIndex, valueIndex := int32(1), int32(2)
+	for index, column := range columns {
+		switch strings.ToLower(strings.TrimSpace(column)) {
+		case "variable":
+			variableIndex = int32(index + 1)
+		case "value":
+			valueIndex = int32(index + 1)
+		}
+	}
+	for {
+		hasNext, err := dataset.Next()
+		if err != nil {
+			return "", err
+		}
+		if !hasNext {
+			return "", errors.New("IoTDB SHOW VARIABLES did not return TimestampPrecision")
+		}
+		variable, err := dataset.GetStringByIndex(variableIndex)
+		if err != nil {
+			return "", err
+		}
+		if !strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(variable), "_", ""), "TimestampPrecision") {
+			continue
+		}
+		value, err := dataset.GetStringByIndex(valueIndex)
+		if err != nil {
+			return "", err
+		}
+		if precision := normalizeTimestampPrecision(value); precision != "" {
+			return precision, nil
+		}
+		return "", fmt.Errorf("unsupported IoTDB timestamp precision: %s", value)
+	}
+}
+
+func normalizeTimestampPrecision(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "ms", "us", "ns":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
 }
 
 func (s *sessionClient) Close() error {

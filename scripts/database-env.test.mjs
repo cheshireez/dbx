@@ -172,6 +172,7 @@ test('uses the approved CNB mirror images and matching recipe versions', () => {
     'clickhouse@24.8': { version: '24.8.14.39', image: 'docker.cnb.cool/znb/images/clickhouse-server:24.8.14.39', platforms: ['linux/amd64', 'linux/arm64'] },
     'consul@2.0.2': { version: '2.0.2', image: 'docker.cnb.cool/znb/images/consul:2.0.2', platforms: ['linux/amd64', 'linux/arm64'] },
     'elasticsearch@6.8': { version: '6.8', image: 'docker.cnb.cool/znb/images/elasticsearch:6.8', platforms: ['linux/amd64', 'linux/arm64'] },
+    'etcd@3.5': { version: '3.5.21', image: 'quay.io/coreos/etcd:v3.5.21', platforms: ['linux/amd64', 'linux/arm64'] },
     'etcd@3.7': { version: '3.7.0', image: 'docker.cnb.cool/znb/images/etcd:v3.7.0', platforms: ['linux/amd64', 'linux/arm64'] },
     'kafka@4.3': { version: '4.3.1', image: 'docker.cnb.cool/znb/images/kafka:4.3.1', platforms: ['linux/amd64', 'linux/arm64'] },
     'mariadb@10.11': { version: '10.11.11', image: 'docker.cnb.cool/znb/images/mariadb:10.11.11', platforms: ['linux/amd64', 'linux/arm64'] },
@@ -207,6 +208,16 @@ test('initializes both Nacos versions with the shared administrator credentials'
     assert.doesNotMatch(compose, /tail -f \/dev\/null/);
     assert.deepEqual(validateRecipe(recipe), []);
   }
+});
+
+test('verifies Nacos 2.5 rejects unauthenticated configuration reads', () => {
+  const recipe = discoverRecipes().find((item) => recipeSelector(item) === 'nacos@2.5');
+  const authenticationStep = recipe.smoke.steps.find((step) => step.name === 'reject unauthenticated configuration reads');
+
+  assert.ok(authenticationStep);
+  assert.match(authenticationStep.command.join(' '), /nacos\/v1\/cs\/configs/);
+  assert.match(authenticationStep.command.join(' '), /403/);
+  assert.equal(authenticationStep.expect, 'unauthenticated access rejected');
 });
 
 test('configures r-nacos with its admin account and console port', () => {
@@ -305,7 +316,7 @@ test('generates DBX deep links from effective recipe connection values', () => {
   assert.equal(params.get('database'), 'dbx');
 });
 
-test('prints a DBX deep link only for compatible connection types', () => {
+test('prints DBX deep links for compatible connection types', () => {
   const repoRoot = join(DEFAULT_RECIPES_ROOT, '..', '..');
   const postgres = spawnSync(process.execPath, ['scripts/database-env.mjs', 'info', 'postgresql', '17.4'], {
     cwd: repoRoot,
@@ -326,7 +337,33 @@ test('prints a DBX deep link only for compatible connection types', () => {
     encoding: 'utf8',
   });
   assert.equal(consul.status, 0, consul.stderr);
-  assert.match(consul.stdout, /DBX connection link: unavailable \(DBX has no compatible Consul connection type\)/);
+  assert.match(consul.stdout, /DBX connection link: dbx:\/\/connection\/new\?type=consul&/);
+});
+
+test('generates canonical service deep-link types from recipes', () => {
+  const expected = {
+    'etcd@3.7': 'etcd',
+    'consul@2.0.2': 'consul',
+    'nacos@2.5': 'nacos-v2',
+    'nacos@3.2': 'nacos-v3',
+    'rnacos@0.8': 'r-nacos',
+  };
+  for (const [selector, type] of Object.entries(expected)) {
+    const recipe = discoverRecipes().find((item) => recipeSelector(item) === selector);
+    assert.ok(recipe, `missing ${selector}`);
+    const params = new URL(dbxConnectionDeepLink(recipe)).searchParams;
+    assert.equal(params.get('type'), type);
+    assert.equal(params.get('port'), String(recipe.connection.port));
+  }
+});
+
+test('Nacos recipes declare their version-specific deep-link type', () => {
+  const recipes = discoverRecipes().filter((item) => item.database === 'nacos');
+  assert.deepEqual(recipes.map((recipe) => [recipe.displayVersion, recipe.deepLinkType]), [
+    ['2.5', 'nacos-v2'],
+    ['3.2', 'nacos-v3'],
+  ]);
+  assert.notEqual(recipes.find((recipe) => recipe.displayVersion === '3.2').connection.port, recipes.find((recipe) => recipe.displayVersion === '3.2').connection.consolePort);
 });
 
 test('MongoDB commands pass reserved-character passwords as a distinct argument', () => {

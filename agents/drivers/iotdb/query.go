@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,8 +88,8 @@ func (s *server) queryValues(sql, database string, limit, timeoutSecs int) (quer
 		}
 		defer dataset.Close()
 		columns := append([]string(nil), dataset.GetColumnNames()...)
-		columnTypes := normalizedColumnTypes(dataset.GetColumnTypes(), len(columns))
-		rows, truncated, err := readDataset(ctx, dataset, connected.dialect, columns, columnTypes, limit)
+		columnTypes := normalizedColumnTypes(dataset.GetColumnTypes(), columns, connected.dialect, connected.timestampPrecision)
+		rows, truncated, err := readDataset(ctx, dataset, connected, columns, columnTypes, limit)
 		if err != nil {
 			return queryResult{}, err
 		}
@@ -163,7 +164,7 @@ func (s *server) executeQueryPage(options queryOptions, requestedPageSize int) (
 			dataset:     dataset,
 			client:      connected,
 			columns:     append([]string(nil), dataset.GetColumnNames()...),
-			columnTypes: normalizedColumnTypes(dataset.GetColumnTypes(), len(dataset.GetColumnNames())),
+			columnTypes: normalizedColumnTypes(dataset.GetColumnTypes(), dataset.GetColumnNames(), connected.dialect, connected.timestampPrecision),
 			remaining:   limit,
 		}
 		rows, hasMore, truncated, err := s.readQuerySessionPage(ctx, queryState, pageSize)
@@ -279,7 +280,7 @@ func (s *server) nextDatasetRow(ctx context.Context, state *querySession) ([]any
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	row, err := datasetRow(state.dataset, state.client.dialect, state.columns, state.columnTypes)
+	row, err := datasetRow(state.dataset, state.client, state.columns, state.columnTypes)
 	return row, true, err
 }
 
@@ -305,6 +306,12 @@ func (s *server) closeAllQuerySessions() error {
 }
 
 func (s *server) executeStatements(params map[string]json.RawMessage, transaction bool) (queryResult, error) {
+	if transaction {
+		// IoTDB executes statements independently and exposes no rollbackable
+		// transaction boundary. Reject the RPC before obtaining a client so a
+		// requested atomic batch can never leave partial writes behind.
+		return queryResult{}, errors.New("IoTDB does not support transactions")
+	}
 	started := time.Now()
 	statements := stringSliceParam(params, "statements")
 	if len(statements) == 0 {
@@ -372,7 +379,7 @@ func runCancelable[T any](s *server, timeoutSecs int, connected *sessionClient, 
 	return value, err
 }
 
-func readDataset(ctx context.Context, dataset *client.SessionDataSet, dialect string, columns, columnTypes []string, limit int) ([][]any, bool, error) {
+func readDataset(ctx context.Context, dataset *client.SessionDataSet, connected *sessionClient, columns, columnTypes []string, limit int) ([][]any, bool, error) {
 	if limit <= 0 {
 		limit = defaultMaxRows
 	}
@@ -391,7 +398,7 @@ func readDataset(ctx context.Context, dataset *client.SessionDataSet, dialect st
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
-		row, err := datasetRow(dataset, dialect, columns, columnTypes)
+		row, err := datasetRow(dataset, connected, columns, columnTypes)
 		if err != nil {
 			return nil, false, err
 		}
@@ -404,7 +411,7 @@ func readDataset(ctx context.Context, dataset *client.SessionDataSet, dialect st
 	return rows, hasNext, err
 }
 
-func datasetRow(dataset *client.SessionDataSet, dialect string, columns, columnTypes []string) ([]any, error) {
+func datasetRow(dataset *client.SessionDataSet, connected *sessionClient, columns, columnTypes []string) ([]any, error) {
 	row := make([]any, len(columns))
 	for index := range columns {
 		columnIndex := int32(index + 1)
@@ -412,12 +419,20 @@ func datasetRow(dataset *client.SessionDataSet, dialect string, columns, columnT
 		if index < len(columnTypes) {
 			columnType = strings.ToUpper(columnTypes[index])
 		}
-		if dialect == client.TreeSqlDialect && index == 0 && strings.EqualFold(columns[index], "Time") {
-			value, err := dataset.GetStringByIndex(columnIndex)
+		if iotdbColumnTypeBase(columnType) == "TIMESTAMP" {
+			isNull, err := dataset.IsNullByIndex(columnIndex)
 			if err != nil {
 				return nil, err
 			}
-			row[index] = value
+			if isNull {
+				row[index] = nil
+				continue
+			}
+			value, err := dataset.GetLongByIndex(columnIndex)
+			if err != nil {
+				return nil, err
+			}
+			row[index] = strconv.FormatInt(value, 10)
 			continue
 		}
 		value, err := dataset.GetObjectByIndex(columnIndex)
@@ -455,14 +470,61 @@ func normalizeIoTDBValue(value any, columnType string) any {
 	}
 }
 
-func normalizedColumnTypes(values []string, columnCount int) []string {
-	result := make([]string, columnCount)
+func normalizedColumnTypes(values, columns []string, dialect, timestampPrecision string) []string {
+	result := make([]string, len(columns))
 	for index := range result {
 		if index < len(values) {
 			result[index] = strings.ToUpper(values[index])
 		}
+		if isTreeTimeColumn(dialect, columns, index) {
+			result[index] = "TIMESTAMP"
+		}
+		if iotdbColumnTypeBase(result[index]) == "TIMESTAMP" {
+			result[index] = timestampColumnType(timestampPrecision)
+			continue
+		}
+		// max_time/min_time aggregates return INT64 epoch values in the tree
+		// dialect; type them as timestamps so the grid renders standard times.
+		if dialect == client.TreeSqlDialect && iotdbColumnTypeBase(result[index]) == "INT64" && isTimeAggregationColumn(columns[index]) {
+			result[index] = timestampColumnType(timestampPrecision)
+		}
 	}
 	return result
+}
+
+func isTimeAggregationColumn(column string) bool {
+	trimmed := strings.TrimSpace(column)
+	for _, prefix := range []string{"max_time(", "min_time("} {
+		if len(trimmed) > len(prefix) && strings.EqualFold(trimmed[:len(prefix)], prefix) {
+			return true
+		}
+	}
+	for _, prefix := range []string{"max_by(", "min_by("} {
+		if len(trimmed) <= len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+			continue
+		}
+		arguments := trimmed[len(prefix):]
+		comma := strings.IndexByte(arguments, ',')
+		if comma > 0 && strings.EqualFold(strings.TrimSpace(arguments[:comma]), "time") {
+			return true
+		}
+	}
+	return false
+}
+
+func timestampColumnType(precision string) string {
+	if normalized := normalizeTimestampPrecision(precision); normalized != "" {
+		return "TIMESTAMP(" + normalized + ")"
+	}
+	return "TIMESTAMP"
+}
+
+func iotdbColumnTypeBase(value string) string {
+	return strings.TrimSpace(strings.SplitN(strings.ToUpper(value), "(", 2)[0])
+}
+
+func isTreeTimeColumn(dialect string, columns []string, index int) bool {
+	return dialect == client.TreeSqlDialect && index == 0 && len(columns) > 0 && strings.EqualFold(columns[0], "Time")
 }
 
 func timeoutMilliseconds(timeoutSecs int) *int64 {

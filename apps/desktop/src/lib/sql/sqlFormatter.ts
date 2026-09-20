@@ -1,9 +1,35 @@
 import { DEFAULT_SQL_FORMATTER_SETTINGS, normalizeSqlFormatterSettings, sqlFormatterOptions, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
+import { formatSqlLayout, type SqlLayoutOptions } from "@/lib/sql/layout";
 import { looksLikeXml } from "@/lib/sql/autoFormat";
 
-export type SqlFormatDialect = "mysql" | "postgres" | "sqlite" | "sqlserver" | "clickhouse" | "generic";
+export type SqlFormatDialect = "mysql" | "postgres" | "sqlite" | "sqlserver" | "oracle" | "clickhouse" | "dameng" | "duckdb" | "generic";
 
 export const MAX_SQL_FORMAT_CHARS = 1_000_000;
+
+type SqlFormatterModule = typeof import("sql-formatter");
+
+// sql-formatter classifies ClickHouse date-part abbreviations as reserved
+// keywords even where ClickHouse accepts them as ordinary identifiers. Keep
+// them identifier-like so keyword casing cannot rewrite aliases such as `m`.
+const CLICKHOUSE_IDENTIFIER_LIKE_DATE_PARTS = new Set(["D", "DD", "H", "HH", "M", "MCS", "MI", "MM", "MS", "N", "NS", "Q", "QQ", "S", "SS", "WK", "WW", "YY", "YYYY"]);
+let clickHouseIdentifierSafeDialect: SqlFormatterModule["clickhouse"] | null = null;
+
+function resolveClickHouseIdentifierSafeDialect(sqlFormatter: SqlFormatterModule): SqlFormatterModule["clickhouse"] {
+  if (clickHouseIdentifierSafeDialect) return clickHouseIdentifierSafeDialect;
+
+  clickHouseIdentifierSafeDialect = {
+    ...sqlFormatter.clickhouse,
+    tokenizerOptions: {
+      ...sqlFormatter.clickhouse.tokenizerOptions,
+      reservedKeywords: sqlFormatter.clickhouse.tokenizerOptions.reservedKeywords.filter((keyword) => !CLICKHOUSE_IDENTIFIER_LIKE_DATE_PARTS.has(keyword)),
+    },
+  };
+  return clickHouseIdentifierSafeDialect;
+}
+
+export function canFormatSqlForDatabaseType(dbType: string | null | undefined): boolean {
+  return dbType !== "redis" && dbType !== "victoriametrics";
+}
 
 /**
  * Thrown by {@link formatSqlText} when the input is XML-looking and must never
@@ -24,10 +50,10 @@ export class UnsupportedStructuredInputError extends Error {
  * Maps a connection's database type to the SQL-formatter dialect to use.
  *
  * Postgres-compatible engines (GaussDB/openGauss/Kingbase/...) reuse the
- * "postgres" grammar, SQLite-compatible ones reuse "sqlite", and anything
- * unrecognized falls back to the permissive "generic" dialect. Centralized
- * here so every surface that formats SQL (editor, object source, DDL viewers)
- * stays in sync.
+ * "postgres" grammar, SQLite-compatible ones reuse "sqlite", and DuckDB gets
+ * a scoped preprocessing pass over the generic grammar. Anything unrecognized
+ * falls back to the permissive "generic" dialect. Centralized here so every
+ * surface that formats SQL (editor, object source, DDL viewers) stays in sync.
  */
 export function sqlFormatDialectForDbType(dbType: string | null | undefined): SqlFormatDialect {
   switch (dbType) {
@@ -51,8 +77,16 @@ export function sqlFormatDialectForDbType(dbType: string | null | undefined): Sq
       return "sqlite";
     case "sqlserver":
       return "sqlserver";
+    case "oracle":
+    // OceanBase Oracle mode speaks Oracle SQL, so it reuses the PL/SQL grammar.
+    case "oceanbase-oracle":
+      return "oracle";
     case "clickhouse":
       return "clickhouse";
+    case "dameng":
+      return "dameng";
+    case "duckdb":
+      return "duckdb";
     default:
       return "generic";
   }
@@ -68,11 +102,232 @@ function formatterLanguage(dialect: SqlFormatDialect) {
       return "sqlite";
     case "sqlserver":
       return "transactsql";
+    case "oracle":
+      return "plsql";
     case "clickhouse":
       return "clickhouse";
     default:
       return "sql";
   }
+}
+
+function splitTrailingStandaloneDot(sql: string): { body: string; suffix: string } | null {
+  const match = /\s+\.(\s*)$/.exec(sql);
+  if (!match || match.index === 0) return null;
+
+  return {
+    body: sql.slice(0, match.index),
+    suffix: match[0],
+  };
+}
+
+interface EmptyLineProtection {
+  sql: string;
+  markers: string[];
+}
+
+/**
+ * Replaces blank source lines with unique line comments while the third-party
+ * formatter runs. sql-formatter intentionally normalizes whitespace, whereas
+ * the optional DBX setting needs to retain visual paragraph boundaries such as
+ * the blank line between a heading comment and a query. Line comments are
+ * valid at every SQL code boundary and are restored only after all DBX layout
+ * post-processing is complete.
+ */
+function protectEmptyLines(sql: string): EmptyLineProtection {
+  let namespace = 0;
+  while (sql.includes(`__DBX_PRESERVE_EMPTY_LINE_${namespace}_`)) namespace += 1;
+
+  const markers: string[] = [];
+  const lineBreakPattern = /\r\n|\r|\n/g;
+  let output = "";
+  let lineStart = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = lineBreakPattern.exec(sql))) {
+    const line = sql.slice(lineStart, match.index);
+    if (line.trim().length === 0) {
+      const marker = `-- __DBX_PRESERVE_EMPTY_LINE_${namespace}_${markers.length}__`;
+      markers.push(marker);
+      output += marker;
+    } else {
+      output += line;
+    }
+    output += match[0];
+    lineStart = lineBreakPattern.lastIndex;
+  }
+
+  // A final non-terminated blank line is still a user-authored empty line.
+  // Do not manufacture one after a trailing line break, though: that would
+  // turn the normal EOF sentinel into an additional preserved blank line.
+  const finalLine = sql.slice(lineStart);
+  if (finalLine.length > 0 && finalLine.trim().length === 0) {
+    const marker = `-- __DBX_PRESERVE_EMPTY_LINE_${namespace}_${markers.length}__`;
+    markers.push(marker);
+    output += marker;
+  } else {
+    output += finalLine;
+  }
+
+  return { sql: markers.length > 0 ? output : sql, markers };
+}
+
+function restoreProtectedEmptyLines(sql: string, markers: readonly string[]): string {
+  if (markers.length === 0) return sql;
+
+  const markerSet = new Set(markers);
+  const lines = sql.split(/\r\n|\r|\n/);
+  for (let index = 0; index < lines.length; ) {
+    if (!markerSet.has(lines[index].trim())) {
+      index += 1;
+      continue;
+    }
+
+    let runEnd = index;
+    while (runEnd < lines.length && markerSet.has(lines[runEnd].trim())) runEnd += 1;
+    const markerCount = runEnd - index;
+
+    // sql-formatter adds `linesBetweenQueries` blank lines before a marker
+    // group placed between statements. Those lines did not exist in the
+    // source—the marker group itself represents the source blank lines—so
+    // remove at most one generated line per original blank line. This keeps
+    // the larger of the user-authored spacing and the formatter's configured
+    // query spacing instead of adding the two counts together.
+    let removed = 0;
+    while (removed < markerCount && index > 0 && lines[index - 1].trim().length === 0) {
+      lines.splice(index - 1, 1);
+      index -= 1;
+      runEnd -= 1;
+      removed += 1;
+    }
+
+    for (let markerIndex = index; markerIndex < runEnd; markerIndex += 1) {
+      lines[markerIndex] = "";
+    }
+    index = runEnd;
+  }
+
+  return lines.join("\n");
+}
+
+const DUCKDB_ALIAS_IDENTIFIER_START_RE = /[\p{L}_]/u;
+const DUCKDB_ALIAS_IDENTIFIER_CHAR_RE = /[\p{L}\p{N}_]/u;
+
+function hasDuckDbBarePrefixAliasBefore(sql: string, colonIndex: number): boolean {
+  let start = colonIndex;
+  while (start > 0 && DUCKDB_ALIAS_IDENTIFIER_CHAR_RE.test(sql[start - 1])) start -= 1;
+  return start < colonIndex && DUCKDB_ALIAS_IDENTIFIER_START_RE.test(sql[start]);
+}
+
+function duckDbDollarQuoteMarkerAt(sql: string, index: number): string | null {
+  if (sql[index] !== "$" || DUCKDB_ALIAS_IDENTIFIER_CHAR_RE.test(sql[index - 1] ?? "")) return null;
+  if (sql[index + 1] === "$") return "$$";
+  if (!/[A-Za-z_]/.test(sql[index + 1] ?? "")) return null;
+
+  let end = index + 2;
+  while (/[A-Za-z0-9_]/.test(sql[end] ?? "")) end += 1;
+  return sql[end] === "$" ? sql.slice(index, end + 1) : null;
+}
+
+function protectDuckDbPrefixAliasSeparators(sql: string): { sql: string; marker: string | null } {
+  let markerIndex = 0;
+  let marker = "";
+  do {
+    marker = `/*__DBX_DUCKDB_PREFIX_ALIAS_COLON_${markerIndex}__*/`;
+    markerIndex += 1;
+  } while (sql.includes(marker));
+
+  let protectedSql = "";
+  let quotedIdentifierEnd = -1;
+  let replaced = false;
+  let index = 0;
+
+  while (index < sql.length) {
+    const ch = sql[index];
+    const next = sql[index + 1];
+
+    if (ch === "-" && next === "-") {
+      const start = index;
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n" && sql[index] !== "\r") index += 1;
+      protectedSql += sql.slice(start, index);
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      const start = index;
+      index += 2;
+      let depth = 1;
+      while (index < sql.length && depth > 0) {
+        if (sql[index] === "/" && sql[index + 1] === "*") {
+          depth += 1;
+          index += 2;
+        } else if (sql[index] === "*" && sql[index + 1] === "/") {
+          depth -= 1;
+          index += 2;
+        } else {
+          index += 1;
+        }
+      }
+      protectedSql += sql.slice(start, index);
+      continue;
+    }
+
+    const dollarQuoteMarker = ch === "$" ? duckDbDollarQuoteMarkerAt(sql, index) : null;
+    if (dollarQuoteMarker) {
+      const start = index;
+      const end = sql.indexOf(dollarQuoteMarker, index + dollarQuoteMarker.length);
+      index = end < 0 ? sql.length : end + dollarQuoteMarker.length;
+      protectedSql += sql.slice(start, index);
+      continue;
+    }
+
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const start = index;
+      const quote = ch;
+      let closed = false;
+      index += 1;
+      while (index < sql.length) {
+        if (sql[index] === "\\" && index + 1 < sql.length) {
+          index += 2;
+          continue;
+        }
+        if (sql[index] === quote) {
+          if (sql[index + 1] === quote) {
+            index += 2;
+            continue;
+          }
+          index += 1;
+          closed = true;
+          break;
+        }
+        index += 1;
+      }
+      protectedSql += sql.slice(start, index);
+      if (quote === '"' && closed) quotedIdentifierEnd = index;
+      continue;
+    }
+
+    const prefixAlias = ch === ":" && sql[index - 1] !== ":" && next !== ":" && next !== "=" && (quotedIdentifierEnd === index || hasDuckDbBarePrefixAliasBefore(sql, index));
+    if (prefixAlias) {
+      // sql-formatter tokenizes a compact DuckDB prefix alias as a named
+      // parameter and inserts a space before `:`. Keeping an opaque separator
+      // through formatting preserves the boundary used by DBX's parameter scan.
+      protectedSql += marker;
+      replaced = true;
+      index += 1;
+      continue;
+    }
+
+    protectedSql += ch;
+    index += 1;
+  }
+
+  return replaced ? { sql: protectedSql, marker } : { sql, marker: null };
+}
+
+function restoreDuckDbPrefixAliasSeparators(sql: string, marker: string | null): string {
+  return marker ? sql.split(marker).join(":") : sql;
 }
 
 export async function formatSqlText(sql: string, dialect: SqlFormatDialect = "generic", settings: Partial<SqlFormatterSettings> = DEFAULT_SQL_FORMATTER_SETTINGS): Promise<string> {
@@ -85,27 +340,89 @@ export async function formatSqlText(sql: string, dialect: SqlFormatDialect = "ge
     throw new UnsupportedStructuredInputError("xml");
   }
 
-  const { format } = await import("sql-formatter");
+  const sqlFormatter = await import("sql-formatter");
+  const { format, formatDialect } = sqlFormatter;
   const normalizedSettings = normalizeSqlFormatterSettings(settings);
   const options = sqlFormatterOptions(normalizedSettings);
   const language = formatterLanguage(dialect);
-  try {
-    const formatted = format(sql, { language, ...options });
-    return applySqlFormatterLayout(formatted, normalizedSettings, dialect);
-  } catch (err) {
-    // The generic "sql" dialect can't parse many real-world constructs (PostgreSQL
-    // `::` casts, GaussDB/openGauss materialized-view DDL, T-SQL specifics, ...).
-    // Retry once with the more permissive PostgreSQL grammar, which is a superset
-    // that tolerates most of these, before surfacing the failure.
-    if (language !== "postgresql") {
-      try {
-        const formatted = format(sql, { language: "postgresql", ...options });
-        return applySqlFormatterLayout(formatted, normalizedSettings, dialect);
-      } catch {
-        // fall through to the original error below
+  const emptyLineProtection = normalizedSettings.preserveEmptyLines ? protectEmptyLines(sql) : null;
+  const sqlWithProtectedEmptyLines = emptyLineProtection?.sql ?? sql;
+  const protectedInput = dialect === "duckdb" ? protectDuckDbPrefixAliasSeparators(sqlWithProtectedEmptyLines) : { sql: sqlWithProtectedEmptyLines, marker: null };
+  const formatterOptions =
+    language === "postgresql"
+      ? {
+          ...options,
+          paramTypes: {
+            ...options.paramTypes,
+            // PostgreSQL itself uses double quotes, but users commonly format
+            // imported MySQL-style SQL before correcting it. Treat complete
+            // backtick spans as opaque tokens so the PostgreSQL lexer can keep
+            // formatting the surrounding statement without rewriting them.
+            custom: [...options.paramTypes.custom, { regex: "`(?:``|[^`])*`" }],
+          },
+        }
+      : options;
+  const resolvedDialect = dialect === "clickhouse" ? resolveClickHouseIdentifierSafeDialect(sqlFormatter) : undefined;
+  const formatWithFallback = (input: string): string => {
+    try {
+      if (resolvedDialect) {
+        return formatDialect(input, { ...formatterOptions, dialect: resolvedDialect });
       }
+      return format(input, { language, ...formatterOptions });
+    } catch (err) {
+      // The generic "sql" dialect can't parse many real-world constructs (PostgreSQL
+      // `::` casts, GaussDB/openGauss materialized-view DDL, T-SQL specifics, ...).
+      // Retry once with the more permissive PostgreSQL grammar, which is a superset
+      // that tolerates most of these, before surfacing the failure.
+      if (language !== "postgresql") {
+        try {
+          return format(input, { language: "postgresql", ...options });
+        } catch {
+          // fall through to the original error below
+        }
+      }
+      throw err;
     }
-    throw err;
+  };
+
+  const finalizeFormattedSql = (formatted: string): string => {
+    const restoredDuckDbAliases = restoreDuckDbPrefixAliasSeparators(formatted, protectedInput.marker);
+    const laidOut = applySqlFormatterLayout(restoredDuckDbAliases, normalizedSettings, dialect);
+    return emptyLineProtection ? restoreProtectedEmptyLines(laidOut, emptyLineProtection.markers) : laidOut;
+  };
+
+  // DBX's own layout printer produces the default style. It needs the AST and
+  // sql-formatter's internal layout machinery, so it can decline an input — an
+  // unparseable statement, an internal shape that moved. `null` means "use the
+  // public formatter", which is also what the tabular indent styles ask for:
+  // those are an alternative layout this printer deliberately does not reproduce.
+  const layoutOptions: Partial<SqlLayoutOptions> = {
+    lineWidth: normalizedSettings.expressionWidth,
+    indentWidth: normalizedSettings.tabWidth,
+    useTabs: normalizedSettings.useTabs,
+    linesBetweenQueries: normalizedSettings.linesBetweenQueries,
+    fromClauseSourceOnSameLine: normalizedSettings.fromClauseLayout === "sameLine",
+    keywordCase: normalizedSettings.keywordCase,
+    logicalOperatorNewline: normalizedSettings.logicalOperatorNewline,
+  };
+  const usesDefaultStyle = normalizedSettings.indentStyle === "standard";
+
+  const formatOnce = async (input: string): Promise<string> => {
+    const laidOut = usesDefaultStyle ? await formatSqlLayout({ sql: input, language, dialectOptions: resolvedDialect, cfg: formatterOptions, options: layoutOptions }) : null;
+    return laidOut ?? formatWithFallback(input);
+  };
+
+  try {
+    return finalizeFormattedSql(await formatOnce(protectedInput.sql));
+  } catch (err) {
+    const trailingDot = dialect === "dameng" ? splitTrailingStandaloneDot(protectedInput.sql) : null;
+    if (!trailingDot) throw err;
+
+    try {
+      return finalizeFormattedSql(`${await formatOnce(trailingDot.body)}${trailingDot.suffix}`);
+    } catch {
+      throw err;
+    }
   }
 }
 
@@ -121,7 +438,7 @@ export async function formatSqlText(sql: string, dialect: SqlFormatDialect = "ge
  *
  * The scanner reuses the same dialect-aware token recognition as
  * {@link compressSqlText}: block comments (with nesting for Postgres/SQL
- * Server/ClickHouse), `--`/`#` line comments, Postgres dollar-quoted strings,
+ * Server/ClickHouse), `--`/`#` line comments, Postgres/DuckDB dollar-quoted strings,
  * single-quoted strings (`''` and MySQL/`E'...'` backslash escapes), double-
  * quoted identifiers (`""` escapes), MySQL backtick identifiers and SQL Server
  * `[...]` identifiers. sql-formatter normalizes string literals to a single
@@ -196,7 +513,7 @@ function maskStringAndCommentSpans(sql: string, dialect: SqlFormatDialect): { ma
     }
 
     // PostgreSQL dollar-quoted 字符串
-    if (dialect === "postgres" && ch === "$") {
+    if ((dialect === "postgres" || dialect === "duckdb") && ch === "$") {
       const tag = dollarQuoteTagAt(i);
       if (tag) {
         const start = i;
@@ -309,6 +626,19 @@ function keepLogicalOperatorsOnSameLine(sql: string, dialect: SqlFormatDialect =
   return restoreSpans(collapsed, spans);
 }
 
+function normalizeLikeOperatorCase(sql: string, settings: SqlFormatterSettings, dialect: SqlFormatDialect): string {
+  if ((dialect !== "mysql" && dialect !== "sqlite") || settings.keywordCase === "preserve") return sql;
+
+  // sql-formatter classifies LIKE as a reserved function in these dialects,
+  // so an operator follows functionCase instead of keywordCase. Only adjust
+  // operator-shaped occurrences; keep LIKE(...) functions and qualified
+  // identifiers under their existing function/identifier case settings.
+  const { masked, spans } = maskStringAndCommentSpans(sql, dialect);
+  const keyword = settings.keywordCase === "upper" ? "LIKE" : "like";
+  const normalized = masked.replace(/(^|[^.\w$:@{#])LIKE\b(?!\s*\()/gi, (_match, prefix: string) => `${prefix}${keyword}`);
+  return restoreSpans(normalized, spans);
+}
+
 function keepFromClauseAndFirstSourceOnSameLine(sql: string): string {
   const lines = sql.split("\n");
   for (let index = 0; index < lines.length - 1; index += 1) {
@@ -333,14 +663,40 @@ function keepFromClauseAndFirstSourceOnSameLine(sql: string): string {
   return lines.join("\n");
 }
 
+/**
+ * The text-level passes applied to whatever the formatter produced, whether the
+ * default style's layout printer or sql-formatter itself.
+ *
+ * The two settings-driven passes fix shapes the printer already gets right on
+ * its own — it keeps a `FROM` source on the keyword's line and joins operators
+ * for `none` — so they are no-ops on its output. They stay because a statement
+ * the printer declines falls back to sql-formatter's layout for the whole input,
+ * which does break those shapes; see `formatSqlText`. {@link
+ * normalizeLikeOperatorCase} is unrelated to either: it corrects a dialect quirk
+ * in both paths.
+ */
 function applySqlFormatterLayout(sql: string, settings: SqlFormatterSettings, dialect: SqlFormatDialect): string {
-  let formatted = settings.logicalOperatorNewline === "none" ? keepLogicalOperatorsOnSameLine(sql, dialect) : sql;
+  let formatted = normalizeLikeOperatorCase(sql, settings, dialect);
+  if (settings.logicalOperatorNewline === "none") formatted = keepLogicalOperatorsOnSameLine(formatted, dialect);
   if (settings.fromClauseLayout === "sameLine") formatted = keepFromClauseAndFirstSourceOnSameLine(formatted);
   return formatted;
 }
 
+/**
+ * sql-formatter throws two distinct shapes when it can't parse the input:
+ * - Grammar-level (nearley parser): `Parse error at token: ... ` with `.offset`/`.token`
+ *   set on the error, e.g. valid tokens in an unexpected position (mid-edit SQL).
+ * - Lexer-level (TokenizerEngine): a plain `Parse error: Unexpected "..." at line ...`
+ *   when a character sequence doesn't match any token rule at all — e.g. full-width
+ *   punctuation (`≠`, `（`, `）`) that MySQL accepts in identifiers/expressions but
+ *   sql-formatter's tokenizer doesn't recognize.
+ * Both mean "sql-formatter can't handle this text", so both should fall back to the
+ * original SQL instead of surfacing a failure.
+ */
 function isSqlFormatterParseError(error: unknown): boolean {
-  if (!(error instanceof Error) || !error.message.startsWith("Parse error at token:")) return false;
+  if (!(error instanceof Error)) return false;
+  if (error.message.startsWith("Parse error: Unexpected ")) return true;
+  if (!error.message.startsWith("Parse error at token:")) return false;
   const candidate = error as Error & { offset?: unknown; token?: unknown };
   return typeof candidate.offset === "number" && candidate.token !== undefined;
 }

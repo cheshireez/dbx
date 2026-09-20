@@ -51,17 +51,57 @@ function fileContainsCommonDependency(path, moduleExists, readModuleFile) {
 const nativeDriverDirectories = {
   cassandra: "cassandra-go",
   duckdb: "duckdb",
+  hive: "hive-go",
+  argo: "argo-go",
   oracle: "oracle-go",
   kingbase: "kingbase-go",
   iotdb: "iotdb",
   neo4j: "neo4j-go",
   vastbase: "vastbase-go",
   rabbitmq: "rabbitmq",
+  rocketmq: "rocketmq",
+  zookeeper: "zookeeper",
   tdengine: "tdengine",
+  etcd: "etcd-go",
+  etcd2: "etcd2-go",
 };
-const nativeDriverModules = new Set(["cassandra", "duckdb", "oracle", "xugu", "kingbase", "iotdb", "neo4j", "vastbase", "rabbitmq", "tdengine"]);
+const crateNativeDriverDirectories = {
+  "sqlite-worker": "crates/dbx-sqlite-worker",
+};
+const nativeDriverModules = new Set(["cassandra", "duckdb", "hive", "argo", "oracle", "xugu", "kingbase", "iotdb", "neo4j", "vastbase", "rabbitmq", "rocketmq", "zookeeper", "tdengine", "etcd", "etcd2", "sqlite-worker"]);
+const nativeDriverSharedPaths = {
+  hive: [
+    "agents/go-common/go-gssapi",
+    "agents/go-common/gohive",
+    "agents/go-common/gosasl",
+  ],
+  argo: [
+    "agents/go-common/go-gssapi",
+    "agents/go-common/gohive",
+    "agents/go-common/gosasl",
+  ],
+  zookeeper: [
+    "agents/go-common/go-gssapi",
+    "agents/go-common/gosasl",
+  ],
+  etcd: [
+    "agents/go-common/go-semver",
+  ],
+};
 
 function resolveAgentModule(moduleName, { legacyStandaloneModules, moduleExists, readModuleFile }) {
+  const cratePath = crateNativeDriverDirectories[moduleName];
+  if (cratePath && moduleExists(cratePath)) {
+    return {
+      checkDir: cratePath,
+      modulePath: cratePath,
+      sharedPaths: [],
+      javaBuild: false,
+      nativeBuild: true,
+      commonDependent: false,
+    };
+  }
+
   let checkDir = null;
   const nativeDriverDirectory = nativeDriverDirectories[moduleName];
   if (nativeDriverDirectory && moduleExists(`agents/drivers/${nativeDriverDirectory}`)) {
@@ -82,6 +122,7 @@ function resolveAgentModule(moduleName, { legacyStandaloneModules, moduleExists,
   return {
     checkDir,
     modulePath,
+    sharedPaths: nativeDriverSharedPaths[moduleName] ?? [],
     javaBuild: hasBuildGradle,
     nativeBuild: nativeDriverModules.has(moduleName),
     commonDependent: hasBuildGradle && (explicitlyDependsOnCommon || !legacyStandaloneModules.has(moduleName)),
@@ -137,7 +178,8 @@ export function evaluateAgentVersionBump({
   }
 
   for (const { moduleName, module } of resolvedModules) {
-    const moduleChanged = pathChanged(changedFiles, module.modulePath);
+    const moduleChanged = [module.modulePath, ...module.sharedPaths]
+      .some((path) => pathChanged(changedFiles, path));
     // Only modules that package agents/common need installer-visible updates
     // for shared Java runtime changes; native and standalone agents do not.
     const commonAffectsModule = commonChanged && module.commonDependent;

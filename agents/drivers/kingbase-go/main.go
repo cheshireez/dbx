@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -129,22 +130,30 @@ type querySession struct {
 }
 
 type server struct {
-	db                         *sql.DB
-	openDatabase               kingbaseDBOpener
-	params                     connectParams
-	mode                       kingbaseMode
-	usePgDefaultExpression     bool
-	usePgViewDefinition        bool
-	usePgFunctionDefinition    bool
-	catalogIdentityUnsupported bool
-	infoColumnTypeUnsupported  bool
-	infoUdtNameUnsupported     bool
-	currentSchema              string
-	schemaSet                  bool
-	sessions                   map[string]*querySession
-	nextSessionID              uint64
-	activeCancelMu             sync.Mutex
-	activeCancel               context.CancelFunc
+	db                              *sql.DB
+	openDatabase                    kingbaseDBOpener
+	params                          connectParams
+	mode                            kingbaseMode
+	usePgDefaultExpression          bool
+	usePgViewDefinition             bool
+	usePgFunctionDefinition         bool
+	useLegacyRoutineDefinition      bool
+	catalogIdentityUnsupported      bool
+	catalogOIDUnsupported           bool
+	infoColumnTypeUnsupported       bool
+	infoUdtNameUnsupported          bool
+	indexOrdinalityUnsupported      bool
+	triggerPrettyUnsupported        bool
+	triggerInternalUnsupported      bool
+	constraintDefinitionUnsupported bool
+	constraintValidatedUnsupported  bool
+	constraintStatusUnsupported     bool
+	currentSchema                   string
+	schemaSet                       bool
+	sessions                        map[string]*querySession
+	nextSessionID                   uint64
+	activeCancelMu                  sync.Mutex
+	activeCancel                    context.CancelFunc
 }
 
 type agentSession struct {
@@ -402,11 +411,17 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 	case "list_foreign_keys":
 		result, err := s.listForeignKeys(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
+	case "list_constraints":
+		result, err := s.listConstraints(stringParam(params, "schema"), stringParam(params, "table"))
+		return result, false, err
 	case "list_triggers":
 		result, err := s.listTriggers(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
 	case "get_object_source":
-		result, err := s.getObjectSource(stringParam(params, "schema"), stringParam(params, "name"), stringParam(params, "object_type"))
+		result, err := s.getObjectSourceForRelation(stringParam(params, "schema"), stringParam(params, "name"), stringParam(params, "object_type"), stringParam(params, "relation_name"))
+		return result, false, err
+	case "get_type_details":
+		result, err := s.getTypeDetails(stringParam(params, "schema"), stringParam(params, "name"))
 		return result, false, err
 	case "get_table_ddl":
 		result, err := s.getTableDDL(stringParam(params, "schema"), stringParam(params, "table"))
@@ -457,12 +472,21 @@ func (s *server) connect(cp connectParams) error {
 	s.db = db
 	s.params = cp
 	s.mode = detectKingbaseMode(db, cp.MySQLCompatMode)
+	s.mode.legacyV7 = detectKingbaseV7(db)
 	s.usePgDefaultExpression = false
 	s.usePgViewDefinition = false
 	s.usePgFunctionDefinition = false
+	s.useLegacyRoutineDefinition = false
 	s.catalogIdentityUnsupported = false
+	s.catalogOIDUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
+	s.indexOrdinalityUnsupported = false
+	s.triggerPrettyUnsupported = false
+	s.triggerInternalUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintStatusUnsupported = false
 	return nil
 }
 
@@ -478,9 +502,17 @@ func (s *server) testConnection(cp connectParams) error {
 type kingbaseDBOpener func(connectParams, string) (*sql.DB, error)
 
 func openAndPingDB(cp connectParams, timeout time.Duration, opener kingbaseDBOpener) (*sql.DB, error) {
+	if endpoints := clusterConnectEndpoints(cp); len(endpoints) > 1 {
+		return openAndPingClusterEndpoints(cp, timeout, endpoints, opener)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return pingDBWithSSLModes(ctx, cp, opener)
+}
 
+// pingDBWithSSLModes runs the historical sslmode attempt sequence
+// ("prefer" degrades to require then disable) for one set of fields.
+func pingDBWithSSLModes(ctx context.Context, cp connectParams, opener kingbaseDBOpener) (*sql.DB, error) {
 	sslMode := effectiveSSLMode(cp)
 	attempts := []string{sslMode}
 	if sslMode == "prefer" {
@@ -497,12 +529,130 @@ func openAndPingDB(cp connectParams, timeout time.Duration, opener kingbaseDBOpe
 		if db != nil {
 			_ = db.Close()
 		}
-		if index == 0 && len(attempts) == 2 && errors.Is(err, gokb.ErrSSLNotSupported) {
+		if index == 0 && len(attempts) == 2 && shouldRetryKingbaseWithoutSSL(err) {
 			continue
 		}
 		return nil, err
 	}
 	return nil, errors.New("kingbase connection failed")
+}
+
+type kingbaseEndpoint struct {
+	host string
+	port int
+}
+
+// clusterConnectEndpoints splits the host field into ordered endpoints for
+// cluster (multi-IP) configurations. DBX stores cluster hosts as
+// comma-separated entries, each optionally embedding its own `:port`
+// (mirroring the vastbase/openGauss driver semantics); semicolons are also
+// accepted because Kingbase deployments paste both separators. A native
+// connection_string builds its own DSN, so the host field is only split for
+// the field-based path, and a host without any separator yields a single
+// endpoint which keeps the legacy single-host flow untouched.
+func clusterConnectEndpoints(cp connectParams) []kingbaseEndpoint {
+	if value := strings.TrimSpace(cp.ConnectionString); value != "" && !isKingbaseJDBCURL(value) {
+		return nil
+	}
+	defaultPort := cp.Port
+	if defaultPort <= 0 {
+		defaultPort = 54321
+	}
+	return splitHostEndpoints(cp.Host, defaultPort)
+}
+
+// splitHostEndpoints parses `host1[:port1][,;]host2[:port2]...`. Entries
+// without an embedded port use fallbackPort; bracketed IPv6 literals may
+// carry a port after the closing bracket.
+func splitHostEndpoints(rawHost string, fallbackPort int) []kingbaseEndpoint {
+	parts := strings.FieldsFunc(rawHost, func(r rune) bool { return r == ',' || r == ';' })
+	endpoints := make([]kingbaseEndpoint, 0, len(parts))
+	for _, part := range parts {
+		host, port, ok := parseHostEndpoint(strings.TrimSpace(part), fallbackPort)
+		if !ok {
+			continue
+		}
+		endpoints = append(endpoints, kingbaseEndpoint{host: host, port: port})
+	}
+	return endpoints
+}
+
+func parseHostEndpoint(entry string, fallbackPort int) (string, int, bool) {
+	if entry == "" {
+		return "", 0, false
+	}
+	if strings.HasPrefix(entry, "[") {
+		if close := strings.Index(entry, "]"); close > 0 {
+			host := entry[1:close]
+			suffix := entry[close+1:]
+			portText, hasPort := strings.CutPrefix(suffix, ":")
+			if !hasPort && suffix == "" {
+				return host, fallbackPort, true
+			}
+			if hasPort {
+				if port, err := strconv.Atoi(portText); err == nil && validEndpointPort(port) {
+					return host, port, true
+				}
+			}
+			// Malformed bracketed entries such as `[::1]x` keep their raw
+			// text so the eventual dial error stays honest.
+			return entry, fallbackPort, true
+		}
+	}
+	if strings.Count(entry, ":") == 1 {
+		if host, rawPort, ok := strings.Cut(entry, ":"); ok && host != "" {
+			if port, err := strconv.Atoi(rawPort); err == nil && validEndpointPort(port) {
+				return host, port, true
+			}
+		}
+	}
+	// Bare IPv6 literals and hostnames (including entries with a non-numeric
+	// port suffix) are forwarded verbatim, exactly like the single-host path.
+	return entry, fallbackPort, true
+}
+
+func validEndpointPort(port int) bool {
+	return port > 0 && port <= 65535
+}
+
+// openAndPingClusterEndpoints tries each configured endpoint in order and
+// keeps the first connection that completes the sslmode sequence, matching
+// the failover behavior the openGauss-family drivers implement natively.
+// Following libpq semantics, every endpoint gets its own full timeout
+// budget so one unreachable node cannot starve the remaining candidates.
+func openAndPingClusterEndpoints(
+	cp connectParams,
+	timeout time.Duration,
+	endpoints []kingbaseEndpoint,
+	opener kingbaseDBOpener,
+) (*sql.DB, error) {
+	failures := make([]error, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpointParams := cp
+		endpointParams.Host = endpoint.host
+		endpointParams.Port = endpoint.port
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		db, err := pingDBWithSSLModes(ctx, endpointParams, opener)
+		cancel()
+		if err == nil {
+			return db, nil
+		}
+		failures = append(failures, fmt.Errorf("%s:%d: %w", endpoint.host, endpoint.port, err))
+	}
+	return nil, fmt.Errorf("kingbase connection failed after trying %d endpoints: %w", len(endpoints), errors.Join(failures...))
+}
+
+func shouldRetryKingbaseWithoutSSL(err error) bool {
+	if errors.Is(err, gokb.ErrSSLNotSupported) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+
+	// KingBase V7 can accept the SSLRequest and then reject the TLS handshake,
+	// so gokb returns the TLS alert instead of ErrSSLNotSupported.
+	return strings.Contains(strings.ToLower(err.Error()), "remote error: tls: handshake failure")
 }
 
 func openDBWithSSLMode(cp connectParams, sslMode string) (*sql.DB, error) {
@@ -526,9 +676,17 @@ func (s *server) disconnect() error {
 	s.usePgDefaultExpression = false
 	s.usePgViewDefinition = false
 	s.usePgFunctionDefinition = false
+	s.useLegacyRoutineDefinition = false
 	s.catalogIdentityUnsupported = false
+	s.catalogOIDUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
+	s.indexOrdinalityUnsupported = false
+	s.triggerPrettyUnsupported = false
+	s.triggerInternalUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintStatusUnsupported = false
 	s.currentSchema = ""
 	s.schemaSet = false
 	if s.db == nil {
@@ -655,6 +813,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		s.endOperation(cancel)
 		return queryPageResult{}, err
 	}
+	columns = nonNilStrings(columns)
 	maxRows := opts.MaxRows
 	if maxRows <= 0 {
 		maxRows = defaultMaxRows
@@ -721,11 +880,27 @@ func (s *server) closeAllQuerySessions() {
 	}
 }
 
+// minInt/maxInt replace the Go 1.21 builtins so the module stays go 1.20
+// compatible for the Windows 7 toolchain build.
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult, error) {
 	if pageSize <= 0 {
 		pageSize = 100
 	}
-	capacity := min(pageSize, session.remaining)
+	capacity := minInt(pageSize, session.remaining)
 	result := queryPageResult{Columns: session.columns, ColumnTypes: session.columnTypes, Rows: make([][]any, 0, capacity)}
 	for len(result.Rows) < pageSize && session.remaining > 0 {
 		if session.pending != nil {
@@ -737,7 +912,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		if !session.rows.Next() {
 			return result, session.rows.Err()
 		}
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -749,7 +924,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		return result, nil
 	}
 	if session.rows.Next() {
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -764,13 +939,15 @@ func readRows(rows *sql.Rows, maxRows int) (queryResult, error) {
 	if err != nil {
 		return queryResult{}, err
 	}
-	result := queryResult{Columns: columns, ColumnTypes: columnTypeNames(rows), Rows: make([][]any, 0, min(maxRows, 1024))}
+	columns = nonNilStrings(columns)
+	columnTypes := columnTypeNames(rows)
+	result := queryResult{Columns: columns, ColumnTypes: columnTypes, Rows: make([][]any, 0, minInt(maxRows, 1024))}
 	for rows.Next() {
 		if len(result.Rows) >= maxRows {
 			result.Truncated = true
 			break
 		}
-		row, err := scanRow(rows, len(columns))
+		row, err := scanRow(rows, len(columns), columnTypes)
 		if err != nil {
 			return queryResult{}, err
 		}
@@ -779,7 +956,7 @@ func readRows(rows *sql.Rows, maxRows int) (queryResult, error) {
 	return result, rows.Err()
 }
 
-func scanRow(rows *sql.Rows, count int) ([]any, error) {
+func scanRow(rows *sql.Rows, count int, columnTypes []string) ([]any, error) {
 	storage := make([]any, count*2)
 	values := storage[:count]
 	dest := storage[count:]
@@ -790,9 +967,16 @@ func scanRow(rows *sql.Rows, count int) ([]any, error) {
 		return nil, err
 	}
 	for i, value := range values {
-		values[i] = normalizeValue(value)
+		values[i] = normalizeValue(value, columnTypeAt(columnTypes, i))
 	}
 	return values, nil
+}
+
+func columnTypeAt(columnTypes []string, index int) string {
+	if index < 0 || index >= len(columnTypes) {
+		return ""
+	}
+	return columnTypes[index]
 }
 
 func columnTypeNames(rows *sql.Rows) []string {
@@ -879,11 +1063,16 @@ func (s *server) schemaConn(ctx context.Context, schema string) (*sql.Conn, erro
 
 func (s *server) setSchema(ctx context.Context, conn *sql.Conn, schema string) error {
 	schema = strings.TrimSpace(schema)
+	// An omitted schema leaves the session search_path under user control.
+	// Reset it only after DBX applied an explicit schema.
+	if schema == "" && !s.schemaSet {
+		return nil
+	}
 	statement := "RESET search_path"
 	if schema != "" {
 		// Kingbase implicitly prioritizes its system catalog when it is not
 		// listed explicitly, matching the JDBC agent and DBeaver behavior.
-		statement = "SET search_path TO " + quoteIdentifier(schema)
+		statement = "SET search_path TO " + s.quoteIdentifier(schema)
 	}
 	if _, err := conn.ExecContext(ctx, statement); err != nil {
 		return err
@@ -1426,7 +1615,7 @@ func isUTF8Encoding(name string) bool {
 	return s == "utf8" || s == "unicode"
 }
 
-func normalizeValue(value any) any {
+func normalizeValue(value any, columnTypeName string) any {
 	switch typed := value.(type) {
 	case nil:
 		return nil
@@ -1436,6 +1625,13 @@ func normalizeValue(value any) any {
 		}
 		return map[string]string{"$binary": base64.StdEncoding.EncodeToString(typed)}
 	case time.Time:
+		// KingBase "timestamp"/"date" columns are wall-clock values with no timezone
+		// meaning; the gokb driver decodes them into a time.Time labeled with the
+		// process-local zone, which is not a real UTC instant. Formatting those with
+		// an offset (RFC3339Nano) makes clients double-apply the timezone shift.
+		if isKingbaseTimezoneLessDateTime(columnTypeName) {
+			return typed.Format("2006-01-02T15:04:05.999999999")
+		}
 		return typed.Format(time.RFC3339Nano)
 	case int8:
 		return int64(typed)
@@ -1447,6 +1643,16 @@ func normalizeValue(value any) any {
 		return float64(typed)
 	default:
 		return typed
+	}
+}
+
+func isKingbaseTimezoneLessDateTime(columnTypeName string) bool {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(columnTypeName), " ", ""))
+	switch normalized {
+	case "DATE", "TIMESTAMP", "TIME":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1513,12 +1719,340 @@ func trimStatementSQL(sqlText string) string {
 }
 
 func isQuerySQL(sqlText string) bool {
-	lower := strings.ToLower(strings.TrimSpace(sqlText))
-	return strings.HasPrefix(lower, "select") || strings.HasPrefix(lower, "with") || strings.HasPrefix(lower, "show") || strings.HasPrefix(lower, "explain")
+	keyword, next := sqlKeywordAt(sqlText, 0)
+	if keyword == "with" {
+		terminal, terminalEnd := withTerminalKeyword(sqlText, next)
+		if terminal == "" || !isStatementKeyword(terminal) {
+			return true
+		}
+		keyword = terminal
+		next = terminalEnd
+	}
+	if keyword == "select" || keyword == "show" || keyword == "explain" || keyword == "values" || keyword == "table" {
+		return true
+	}
+	return isDMLKeyword(keyword) && hasTopLevelSQLKeyword(sqlText, next, "returning")
+}
+
+func withTerminalKeyword(sqlText string, index int) (string, int) {
+	if keyword, next := sqlKeywordAt(sqlText, index); keyword == "recursive" {
+		index = next
+	}
+
+	for {
+		index = skipSQLTrivia(sqlText, index)
+		index = skipSQLIdentifier(sqlText, index)
+		if index < 0 {
+			return "", index
+		}
+
+		index = skipSQLTrivia(sqlText, index)
+		if index < len(sqlText) && sqlText[index] == '(' {
+			index = skipSQLParenthesized(sqlText, index)
+			if index < 0 {
+				return "", index
+			}
+		}
+
+		keyword, next := sqlKeywordAt(sqlText, index)
+		if keyword != "as" {
+			return "", index
+		}
+		index = next
+
+		if keyword, next = sqlKeywordAt(sqlText, index); keyword == "not" {
+			index = next
+			keyword, next = sqlKeywordAt(sqlText, index)
+			if keyword != "materialized" {
+				return "", index
+			}
+			index = next
+		} else if keyword == "materialized" {
+			index = next
+		}
+
+		index = skipSQLTrivia(sqlText, index)
+		if index >= len(sqlText) || sqlText[index] != '(' {
+			return "", index
+		}
+		index = skipSQLParenthesized(sqlText, index)
+		if index < 0 {
+			return "", index
+		}
+
+		index = skipSQLTrivia(sqlText, index)
+		if index < len(sqlText) && sqlText[index] == ',' {
+			index++
+			continue
+		}
+		keyword, next = sqlKeywordAt(sqlText, index)
+		return keyword, next
+	}
+}
+
+func hasTopLevelSQLKeyword(sqlText string, index int, target string) bool {
+	depth := 0
+	for index < len(sqlText) {
+		switch sqlText[index] {
+		case '\'':
+			index = skipSQLQuoted(sqlText, index, '\'')
+			if index < 0 {
+				return false
+			}
+			continue
+		case '"':
+			index = skipSQLQuoted(sqlText, index, '"')
+			if index < 0 {
+				return false
+			}
+			continue
+		case '$':
+			if next := skipSQLDollarQuoted(sqlText, index); next != index {
+				if next < 0 {
+					return false
+				}
+				index = next
+				continue
+			}
+		case '-':
+			if index+1 < len(sqlText) && sqlText[index+1] == '-' {
+				index = skipSQLLineComment(sqlText, index+2)
+				continue
+			}
+		case '/':
+			if index+1 < len(sqlText) && sqlText[index+1] == '*' {
+				index = skipSQLBlockComment(sqlText, index)
+				if index < 0 {
+					return false
+				}
+				continue
+			}
+		case '(':
+			depth++
+		case ')':
+			depth = maxInt(depth-1, 0)
+		default:
+			if depth == 0 && isSQLWordStartByte(sqlText[index]) {
+				keyword, next := sqlKeywordAt(sqlText, index)
+				if keyword == target {
+					return true
+				}
+				index = next
+				continue
+			}
+		}
+		index++
+	}
+	return false
+}
+
+func isDMLKeyword(keyword string) bool {
+	return keyword == "insert" || keyword == "update" || keyword == "delete" || keyword == "merge"
+}
+
+func isStatementKeyword(keyword string) bool {
+	return isDMLKeyword(keyword) || keyword == "select" || keyword == "values" || keyword == "table"
+}
+
+func sqlKeywordAt(sqlText string, index int) (string, int) {
+	index = skipSQLTrivia(sqlText, index)
+	if index >= len(sqlText) || !isSQLWordStartByte(sqlText[index]) {
+		return "", index
+	}
+	start := index
+	for index < len(sqlText) && isSQLIdentifierByte(sqlText[index]) {
+		index++
+	}
+	return strings.ToLower(sqlText[start:index]), index
+}
+
+func skipSQLIdentifier(sqlText string, index int) int {
+	index = skipSQLTrivia(sqlText, index)
+	if index >= len(sqlText) {
+		return -1
+	}
+	if sqlText[index] == '"' {
+		return skipSQLQuoted(sqlText, index, '"')
+	}
+	start := index
+	for index < len(sqlText) && isSQLIdentifierByte(sqlText[index]) {
+		index++
+	}
+	if start == index {
+		return -1
+	}
+	return index
+}
+
+func skipSQLParenthesized(sqlText string, index int) int {
+	if index >= len(sqlText) || sqlText[index] != '(' {
+		return -1
+	}
+	depth := 0
+	for index < len(sqlText) {
+		switch sqlText[index] {
+		case '\'':
+			index = skipSQLQuoted(sqlText, index, '\'')
+			if index < 0 {
+				return -1
+			}
+			continue
+		case '"':
+			index = skipSQLQuoted(sqlText, index, '"')
+			if index < 0 {
+				return -1
+			}
+			continue
+		case '$':
+			if next := skipSQLDollarQuoted(sqlText, index); next != index {
+				if next < 0 {
+					return -1
+				}
+				index = next
+				continue
+			}
+		case '-':
+			if index+1 < len(sqlText) && sqlText[index+1] == '-' {
+				index = skipSQLLineComment(sqlText, index+2)
+				continue
+			}
+		case '/':
+			if index+1 < len(sqlText) && sqlText[index+1] == '*' {
+				index = skipSQLBlockComment(sqlText, index)
+				if index < 0 {
+					return -1
+				}
+				continue
+			}
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return index + 1
+			}
+		}
+		index++
+	}
+	return -1
+}
+
+func skipSQLTrivia(sqlText string, index int) int {
+	for index < len(sqlText) {
+		if isSQLSpace(sqlText[index]) {
+			index++
+			continue
+		}
+		if index+1 < len(sqlText) && sqlText[index] == '-' && sqlText[index+1] == '-' {
+			index = skipSQLLineComment(sqlText, index+2)
+			continue
+		}
+		if index+1 < len(sqlText) && sqlText[index] == '/' && sqlText[index+1] == '*' {
+			index = skipSQLBlockComment(sqlText, index)
+			if index < 0 {
+				return len(sqlText)
+			}
+			continue
+		}
+		break
+	}
+	return index
+}
+
+func skipSQLLineComment(sqlText string, index int) int {
+	for index < len(sqlText) && sqlText[index] != '\n' {
+		index++
+	}
+	return index
+}
+
+func skipSQLBlockComment(sqlText string, index int) int {
+	depth := 0
+	for index+1 < len(sqlText) {
+		if sqlText[index] == '/' && sqlText[index+1] == '*' {
+			depth++
+			index += 2
+			continue
+		}
+		if sqlText[index] == '*' && sqlText[index+1] == '/' {
+			depth--
+			index += 2
+			if depth == 0 {
+				return index
+			}
+			continue
+		}
+		index++
+	}
+	return -1
+}
+
+func skipSQLQuoted(sqlText string, index int, quote byte) int {
+	index++
+	for index < len(sqlText) {
+		if sqlText[index] == '\\' && quote == '\'' && index+1 < len(sqlText) {
+			index += 2
+			continue
+		}
+		if sqlText[index] == quote {
+			if index+1 < len(sqlText) && sqlText[index+1] == quote {
+				index += 2
+				continue
+			}
+			return index + 1
+		}
+		index++
+	}
+	return -1
+}
+
+func skipSQLDollarQuoted(sqlText string, index int) int {
+	endTag := index + 1
+	for endTag < len(sqlText) && isSQLDollarTagByte(sqlText[endTag]) {
+		endTag++
+	}
+	if endTag >= len(sqlText) || sqlText[endTag] != '$' {
+		return index
+	}
+	tag := sqlText[index : endTag+1]
+	if end := strings.Index(sqlText[endTag+1:], tag); end >= 0 {
+		return endTag + 1 + end + len(tag)
+	}
+	return -1
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+func isSQLSpace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == '\f'
+}
+
+func isSQLWordStartByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value == '_'
+}
+
+func isSQLIdentifierByte(value byte) bool {
+	return isSQLWordStartByte(value) || value >= '0' && value <= '9' || value == '$' || value >= 0x80
+}
+
+func isSQLDollarTagByte(value byte) bool {
+	return isSQLWordStartByte(value) || value >= '0' && value <= '9'
 }
 
 func quoteIdentifier(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func (s *server) quoteIdentifier(value string) string {
+	if s.mode.mysqlCompat {
+		return "`" + strings.ReplaceAll(value, "`", "``") + "`"
+	}
+	return quoteIdentifier(value)
 }
 
 func quoteLiteral(value string) string {

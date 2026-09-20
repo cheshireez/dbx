@@ -1,5 +1,18 @@
 import type { NacosNamespaceInfo } from "@/types/nacos";
 
+type NacosNamespaceAccessClient = {
+  nacosListNamespaces(connectionId: string): Promise<NacosNamespaceInfo[]>;
+};
+
+/**
+ * The backend returns namespaces verified through authorization metadata, or,
+ * for this explicit user action, by checking configuration and service reads.
+ * It never returns merely enumerable namespaces as selectable access scope.
+ */
+export async function loadReadableNacosNamespaces(connectionId: string, client: NacosNamespaceAccessClient): Promise<NacosNamespaceInfo[]> {
+  return normalizeNacosNamespacesForDisplay(await client.nacosListNamespaces(connectionId));
+}
+
 /**
  * Nacos 2/r-nacos may represent the default namespace with an empty ID, while
  * Nacos 3 returns the concrete `public` ID. Older backend builds could expose

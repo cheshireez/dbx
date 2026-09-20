@@ -28,15 +28,62 @@ const defaultMaxRows = 1000
 const defaultXuguPort = 5138
 const legacyAgentSessionID = "__legacy__"
 const maxAgentSessions = 256
+
+// xuguPublicSynonymScope is a protocol-only namespace for database-global
+// synonyms. It is deliberately not a real schema name (and must never be
+// interpreted as one by metadata queries).
+const xuguPublicSynonymScope = "\x00DBX_XUGU_PUBLIC_SYNONYMS"
+
+// xuguSchedulerJobScope is a protocol-only namespace for database-scoped
+// scheduler jobs. Jobs are not schema objects in Xugu, so keeping them out of
+// a user schema prevents an owner from being implied where none exists.
+const xuguSchedulerJobScope = "\x00DBX_XUGU_SCHEDULER_JOBS"
 const xuguListDatabasesSQL = `
 SELECT DB_NAME
 FROM ALL_DATABASES
 ORDER BY DB_NAME`
 const xuguListSchemasSQL = `
+SELECT s.SCHEMA_NAME AS SCHEMA_NAME, FALSE AS IS_PUBLIC_SCOPE
+FROM ALL_SCHEMAS s
+WHERE s.DB_ID = CURRENT_DB_ID
+UNION
+SELECT '' AS SCHEMA_NAME, TRUE AS IS_PUBLIC_SCOPE
+FROM ALL_SYNONYMS y
+WHERE y.DB_ID = CURRENT_DB_ID
+  AND y.IS_PUBLIC = TRUE
+ORDER BY IS_PUBLIC_SCOPE, SCHEMA_NAME`
+const xuguListSchemasFallbackSQL = `
 SELECT SCHEMA_NAME
 FROM ALL_SCHEMAS
 WHERE DB_ID = CURRENT_DB_ID
 ORDER BY SCHEMA_NAME`
+
+// Xugu exposes storage metadata through SYS_* views scoped to the current
+// database. Keep these statements independent from the generic object
+// catalog so ordinary schema browsing remains unchanged for every driver.
+const xuguListTablespacesSQL = `
+SELECT NODEID, SPACE_ID, SPACE_NAME, DATAFILE_NUM, SPACE_TYPE, MEDIA_ERROR,
+       TOTAL_CHUNK_NUM, FREE_CHUNK_NUM
+FROM SYS_TABLESPACES
+ORDER BY SPACE_ID`
+
+// ALL_* is the ordinary-account view exposed by Xugu. SYS_* is retained as
+// the primary query because it is the stable shape used by the native agent;
+// this fallback lets DBA/normal logins browse the same read-only metadata when
+// their account is not allowed to read the SYS_* views.
+const xuguListAllTablespacesSQL = `
+SELECT NODE_ID, SPACE_ID, SPACE_NAME, DATAFILE_NUM, SPACE_TYPE, MEDIA_ERROR,
+       TOTAL_CHUNK_NUM, FREE_CHUNK_NUM
+FROM ALL_TABLESPACES
+ORDER BY SPACE_ID`
+const xuguListDatafilesSQL = `
+SELECT NODEID, SPACE_ID, PATH, FILE_NO, MAX_SIZE, STEP_SIZE, CURR_SIZE, RESERVED1
+FROM SYS_DATAFILES
+ORDER BY SPACE_ID, FILE_NO`
+const xuguListAllDatafilesSQL = `
+SELECT NODEID, SPACE_ID, PATH, FILE_NO, MAX_SIZE, STEP_SIZE, CURR_SIZE, RESERVED1
+FROM ALL_DATAFILES
+ORDER BY SPACE_ID, FILE_NO`
 const xuguCatalogTableNameSelectSQL = `
 SELECT s.SCHEMA_NAME, t.TABLE_NAME
 FROM ALL_TABLES t
@@ -48,12 +95,12 @@ JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
 WHERE s.DB_ID = CURRENT_DB_ID
   AND q.IS_SYS = FALSE`
 const xuguCatalogSynonymSelectSQL = `
-SELECT s.SCHEMA_NAME, y.SYNO_NAME, t.SCHEMA_NAME AS TARGET_SCHEMA, y.TARG_NAME
+SELECT s.SCHEMA_NAME,
+       y.SYNO_NAME, t.SCHEMA_NAME AS TARGET_SCHEMA, y.TARG_NAME, y.IS_PUBLIC
 FROM ALL_SYNONYMS y
-JOIN ALL_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
+LEFT JOIN ALL_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
 LEFT JOIN ALL_SCHEMAS t ON t.DB_ID = y.DB_ID AND t.SCHEMA_ID = y.TARG_SCHE_ID
-WHERE s.DB_ID = CURRENT_DB_ID
-  AND y.IS_PUBLIC = FALSE`
+WHERE y.DB_ID = CURRENT_DB_ID`
 const xuguPrimaryKeyColumnsSQL = `
 SELECT c.DEFINE
 FROM ALL_CONSTRAINTS c
@@ -92,6 +139,43 @@ WHERE s.DB_ID = CURRENT_DB_ID
   AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
 ORDER BY i.INDEX_NAME`
+
+// Index scope and partition metadata are queried separately from the stable
+// index listing query.  This keeps ordinary index discovery compatible with
+// older Xugu catalog versions while allowing newer versions to preserve
+// LOCAL/GLOBAL partition semantics in reconstructed DDL.
+const xuguIndexPartitionAttributesSQL = `
+SELECT i.INDEX_NAME, i.IS_LOCAL, i.PARTI_TYPE, i.PARTI_NUM, i.PARTI_KEY,
+       i.SUBPARTI_TYPE, i.SUBPARTI_NUM, i.SUBPARTI_KEY
+FROM ALL_INDEXES i
+JOIN ALL_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
+ORDER BY i.INDEX_NAME`
+const xuguIndexPartitionsSQL = `
+SELECT i.INDEX_NAME, p.PARTI_NO, p.PARTI_NAME, p.PARTI_VAL
+FROM ALL_IDX_PARTIS p
+JOIN ALL_INDEXES i ON i.DB_ID = p.DB_ID AND i.INDEX_ID = p.INDEX_ID
+JOIN ALL_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
+  AND i.IS_PRIMARY = FALSE
+ORDER BY i.INDEX_NAME, p.PARTI_NO`
+const xuguIndexSubpartitionsSQL = `
+SELECT i.INDEX_NAME, p.SUBPARTI_NO, p.SUBPARTI_NAME, p.SUBPARTI_VAL
+FROM ALL_IDX_SUBPARTIS p
+JOIN ALL_INDEXES i ON i.DB_ID = p.DB_ID AND i.INDEX_ID = p.INDEX_ID
+JOIN ALL_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
+  AND i.IS_PRIMARY = FALSE
+ORDER BY i.INDEX_NAME, p.SUBPARTI_NO`
 const xuguTableMetadataSQL = `
 SELECT t.TEMP_TYPE, t.ON_COMMIT_DEL, t.PCTFREE, t.COPY_NUM,
        t.PARTI_TYPE, t.PARTI_NUM, t.PARTI_KEY,
@@ -168,33 +252,67 @@ WHERE s.DB_ID = CURRENT_DB_ID
 ORDER BY p.SUBPARTI_NO`
 
 var xuguDataTypes = []string{
-	"BOOLEAN",
-	"INTEGER",
-	"SMALLINT",
 	"BIGINT",
-	"FLOAT",
-	"NUMERIC",
-	"CHAR",
-	"VARCHAR",
-	"CLOB",
-	"DATE",
-	"TIME",
-	"TIMESTAMP",
 	"BINARY",
-	"VARBINARY",
+	"BIT",
 	"BLOB",
-	"XML",
 	"BOOL",
-	"INT",
-	"SHORT",
-	"LONGINT",
-	"LONG",
-	"REAL",
+	"BOOLEAN",
+	"CHAR",
+	"CHAR[]",
+	"CLOB",
+	"CLOB[]",
+	"DATE",
+	"DATETIME",
+	"DATETIME WITH TIME ZONE",
 	"DECIMAL",
-	"TEXT",
+	"DOUBLE",
+	"DOUBLE[]",
+	"FLOAT",
+	"GUID",
+	"GEOMETRY",
+	"GEOGRAPHY",
+	"BOX2D",
+	"BOX3D",
+	"SPHEROID",
+	"RASTER",
+	"INT",
+	"INTEGER",
+	"INTEGER[]",
+	"INTERVAL DAY",
+	"INTERVAL DAY TO HOUR",
+	"INTERVAL DAY TO MINUTE",
+	"INTERVAL DAY TO SECOND",
+	"INTERVAL HOUR",
+	"INTERVAL HOUR TO MINUTE",
+	"INTERVAL HOUR TO SECOND",
+	"INTERVAL MINUTE",
+	"INTERVAL MINUTE TO SECOND",
+	"INTERVAL MONTH",
+	"INTERVAL SECOND",
+	"INTERVAL YEAR",
+	"INTERVAL YEAR TO MONTH",
+	"JSON",
+	"LONG",
+	"LONGINT",
 	"NCHAR",
+	"NUMERIC",
 	"NVARCHAR",
 	"NVARCHAR2",
+	"REAL",
+	"ROWID",
+	"SHORT",
+	"SMALLINT",
+	"TEXT",
+	"TIME",
+	"TIME WITH TIME ZONE",
+	"TIMESTAMP",
+	"TIMESTAMP WITH TIME ZONE",
+	"TINYINT",
+	"VARBINARY",
+	"VARBIT",
+	"VARCHAR",
+	"XML",
 }
 
 type request struct {
@@ -208,11 +326,6 @@ type response struct {
 	ID      json.RawMessage `json:"id,omitempty"`
 	Result  any             `json:"result,omitempty"`
 	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
 }
 
 type connectParams struct {
@@ -236,12 +349,14 @@ type queryOptions struct {
 }
 
 type queryResult struct {
-	Columns         []string `json:"columns"`
-	ColumnTypes     []string `json:"column_types"`
-	Rows            [][]any  `json:"rows"`
-	AffectedRows    int64    `json:"affected_rows"`
-	ExecutionTimeMS int64    `json:"execution_time_ms"`
-	Truncated       bool     `json:"truncated"`
+	Columns         []string        `json:"columns"`
+	ColumnTypes     []string        `json:"column_types"`
+	SpatialColumns  []spatialColumn `json:"spatial_columns,omitempty"`
+	SpatialValues   [][]*uint32     `json:"spatial_values,omitempty"`
+	Rows            [][]any         `json:"rows"`
+	AffectedRows    int64           `json:"affected_rows"`
+	ExecutionTimeMS int64           `json:"execution_time_ms"`
+	Truncated       bool            `json:"truncated"`
 }
 
 func (r queryResult) MarshalJSON() ([]byte, error) {
@@ -260,14 +375,16 @@ func (r queryResult) MarshalJSON() ([]byte, error) {
 }
 
 type queryPageResult struct {
-	Columns         []string `json:"columns"`
-	ColumnTypes     []string `json:"column_types"`
-	Rows            [][]any  `json:"rows"`
-	AffectedRows    int64    `json:"affected_rows"`
-	ExecutionTimeMS int64    `json:"execution_time_ms"`
-	Truncated       bool     `json:"truncated"`
-	SessionID       *string  `json:"session_id"`
-	HasMore         bool     `json:"has_more"`
+	Columns         []string        `json:"columns"`
+	ColumnTypes     []string        `json:"column_types"`
+	SpatialColumns  []spatialColumn `json:"spatial_columns,omitempty"`
+	SpatialValues   [][]*uint32     `json:"spatial_values,omitempty"`
+	Rows            [][]any         `json:"rows"`
+	AffectedRows    int64           `json:"affected_rows"`
+	ExecutionTimeMS int64           `json:"execution_time_ms"`
+	Truncated       bool            `json:"truncated"`
+	SessionID       *string         `json:"session_id"`
+	HasMore         bool            `json:"has_more"`
 }
 
 func (r queryPageResult) MarshalJSON() ([]byte, error) {
@@ -286,15 +403,40 @@ func (r queryPageResult) MarshalJSON() ([]byte, error) {
 }
 
 type querySession struct {
-	rows        *sql.Rows
-	columns     []string
-	columnTypes []string
-	pending     []any
-	remaining   int
+	rows           *sql.Rows
+	columns        []string
+	columnTypes    []string
+	scanner        *xuguRowScanner
+	pending        []any
+	pendingSpatial []*uint32
+	remaining      int
 }
 
 type databaseInfo struct {
 	Name string `json:"name"`
+}
+
+type xuguDatafileInfo struct {
+	NodeID    string  `json:"node_id"`
+	SpaceID   int64   `json:"space_id"`
+	Path      string  `json:"path"`
+	FileNo    int64   `json:"file_no"`
+	MaxSize   *int64  `json:"max_size"`
+	StepSize  *int64  `json:"step_size"`
+	CurrSize  *int64  `json:"curr_size"`
+	Reserved1 *string `json:"reserved1"`
+}
+
+type xuguTablespaceInfo struct {
+	NodeID        string             `json:"node_id"`
+	SpaceID       int64              `json:"space_id"`
+	SpaceName     string             `json:"space_name"`
+	DatafileNum   int64              `json:"datafile_num"`
+	SpaceType     string             `json:"space_type"`
+	MediaError    *string            `json:"media_error"`
+	TotalChunkNum *int64             `json:"total_chunk_num"`
+	FreeChunkNum  *int64             `json:"free_chunk_num"`
+	Datafiles     []xuguDatafileInfo `json:"datafiles"`
 }
 
 type tableInfo struct {
@@ -348,7 +490,20 @@ type indexInfo struct {
 	IndexType       *string  `json:"index_type"`
 	IncludedColumns []string `json:"included_columns"`
 	Comment         *string  `json:"comment"`
-	keys            []xuguIndexKey
+	// Partition fields are intentionally internal. The generic DBX index
+	// protocol does not yet model Xugu-specific index partition clauses, but
+	// the DDL exporter must retain them to avoid changing index semantics.
+	IsLocal             bool                `json:"-"`
+	PartitionType       int                 `json:"-"`
+	PartitionCount      int                 `json:"-"`
+	PartitionKey        string              `json:"-"`
+	SubpartitionType    int                 `json:"-"`
+	SubpartitionCount   int                 `json:"-"`
+	SubpartitionKey     string              `json:"-"`
+	PartitionRowsLoaded bool                `json:"-"`
+	IndexPartitions     []xuguPartitionInfo `json:"-"`
+	IndexSubpartitions  []xuguPartitionInfo `json:"-"`
+	keys                []xuguIndexKey
 }
 
 func (i indexInfo) MarshalJSON() ([]byte, error) {
@@ -457,6 +612,7 @@ type xuguCatalogSynonym struct {
 	Name         string
 	TargetSchema sql.NullString
 	TargetName   string
+	Public       bool
 }
 
 // xuguIndexKey preserves the catalog spelling and SQL semantics of an index
@@ -523,6 +679,7 @@ type server struct {
 	activeRows        map[*sql.Rows]context.CancelFunc
 	activeTimer       *time.Timer
 	activeTimedOut    bool
+	activeCanceled    bool
 	// killSession, if non-nil, is called to force-kill the current
 	// statement on the database server. Tests may replace it with a
 	// stub. The real implementation is set during connectWithControl.
@@ -603,14 +760,14 @@ func newRuntimeServer() *runtimeServer {
 func (r *runtimeServer) handleLine(line string) (response, bool) {
 	var req request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		return errorResponse(nil, err), false
+		return errorResponse(nil, "", "", err), false
 	}
 	if len(req.ID) == 0 {
 		req.ID = json.RawMessage("1")
 	}
 	result, shutdown, err := r.dispatch(req.Method, req.Params)
 	if err != nil {
-		return errorResponse(req.ID, err), false
+		return errorResponse(req.ID, req.Method, stringParam(req.Params, "agentSessionId"), err), false
 	}
 	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, shutdown
 }
@@ -621,7 +778,7 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 		return map[string]any{
 			"protocolVersion":      multiSessionProtocolVersion,
 			"agentProtocolVersion": multiSessionProtocolVersion,
-			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "ddl", "multi_session"},
+			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "ddl", "structured_error_v1", "multi_session"},
 		}, false, nil
 	case "open_session":
 		agentSessionID := stringParam(params, "agentSessionId")
@@ -695,7 +852,7 @@ func (r *runtimeServer) openSession(agentSessionID string, params connectParams)
 	}
 	if len(r.sessions) >= maxAgentSessions {
 		r.mu.Unlock()
-		return fmt.Errorf("agent session limit reached: %d", maxAgentSessions)
+		return fmt.Errorf("%w: %d", errAgentSessionLimit, maxAgentSessions)
 	}
 	r.mu.Unlock()
 
@@ -761,7 +918,7 @@ func (r *runtimeServer) registerSession(agentSessionID string, server *server, c
 	if len(r.sessions) >= maxAgentSessions {
 		_ = server.disconnect()
 		r.releaseControl(controlKey)
-		return fmt.Errorf("agent session limit reached: %d", maxAgentSessions)
+		return fmt.Errorf("%w: %d", errAgentSessionLimit, maxAgentSessions)
 	}
 	r.sessions[agentSessionID] = session
 	return nil
@@ -795,7 +952,7 @@ func (r *runtimeServer) session(agentSessionID string) (*agentSession, error) {
 	session := r.sessions[agentSessionID]
 	r.mu.RUnlock()
 	if session == nil {
-		return nil, fmt.Errorf("agent session not found: %s", agentSessionID)
+		return nil, fmt.Errorf("%w: %s", errAgentSessionNotFound, agentSessionID)
 	}
 	return session, nil
 }
@@ -881,14 +1038,14 @@ func (r *runtimeServer) closeAllSessions() error {
 func (s *server) handleLine(line string) (response, bool) {
 	var req request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		return errorResponse(nil, err), false
+		return errorResponse(nil, "", "", err), false
 	}
 	if len(req.ID) == 0 {
 		req.ID = json.RawMessage("1")
 	}
 	result, shutdown, err := s.dispatch(req.Method, req.Params)
 	if err != nil {
-		return errorResponse(req.ID, err), false
+		return errorResponse(req.ID, req.Method, stringParam(req.Params, "agentSessionId"), err), false
 	}
 	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, shutdown
 }
@@ -927,6 +1084,14 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		return map[string]bool{"ok": true}, false, s.validateConnection()
 	case "list_databases":
 		result, err := s.listDatabases()
+		return result, false, err
+	case "list_xugu_tablespaces":
+		if database := stringParam(params, "database"); database != "" {
+			if err := s.useDatabase(database); err != nil {
+				return nil, false, err
+			}
+		}
+		result, err := s.listTablespaces()
 		return result, false, err
 	case "list_schemas":
 		if err := s.useDatabase(stringParam(params, "database")); err != nil {
@@ -1219,6 +1384,9 @@ func (s *server) validateConnection() error {
 }
 
 func openDB(params connectParams) (*sql.DB, error) {
+	if configuredDatabaseName(params) == "" {
+		return nil, errors.New("XuguDB requires an existing database name; set Database or include DB in the connection string")
+	}
 	dsn := buildDSN(params)
 	db, err := sql.Open("xugu", dsn)
 	if err != nil {
@@ -1592,6 +1760,84 @@ func fallbackDatabasesFromParams(params connectParams) []databaseInfo {
 	return nil
 }
 
+func (s *server) listTablespaces() ([]xuguTablespaceInfo, error) {
+	spaceRows, err := s.queryRows(xuguListTablespacesSQL, nil)
+	if err != nil && isXuguMetadataUnavailableError(err) {
+		spaceRows, err = s.queryRows(xuguListAllTablespacesSQL, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(spaceRows)
+
+	spaces := make([]xuguTablespaceInfo, 0)
+	spaceIndex := make(map[int64]int)
+	for spaceRows.Next() {
+		values, err := scanRow(spaceRows, 8)
+		if err != nil {
+			return nil, err
+		}
+		space := xuguTablespaceInfo{
+			NodeID:        xuguString(values[0]),
+			SpaceID:       xuguInt64(values[1]),
+			SpaceName:     xuguString(values[2]),
+			DatafileNum:   xuguInt64(values[3]),
+			SpaceType:     xuguString(values[4]),
+			MediaError:    optionalStringPtr(values[5]),
+			TotalChunkNum: optionalInt64(values[6]),
+			FreeChunkNum:  optionalInt64(values[7]),
+			Datafiles:     []xuguDatafileInfo{},
+		}
+		spaceIndex[space.SpaceID] = len(spaces)
+		spaces = append(spaces, space)
+	}
+	if err := spaceRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(spaces) == 0 {
+		return spaces, nil
+	}
+
+	fileRows, err := s.queryRows(xuguListDatafilesSQL, nil)
+	if err != nil {
+		// Accounts may inspect the parent view without being allowed to read
+		// physical file paths. Keep the parent rows usable in that case.
+		if isXuguMetadataUnavailableError(err) {
+			fileRows, err = s.queryRows(xuguListAllDatafilesSQL, nil)
+			if err != nil && isXuguMetadataUnavailableError(err) {
+				return spaces, nil
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer s.closeRows(fileRows)
+	for fileRows.Next() {
+		values, err := scanRow(fileRows, 8)
+		if err != nil {
+			return nil, err
+		}
+		file := xuguDatafileInfo{
+			NodeID:    xuguString(values[0]),
+			SpaceID:   xuguInt64(values[1]),
+			Path:      xuguString(values[2]),
+			FileNo:    xuguInt64(values[3]),
+			MaxSize:   optionalInt64(values[4]),
+			StepSize:  optionalInt64(values[5]),
+			CurrSize:  optionalInt64(values[6]),
+			Reserved1: optionalStringPtr(values[7]),
+		}
+		if index, ok := spaceIndex[file.SpaceID]; ok {
+			spaces[index].Datafiles = append(spaces[index].Datafiles, file)
+		}
+	}
+	if err := fileRows.Err(); err != nil {
+		return nil, err
+	}
+	return spaces, nil
+}
+
 func configuredDatabaseName(params connectParams) string {
 	if name := strings.TrimSpace(params.Database); name != "" {
 		return name
@@ -1624,7 +1870,7 @@ func isXuguMetadataAccessError(err error) bool {
 	catalogObject := false
 	for _, object := range []string{
 		"DATABASES", "SCHEMAS", "TABLES", "VIEWS", "COLUMNS", "CONSTRAINTS", "INDEXES",
-		"TRIGGERS", "PARTIS", "SUBPARTIS", "SEQUENCES", "SYNONYMS", "PROCEDURES", "PACKAGES", "TYPES",
+		"TRIGGERS", "PARTIS", "SUBPARTIS", "IDX_PARTIS", "IDX_SUBPARTIS", "SEQUENCES", "SYNONYMS", "JOBS", "PROCEDURES", "PACKAGES", "TYPES", "TABLESPACES", "DATAFILES",
 	} {
 		if strings.Contains(message, "ALL_"+object) || strings.Contains(message, "SYS_"+object) {
 			catalogObject = true
@@ -1677,33 +1923,127 @@ func isXuguMissingOnNullColumnError(err error) bool {
 }
 
 func xuguDSNValue(dsn string, key string) string {
-	for _, part := range strings.Split(dsn, ";") {
+	var result string
+	for _, part := range splitXuguDSNSegments(dsn) {
 		name, value, ok := strings.Cut(part, "=")
 		if ok && strings.EqualFold(strings.TrimSpace(name), key) {
-			return strings.TrimSpace(value)
+			value = strings.TrimSpace(value)
+			if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+				value = strings.ReplaceAll(value[1:len(value)-1], "''", "'")
+			}
+			result = strings.TrimSpace(value)
 		}
 	}
-	return ""
+	return result
+}
+
+func splitXuguDSNSegments(dsn string) []string {
+	var segments []string
+	var current strings.Builder
+	inQuotes := false
+
+	for index := 0; index < len(dsn); index++ {
+		character := dsn[index]
+		if character == '\'' {
+			current.WriteByte(character)
+			if inQuotes && index+1 < len(dsn) && dsn[index+1] == '\'' {
+				current.WriteByte(dsn[index+1])
+				index++
+			} else {
+				inQuotes = !inQuotes
+			}
+			continue
+		}
+		if character == ';' && !inQuotes {
+			segments = append(segments, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(character)
+	}
+
+	segments = append(segments, current.String())
+	return segments
 }
 
 func (s *server) listSchemas() ([]string, error) {
 	rows, err := s.queryRows(xuguListSchemasSQL, nil)
 	if err != nil {
-		if fallback := strings.ToUpper(strings.TrimSpace(s.params.Username)); fallback != "" && isXuguMetadataUnavailableError(err) {
-			return []string{fallback}, nil
+		rows, err = s.queryRows(xuguListSchemasFallbackSQL, nil)
+		if err != nil {
+			if fallback := strings.ToUpper(strings.TrimSpace(s.params.Username)); fallback != "" && isXuguMetadataUnavailableError(err) {
+				return []string{fallback}, nil
+			}
+			return nil, err
 		}
-		return nil, err
+		result, scanErr := s.scanXuguSchemaRows(rows, false)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		return s.appendXuguSchedulerJobScope(result)
 	}
+	result, scanErr := s.scanXuguSchemaRows(rows, true)
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	return s.appendXuguSchedulerJobScope(result)
+}
+
+// appendXuguSchedulerJobScope exposes the database-global scheduler job group.
+// Scheduler jobs are discovered from the role-scoped *_JOBS catalog when the
+// group is expanded. Keep the group even if that catalog is empty so users can
+// distinguish an empty database from an unavailable navigator capability.
+func (s *server) appendXuguSchedulerJobScope(schemas []string) ([]string, error) {
+	schemas = append(schemas, xuguSchedulerJobScope)
+	return dedupeXuguSchemaNames(schemas), nil
+}
+
+func (s *server) scanXuguSchemaRows(rows *sql.Rows, includesPublicScope bool) ([]string, error) {
 	defer s.closeRows(rows)
 	var result []string
 	for rows.Next() {
-		var schema string
-		if err := rows.Scan(&schema); err != nil {
+		var schema sql.NullString
+		var publicScope bool
+		var err error
+		if includesPublicScope {
+			err = rows.Scan(&schema, &publicScope)
+		} else {
+			err = rows.Scan(&schema)
+		}
+		if err != nil {
 			return nil, err
 		}
-		result = append(result, schema)
+		if publicScope {
+			result = append(result, xuguPublicSynonymScope)
+		} else if schema.Valid && schema.String != "" {
+			result = append(result, schema.String)
+		}
 	}
-	return emptyIfNil(result), rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dedupeXuguSchemaNames(result), nil
+}
+
+func dedupeXuguSchemaNames(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+	return emptyIfNil(result)
+}
+
+func isXuguPublicSynonymScope(schema string) bool {
+	return strings.TrimSpace(schema) == xuguPublicSynonymScope
+}
+
+func isXuguSchedulerJobScope(schema string) bool {
+	return strings.TrimSpace(schema) == xuguSchedulerJobScope
 }
 
 func (s *server) currentSchema() (string, error) {
@@ -1878,6 +2218,9 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	if isOnlyXuguObjectType(constraints, "TRIGGER") {
 		return s.listSchemaTriggers(schema, constraints)
 	}
+	if isXuguSchedulerJobScope(schema) {
+		return s.listSchedulerJobs(constraints)
+	}
 	query := xuguListObjectsQuery(schema, constraints)
 	rows, err := s.queryRows(query.SQL, query.Args)
 	if err != nil {
@@ -1946,6 +2289,19 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	}
 	defer s.closeRows(rows)
 	return readXuguObjectRows(rows, schema)
+}
+
+func (s *server) listSchedulerJobs(constraints metadataListConstraints) ([]objectInfo, error) {
+	query := xuguSchedulerJobsQuery(constraints)
+	rows, err := s.queryRows(query.SQL, query.Args)
+	if err != nil {
+		if isXuguMetadataUnavailableError(err) {
+			return []objectInfo{}, nil
+		}
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	return readXuguObjectRows(rows, xuguSchedulerJobScope)
 }
 
 func isOnlyXuguObjectType(constraints metadataListConstraints, objectType string) bool {
@@ -2160,6 +2516,24 @@ WHERE s.DB_ID = CURRENT_DB_ID
 }
 
 func xuguListObjectsQuery(schema string, constraints metadataListConstraints) xuguMetadataListQuery {
+	// Public synonyms have no owning schema in Xugu. They are queried only
+	// through the reserved protocol scope; a real schema named GUEST remains
+	// a normal private-synonym namespace.
+	publicSynonymScope := isXuguPublicSynonymScope(schema)
+	synonymSQL := `
+SELECT y.SYNO_NAME AS OBJECT_NAME, 'SYNONYM' AS OBJECT_TYPE, NULL AS COMMENTS, y.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
+FROM ALL_SYNONYMS y
+WHERE y.DB_ID = CURRENT_DB_ID
+  AND y.IS_PUBLIC = TRUE`
+	if !publicSynonymScope {
+		synonymSQL = `
+SELECT y.SYNO_NAME AS OBJECT_NAME, 'SYNONYM' AS OBJECT_TYPE, NULL AS COMMENTS, y.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
+FROM ALL_SYNONYMS y
+JOIN ALL_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
+WHERE y.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND y.IS_PUBLIC = FALSE`
+	}
 	type objectSource struct {
 		objectTypes []string
 		sql         string
@@ -2211,13 +2585,7 @@ JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
 WHERE s.DB_ID = CURRENT_DB_ID
   AND UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND q.IS_SYS = FALSE`},
-		{objectTypes: []string{"SYNONYM"}, sql: `
-SELECT y.SYNO_NAME AS OBJECT_NAME, 'SYNONYM' AS OBJECT_TYPE, NULL AS COMMENTS, y.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
-FROM ALL_SYNONYMS y
-JOIN ALL_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
-WHERE s.DB_ID = CURRENT_DB_ID
-  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
-	AND y.IS_PUBLIC = FALSE`},
+		{objectTypes: []string{"SYNONYM"}, sql: synonymSQL},
 		{objectTypes: []string{"TYPE"}, sql: `
 SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE' AS OBJECT_TYPE, u.COMMENTS, u.VALID,
 	       CASE WHEN u.UDT_TYPE = 1001 THEN TRUE ELSE FALSE END AS XUGU_TYPE_MEMBERS_EXPANDABLE
@@ -2263,7 +2631,9 @@ WHERE s.DB_ID = CURRENT_DB_ID
 	baseArgs := make([]any, 0, len(baseSources))
 	for _, source := range baseSources {
 		baseSQLParts = append(baseSQLParts, source.sql)
-		baseArgs = append(baseArgs, schema)
+		if !(publicSynonymScope && len(source.objectTypes) == 1 && source.objectTypes[0] == "SYNONYM") {
+			baseArgs = append(baseArgs, schema)
+		}
 	}
 	return xuguConstrainedMetadataListQuery(
 		strings.Join(baseSQLParts, "\nUNION ALL\n"),
@@ -2273,6 +2643,16 @@ WHERE s.DB_ID = CURRENT_DB_ID
 		baseArgs,
 		constraints,
 	)
+}
+
+func xuguSchedulerJobsQuery(constraints metadataListConstraints) xuguMetadataListQuery {
+	return xuguConstrainedMetadataListQuery(`
+SELECT j.JOB_NAME AS OBJECT_NAME, 'JOB' AS OBJECT_TYPE, j.COMMENTS,
+       NULL AS VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
+FROM ALL_JOBS j
+WHERE j.DB_ID = CURRENT_DB_ID`,
+		"OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID, XUGU_TYPE_MEMBERS_EXPANDABLE",
+		"OBJECT_NAME", "OBJECT_TYPE", nil, constraints)
 }
 
 func xuguConstrainedMetadataListQuery(baseSQL, selectList, nameColumn, typeColumn string, baseArgs []any, constraints metadataListConstraints) xuguMetadataListQuery {
@@ -2335,7 +2715,7 @@ func normalizedXuguObjectTypes(values []string) []string {
 			normalized = "TABLE"
 		case "VIEW":
 			normalized = "VIEW"
-		case "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY":
+		case "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY", "JOB":
 			// Already normalized.
 		default:
 			continue
@@ -2422,11 +2802,32 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 		item.DataType = normalizeXuguColumnType(item.DataType, varying)
 		item.IsNullable = !truthy(notNull)
 		item.DefaultOnNull = xuguInt(onNull)
-		item.IsPrimaryKey = primaryKeys[item.Name]
+		item.IsPrimaryKey = xuguPrimaryKeyMatches(item.Name, primaryKeys)
 		item.NumericPrecision, item.NumericScale, item.CharacterMaximumLength = decodeXuguScale(item.DataType, scale)
 		result = append(result, item)
 	}
-	return emptyIfNil(result), rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = s.closeRows(rows)
+		return nil, err
+	}
+	if err := s.closeRows(rows); err != nil {
+		return nil, err
+	}
+
+	// Xugu exposes IDENTITY/AUTO_INCREMENT columns through the serial
+	// metadata catalogs rather than through DEF_VAL. Enrich the common column
+	// contract with the value already understood by the desktop data generator.
+	// This lookup is deliberately optional: an account may read ALL_COLUMNS
+	// while lacking access to ALL_SEQUENCES, and that must not make ordinary
+	// column metadata unavailable.
+	if identities, identityErr := s.tableIdentities(schema, table); identityErr == nil {
+		for index := range result {
+			if xuguIdentityMatchesColumn(result[index].Name, identities) {
+				result[index].Extra = stringPtr("auto_increment")
+			}
+		}
+	}
+	return emptyIfNil(result), nil
 }
 
 func (s *server) queryColumnRows(schema, table string) (*sql.Rows, bool, error) {
@@ -2459,7 +2860,7 @@ func (s *server) columnsFromSelect(schema, table string, primaryKeys map[string]
 		item := columnInfo{
 			Name:         columnType.Name(),
 			DataType:     columnType.DatabaseTypeName(),
-			IsPrimaryKey: primaryKeys[columnType.Name()],
+			IsPrimaryKey: xuguPrimaryKeyMatches(columnType.Name(), primaryKeys),
 		}
 		if nullable, ok := columnType.Nullable(); ok {
 			item.IsNullable = nullable
@@ -2517,6 +2918,24 @@ func (s *server) primaryKeyColumns(schema, table string) (map[string]bool, error
 	return result, rows.Err()
 }
 
+// Xugu may report an unquoted primary-key name with a different case from
+// ALL_COLUMNS (for example, DEFINE contains "ID" while COL_NAME is "id").
+// Exact matches always win so quoted identifiers that differ only by case stay
+// distinct; a case-insensitive fallback is used only when it identifies one
+// primary-key column.
+func xuguPrimaryKeyMatches(columnName string, primaryKeys map[string]bool) bool {
+	if primaryKeys[columnName] {
+		return true
+	}
+	matches := 0
+	for primaryKey := range primaryKeys {
+		if strings.EqualFold(primaryKey, columnName) {
+			matches++
+		}
+	}
+	return matches == 1
+}
+
 func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
 	catalogSchema, catalogTable, err := s.resolveCatalogTableName(schema, table)
 	if err != nil {
@@ -2555,7 +2974,88 @@ func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
 		item.IncludedColumns = []string{}
 		result = append(result, item)
 	}
+	// LOCAL/GLOBAL attributes are best-effort metadata. Keep the stable index
+	// listing usable when an older Xugu catalog does not expose these columns.
+	s.loadIndexPartitionMetadata(catalogSchema, catalogTable, result)
 	return emptyIfNil(result), rows.Err()
+}
+
+// loadIndexPartitionMetadata enriches the stable index list with Xugu's
+// partition scope and partition definitions. The generic DBX index payload
+// does not expose these Xugu-specific fields, so they remain internal and are
+// consumed by table DDL reconstruction only.
+func (s *server) loadIndexPartitionMetadata(schema, table string, indexes []indexInfo) {
+	if len(indexes) == 0 {
+		return
+	}
+	byName := make(map[string]*indexInfo, len(indexes))
+	for i := range indexes {
+		byName[indexes[i].Name] = &indexes[i]
+	}
+
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguIndexPartitionAttributesSQL, schema, table), nil)
+	if err != nil {
+		return
+	}
+	func() {
+		defer s.closeRows(rows)
+		for rows.Next() {
+			var name, local, partitionType, partitionCount, partitionKey any
+			var subpartitionType, subpartitionCount, subpartitionKey any
+			if err := rows.Scan(&name, &local, &partitionType, &partitionCount, &partitionKey,
+				&subpartitionType, &subpartitionCount, &subpartitionKey); err != nil {
+				return
+			}
+			item := byName[xuguString(name)]
+			if item == nil {
+				continue
+			}
+			item.IsLocal = truthy(local)
+			item.PartitionType = xuguInt(partitionType)
+			item.PartitionCount = xuguInt(partitionCount)
+			item.PartitionKey = xuguString(partitionKey)
+			item.SubpartitionType = xuguInt(subpartitionType)
+			item.SubpartitionCount = xuguInt(subpartitionCount)
+			item.SubpartitionKey = xuguString(subpartitionKey)
+		}
+	}()
+
+	rows, err = s.queryRows(xuguTableCatalogQuery(xuguIndexPartitionsSQL, schema, table), nil)
+	if err != nil {
+		return
+	}
+	func() {
+		defer s.closeRows(rows)
+		for rows.Next() {
+			var name, position, partitionName, partitionValue any
+			if err := rows.Scan(&name, &position, &partitionName, &partitionValue); err != nil {
+				return
+			}
+			if item := byName[xuguString(name)]; item != nil {
+				item.IndexPartitions = append(item.IndexPartitions, xuguPartitionInfo{
+					Name: xuguString(partitionName), Value: xuguString(partitionValue),
+				})
+				item.PartitionRowsLoaded = true
+			}
+		}
+	}()
+
+	rows, err = s.queryRows(xuguTableCatalogQuery(xuguIndexSubpartitionsSQL, schema, table), nil)
+	if err != nil {
+		return
+	}
+	defer s.closeRows(rows)
+	for rows.Next() {
+		var name, position, partitionName, partitionValue any
+		if err := rows.Scan(&name, &position, &partitionName, &partitionValue); err != nil {
+			return
+		}
+		if item := byName[xuguString(name)]; item != nil {
+			item.IndexSubpartitions = append(item.IndexSubpartitions, xuguPartitionInfo{
+				Name: xuguString(partitionName), Value: xuguString(partitionValue),
+			})
+		}
+	}
 }
 
 func (s *server) listForeignKeys(schema, table string) ([]foreignKeyInfo, error) {
@@ -2694,6 +3194,13 @@ func (s *server) listSubpartitions(schema, table string) ([]subpartitionInfo, er
 }
 
 func (s *server) getObjectSource(schema, name, objectType string) (map[string]any, error) {
+	if strings.EqualFold(strings.TrimSpace(objectType), "JOB") {
+		result, err := s.getSchedulerJobSource(schema, name)
+		if err != nil && isXuguMetadataUnavailableError(err) {
+			return xuguUnavailableObjectSource(schema, name, objectType), nil
+		}
+		return result, err
+	}
 	if strings.EqualFold(strings.TrimSpace(objectType), "SEQUENCE") {
 		result, err := s.getSequenceSource(schema, name)
 		if err != nil && isXuguMetadataAccessError(err) {
@@ -2740,6 +3247,188 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 		result["editable"] = false
 	}
 	return result, rows.Err()
+}
+
+type xuguSchedulerJobMetadata struct {
+	Name           string
+	JobType        any
+	ParameterCount any
+	Action         any
+	BeginTime      any
+	RepeatInterval any
+	EndTime        any
+	Enabled        any
+	AutoDrop       any
+	Comments       any
+}
+
+const xuguCatalogSchedulerJobNameSelectSQL = `
+SELECT JOB_NAME
+FROM ALL_JOBS
+WHERE DB_ID = CURRENT_DB_ID`
+
+// getSchedulerJobSource reconstructs a replayable DBMS_SCHEDULER.CREATE_JOB
+// call from the catalog. Xugu stores jobs at database scope rather than under
+// a schema, so the returned synthetic scope is retained for sidebar routing.
+func (s *server) getSchedulerJobSource(schema, name string) (map[string]any, error) {
+	if !isXuguSchedulerJobScope(schema) {
+		return nil, errors.New("scheduler jobs must be read from the scheduler job scope")
+	}
+	jobName, err := s.resolveCatalogSchedulerJobName(name)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.queryRows(xuguSchedulerJobMetadataQuery(jobName), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+
+	result := map[string]any{
+		"name":        jobName,
+		"object_type": "JOB",
+		"schema":      xuguSchedulerJobScope,
+		"source":      "",
+		"editable":    false,
+	}
+	if !rows.Next() {
+		return result, rows.Err()
+	}
+	var job xuguSchedulerJobMetadata
+	if err := rows.Scan(
+		&job.Name, &job.JobType, &job.ParameterCount, &job.Action, &job.BeginTime,
+		&job.RepeatInterval, &job.EndTime, &job.Enabled, &job.AutoDrop, &job.Comments,
+	); err != nil {
+		return nil, err
+	}
+	result["name"] = job.Name
+	result["source"] = renderXuguSchedulerJobDDL(job)
+	return result, rows.Err()
+}
+
+func (s *server) resolveCatalogSchedulerJobName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("scheduler job name is required")
+	}
+	candidates, err := s.catalogSchedulerJobNameCandidates(xuguCatalogSchedulerJobNameQuery(name, false))
+	if err != nil {
+		return "", err
+	}
+	if len(candidates) == 0 {
+		candidates, err = s.catalogSchedulerJobNameCandidates(xuguCatalogSchedulerJobNameQuery(name, true))
+		if err != nil {
+			return "", err
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate == name {
+			return candidate, nil
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("scheduler job not found: %s", name)
+	}
+	return "", fmt.Errorf("scheduler job name is ambiguous: %s; specify the catalog's exact case", name)
+}
+
+func xuguCatalogSchedulerJobNameQuery(name string, caseInsensitive bool) string {
+	expr := quoteStringLiteral(name)
+	if caseInsensitive {
+		expr = quoteStringLiteral(strings.ToUpper(name))
+		return xuguCatalogSchedulerJobNameSelectSQL + "\n  AND UPPER(JOB_NAME) = " + expr
+	}
+	return xuguCatalogSchedulerJobNameSelectSQL + "\n  AND JOB_NAME = " + expr
+}
+
+func (s *server) catalogSchedulerJobNameCandidates(query string) ([]string, error) {
+	rows, err := s.queryRows(strings.TrimSpace(query), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	var result []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		result = append(result, name)
+	}
+	return result, rows.Err()
+}
+
+func xuguSchedulerJobMetadataQuery(name string) string {
+	// Keep DATETIME values on the textual path. The Go driver decodes a raw
+	// DATETIME catalog value before database/sql can preserve its NULL state;
+	// TO_CHAR lets SQL NULL pass through as nil instead of becoming a bogus
+	// time.Time value in the reconstructed CREATE_JOB call.
+	return `
+SELECT JOB_NAME, JOB_TYPE, JOB_PARAM_NUM, TO_CHAR(JOB_ACTION),
+       TO_CHAR(BEGIN_T), REPET_INTERVAL, TO_CHAR(END_T), ENABLE, AUTO_DROP, COMMENTS
+FROM ALL_JOBS
+WHERE DB_ID = CURRENT_DB_ID
+  AND JOB_NAME = ` + quoteStringLiteral(name)
+}
+
+func xuguNullableSchedulerLiteral(value any) string {
+	normalized := normalizeValue(value)
+	if normalized == nil {
+		return "NULL"
+	}
+	// TO_CHAR(NULL) should arrive as nil, but some Xugu versions expose an
+	// empty string for optional catalog values. Treat both representations as
+	// SQL NULL so the generated call remains replayable.
+	if text, ok := normalized.(string); ok && strings.TrimSpace(text) == "" {
+		return "NULL"
+	}
+	return quoteStringLiteral(xuguString(normalized))
+}
+
+// Xugu stores an END_T/END_DATE value supplied as SQL NULL using a catalog
+// sentinel. The native driver exposes that sentinel as an 1816 timestamp when
+// the raw DATETIME column is scanned, while TO_CHAR(END_T) exposes the same
+// value as 9999-12-31. Neither value is a real user-specified end date; both
+// mean that the scheduler job has no end time and must be replayed as NULL.
+func xuguNullableSchedulerEndTimeLiteral(value any) string {
+	normalized := normalizeValue(value)
+	if normalized == nil {
+		return "NULL"
+	}
+	text := strings.TrimSpace(fmt.Sprint(normalized))
+	if text == "" || strings.HasPrefix(text, "1816-03-30") || strings.HasPrefix(text, "9999-12-31") {
+		return "NULL"
+	}
+	return xuguNullableSchedulerLiteral(normalized)
+}
+
+func renderXuguSchedulerJobDDL(job xuguSchedulerJobMetadata) string {
+	var builder strings.Builder
+	builder.WriteString("EXEC DBMS_SCHEDULER.CREATE_JOB(\n  ")
+	builder.WriteString(quoteStringLiteral(job.Name))
+	builder.WriteString(",\n  ")
+	builder.WriteString(xuguNullableSchedulerLiteral(job.JobType))
+	builder.WriteString(",\n  ")
+	builder.WriteString(xuguNullableSchedulerLiteral(job.Action))
+	builder.WriteString(",\n  ")
+	builder.WriteString(strconv.Itoa(xuguInt(job.ParameterCount)))
+	builder.WriteString(",\n  ")
+	builder.WriteString(xuguNullableSchedulerLiteral(job.BeginTime))
+	builder.WriteString(",\n  ")
+	builder.WriteString(xuguNullableSchedulerLiteral(job.RepeatInterval))
+	builder.WriteString(",\n  ")
+	builder.WriteString(xuguNullableSchedulerEndTimeLiteral(job.EndTime))
+	builder.WriteString(",\n  'default_class',\n  ")
+	builder.WriteString(strconv.FormatBool(truthy(job.Enabled)))
+	builder.WriteString(",\n  ")
+	builder.WriteString(strconv.FormatBool(truthy(job.AutoDrop)))
+	builder.WriteString(",\n  ")
+	builder.WriteString(xuguNullableSchedulerLiteral(job.Comments))
+	builder.WriteString("\n);")
+	return builder.String()
 }
 
 func xuguUnavailableObjectSource(schema, name, objectType string) map[string]any {
@@ -2929,9 +3618,9 @@ func renderXuguSequenceDDL(sequence xuguSequenceMetadata) string {
 	return builder.String()
 }
 
-// getSynonymSource reconstructs private synonym DDL from ALL_SYNONYMS. Public
-// synonyms deliberately remain outside schema groups: their catalog rows have
-// no owning schema and showing them in every schema would duplicate objects.
+// getSynonymSource reconstructs synonym DDL from ALL_SYNONYMS. Public
+// synonyms are exposed in the reserved database-global scope and therefore
+// use PUBLIC syntax without a schema qualifier.
 func (s *server) getSynonymSource(schema, name string) (map[string]any, error) {
 	synonym, err := s.resolveCatalogSynonym(schema, name)
 	if err != nil {
@@ -2942,10 +3631,15 @@ func (s *server) getSynonymSource(schema, name string) (map[string]any, error) {
 	}
 
 	var builder strings.Builder
-	builder.WriteString("CREATE SYNONYM ")
-	builder.WriteString(quoteIdentifier(synonym.Schema))
-	builder.WriteByte('.')
-	builder.WriteString(quoteIdentifier(synonym.Name))
+	if synonym.Public {
+		builder.WriteString("CREATE PUBLIC SYNONYM ")
+		builder.WriteString(quoteIdentifier(synonym.Name))
+	} else {
+		builder.WriteString("CREATE SYNONYM ")
+		builder.WriteString(quoteIdentifier(synonym.Schema))
+		builder.WriteByte('.')
+		builder.WriteString(quoteIdentifier(synonym.Name))
+	}
 	builder.WriteString("\nFOR ")
 	if targetSchema := strings.TrimSpace(synonym.TargetSchema.String); targetSchema != "" {
 		builder.WriteString(quoteIdentifier(targetSchema))
@@ -2996,13 +3690,20 @@ func (s *server) resolveCatalogSynonym(schema, name string) (xuguCatalogSynonym,
 func xuguCatalogSynonymQuery(schema, name string, caseInsensitive bool) string {
 	schemaExpr := quoteStringLiteral(schema)
 	nameExpr := quoteStringLiteral(name)
+	publicScope := isXuguPublicSynonymScope(schema)
 	if caseInsensitive {
-		schemaExpr = quoteStringLiteral(strings.ToUpper(schema))
 		nameExpr = quoteStringLiteral(strings.ToUpper(name))
-		return xuguCatalogSynonymSelectSQL + "\n  AND UPPER(s.SCHEMA_NAME) = " + schemaExpr +
+		if publicScope {
+			return xuguCatalogSynonymSelectSQL + "\n  AND y.IS_PUBLIC = TRUE\n  AND UPPER(y.SYNO_NAME) = " + nameExpr
+		}
+		schemaExpr = quoteStringLiteral(strings.ToUpper(schema))
+		return xuguCatalogSynonymSelectSQL + "\n  AND y.IS_PUBLIC = FALSE\n  AND UPPER(s.SCHEMA_NAME) = " + schemaExpr +
 			"\n  AND UPPER(y.SYNO_NAME) = " + nameExpr
 	}
-	return xuguCatalogSynonymSelectSQL + "\n  AND s.SCHEMA_NAME = " + schemaExpr +
+	if publicScope {
+		return xuguCatalogSynonymSelectSQL + "\n  AND y.IS_PUBLIC = TRUE\n  AND y.SYNO_NAME = " + nameExpr
+	}
+	return xuguCatalogSynonymSelectSQL + "\n  AND y.IS_PUBLIC = FALSE\n  AND s.SCHEMA_NAME = " + schemaExpr +
 		"\n  AND y.SYNO_NAME = " + nameExpr
 }
 
@@ -3016,8 +3717,14 @@ func (s *server) catalogSynonymCandidates(query string) ([]xuguCatalogSynonym, e
 	var candidates []xuguCatalogSynonym
 	for rows.Next() {
 		var candidate xuguCatalogSynonym
-		if err := rows.Scan(&candidate.Schema, &candidate.Name, &candidate.TargetSchema, &candidate.TargetName); err != nil {
+		var schema sql.NullString
+		if err := rows.Scan(&schema, &candidate.Name, &candidate.TargetSchema, &candidate.TargetName, &candidate.Public); err != nil {
 			return nil, err
+		}
+		if candidate.Public {
+			candidate.Schema = xuguPublicSynonymScope
+		} else {
+			candidate.Schema = schema.String
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -3224,7 +3931,7 @@ func (s *server) getExplainInfo(sqlText string) (string, error) {
 	return strings.TrimSpace(builder.String()), rows.Err()
 }
 
-func (s *server) executeTransaction(params map[string]json.RawMessage) (queryResult, error) {
+func (s *server) executeTransaction(params map[string]json.RawMessage) (result queryResult, err error) {
 	var payload struct {
 		Statements []string `json:"statements"`
 		Schema     string   `json:"schema"`
@@ -3237,7 +3944,9 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 		return queryResult{}, err
 	}
 	ctx, cancel := s.beginActiveOperation()
-	defer s.endActiveOperation(cancel)
+	defer func() {
+		err = s.finishActiveOperation(cancel, 0, err)
+	}()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return queryResult{}, err
@@ -3255,12 +3964,12 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 		if statement == "" {
 			continue
 		}
-		result, err := tx.ExecContext(ctx, statement)
+		execResult, err := tx.ExecContext(ctx, statement)
 		if err != nil {
 			tx.Rollback()
 			return queryResult{}, err
 		}
-		count, _ := result.RowsAffected()
+		count, _ := execResult.RowsAffected()
 		affected += count
 	}
 	if err := tx.Commit(); err != nil {
@@ -3291,6 +4000,8 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		return queryPageResult{
 			Columns:         result.Columns,
 			ColumnTypes:     result.ColumnTypes,
+			SpatialColumns:  result.SpatialColumns,
+			SpatialValues:   result.SpatialValues,
 			Rows:            result.Rows,
 			AffectedRows:    result.AffectedRows,
 			ExecutionTimeMS: result.ExecutionTimeMS,
@@ -3309,11 +4020,19 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		return queryPageResult{}, err
 	}
 	columnTypes := columnTypeNames(rows)
+	rowScanner := newXuguRowScanner(len(columns), columnTypes)
+	columnTypes = rowScanner.spatial.columnTypes
 	maxRows := opts.MaxRows
 	if maxRows <= 0 {
 		maxRows = defaultMaxRows
 	}
-	session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
+	session := &querySession{
+		rows:        rows,
+		columns:     columns,
+		columnTypes: columnTypes,
+		scanner:     rowScanner,
+		remaining:   maxRows,
+	}
 	result, err := readQuerySessionPage(session, pageSize)
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
 	if err != nil {
@@ -3375,37 +4094,42 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		pageSize = defaultMaxRows
 	}
 	result := queryPageResult{Columns: session.columns, ColumnTypes: session.columnTypes, Rows: [][]any{}, SessionID: nil, HasMore: false}
+	spatialValues := make([][]*uint32, 0, pageSize)
 	for len(result.Rows) < pageSize && session.remaining > 0 {
 		if session.pending != nil {
 			result.Rows = append(result.Rows, session.pending)
+			spatialValues = append(spatialValues, session.pendingSpatial)
 			session.pending = nil
+			session.pendingSpatial = nil
 			session.remaining--
 			continue
 		}
 		if !session.rows.Next() {
-			return result, session.rows.Err()
+			return finishXuguSpatialPage(result, session.scanner, spatialValues), session.rows.Err()
 		}
-		row, err := scanRow(session.rows, len(session.columns))
+		row, rowSpatial, err := session.scanner.scan(session.rows)
 		if err != nil {
 			return queryPageResult{}, err
 		}
 		result.Rows = append(result.Rows, row)
+		spatialValues = append(spatialValues, rowSpatial)
 		session.remaining--
 	}
 	if session.remaining <= 0 {
 		result.Truncated = true
-		return result, nil
+		return finishXuguSpatialPage(result, session.scanner, spatialValues), nil
 	}
 	if session.rows.Next() {
-		row, err := scanRow(session.rows, len(session.columns))
+		row, rowSpatial, err := session.scanner.scan(session.rows)
 		if err != nil {
 			return queryPageResult{}, err
 		}
 		session.pending = row
+		session.pendingSpatial = rowSpatial
 		result.HasMore = true
-		return result, nil
+		return finishXuguSpatialPage(result, session.scanner, spatialValues), nil
 	}
-	return result, session.rows.Err()
+	return finishXuguSpatialPage(result, session.scanner, spatialValues), session.rows.Err()
 }
 
 func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
@@ -3433,8 +4157,8 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 		return queryResult{}, err
 	}
 	ctx, cancel := s.beginActiveOperationWithTimeout(opts.TimeoutSecs)
-	defer s.endActiveOperation(cancel)
 	execResult, err := db.ExecContext(ctx, sqlText)
+	err = s.finishActiveOperation(cancel, opts.TimeoutSecs, err)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -3452,18 +4176,24 @@ func (s *server) executeSelect(sqlText string, maxRows int, timeoutSecs int) (qu
 	if err != nil {
 		return queryResult{}, err
 	}
-	result := queryResult{Columns: columns, ColumnTypes: columnTypeNames(rows), Rows: [][]any{}}
+	columnTypes := columnTypeNames(rows)
+	scanner := newXuguRowScanner(len(columns), columnTypes)
+	columnTypes = scanner.spatial.columnTypes
+	result := queryResult{Columns: columns, ColumnTypes: columnTypes, Rows: [][]any{}}
+	spatialValues := make([][]*uint32, 0)
 	for rows.Next() {
 		if len(result.Rows) >= maxRows {
 			result.Truncated = true
 			break
 		}
-		values, err := scanRow(rows, len(columns))
+		values, rowSpatial, err := scanner.scan(rows)
 		if err != nil {
 			return queryResult{}, err
 		}
 		result.Rows = append(result.Rows, values)
+		spatialValues = append(spatialValues, rowSpatial)
 	}
+	result.SpatialColumns, result.SpatialValues = xuguSpatialResultMetadata(scanner, spatialValues)
 	return result, rows.Err()
 }
 
@@ -3531,18 +4261,20 @@ func (s *server) queryRowsWithTimeoutOnce(sqlText string, args []any, timeoutSec
 		s.activeTimer = nil
 	}
 	timedOut := s.activeTimedOut
-	if queryErr != nil {
-		cancel()
-	} else if timedOut {
-		cancel()
-		if rows != nil {
-			rows.Close()
-		}
-		queryErr = fmt.Errorf("query timed out after %ds", timeoutSecs)
-	} else {
+	canceled := s.activeCanceled
+	s.activeTimedOut = false
+	s.activeCanceled = false
+	if queryErr == nil && !timedOut && !canceled {
 		s.activeRows[rows] = cancel
 	}
 	s.activeCancelMu.Unlock()
+	if queryErr != nil || timedOut || canceled {
+		cancel()
+		if rows != nil {
+			_ = rows.Close()
+		}
+		queryErr = xuguOperationResultError(timedOut, canceled, timeoutSecs, queryErr)
+	}
 	return rows, queryErr
 }
 
@@ -3572,7 +4304,7 @@ func (s *server) execWithReconnect(statement string) error {
 	}
 	ctx, cancel := s.beginActiveOperation()
 	_, execErr := db.ExecContext(ctx, statement)
-	s.endActiveOperation(cancel)
+	execErr = s.finishActiveOperation(cancel, 0, execErr)
 	if execErr == nil || !isXuguConnectionClosedError(execErr) {
 		return execErr
 	}
@@ -3585,7 +4317,7 @@ func (s *server) execWithReconnect(statement string) error {
 	}
 	ctx, cancel = s.beginActiveOperation()
 	_, execErr = db.ExecContext(ctx, statement)
-	s.endActiveOperation(cancel)
+	execErr = s.finishActiveOperation(cancel, 0, execErr)
 	return execErr
 }
 
@@ -3615,25 +4347,60 @@ func (s *server) beginActiveOperationWithTimeout(timeoutSecs int) (context.Conte
 	s.activeCancel = cancel
 	s.activeTimer = timer
 	s.activeTimedOut = false
+	s.activeCanceled = false
 	s.activeCancelMu.Unlock()
 	return ctx, cancel
 }
 
 func (s *server) endActiveOperation(cancel context.CancelFunc) {
-	cancel()
+	_ = s.finishActiveOperation(cancel, 0, nil)
+}
+
+func (s *server) finishActiveOperation(cancel context.CancelFunc, timeoutSecs int, operationErr error) error {
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
 	if s.activeTimer != nil {
 		s.activeTimer.Stop()
 		s.activeTimer = nil
 	}
+	timedOut := s.activeTimedOut
+	canceled := s.activeCanceled
+	s.activeTimedOut = false
+	s.activeCanceled = false
 	s.activeCancelMu.Unlock()
+	cancel()
+	return xuguOperationResultError(timedOut, canceled, timeoutSecs, operationErr)
+}
+
+func xuguOperationResultError(timedOut, canceled bool, timeoutSecs int, operationErr error) error {
+	if timedOut {
+		if operationErr != nil {
+			return fmt.Errorf("%w after %ds: %v", errXuguOperationTimeout, timeoutSecs, operationErr)
+		}
+		return fmt.Errorf("%w after %ds", errXuguOperationTimeout, timeoutSecs)
+	}
+	if canceled {
+		if operationErr != nil {
+			return fmt.Errorf("%w: %v", errXuguOperationCanceled, operationErr)
+		}
+		return errXuguOperationCanceled
+	}
+	return operationErr
 }
 
 func (s *server) cancelActiveQuery() {
 	s.activeCancelMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(s.activeRows)+1)
 	if s.activeCancel != nil {
+		if !s.activeTimedOut {
+			s.activeCanceled = true
+			// Explicit cancellation won the race. Disable the watchdog so a
+			// slow driver return cannot relabel this operation as a timeout.
+			if s.activeTimer != nil {
+				s.activeTimer.Stop()
+				s.activeTimer = nil
+			}
+		}
 		cancels = append(cancels, s.activeCancel)
 	}
 	for _, cancel := range s.activeRows {
@@ -3835,6 +4602,22 @@ func (s *server) tableIdentities(schema, table string) (map[string]xuguIdentityI
 		result[item.Column] = item
 	}
 	return result, rows.Err()
+}
+
+// xuguIdentityMatchesColumn keeps identity enrichment safe for catalog views
+// that may normalize unquoted names differently from ALL_COLUMNS. Exact
+// matches win; a case-insensitive match is accepted only when unambiguous.
+func xuguIdentityMatchesColumn(columnName string, identities map[string]xuguIdentityInfo) bool {
+	if _, ok := identities[columnName]; ok {
+		return true
+	}
+	matches := 0
+	for identityColumn := range identities {
+		if strings.EqualFold(identityColumn, columnName) {
+			matches++
+		}
+	}
+	return matches == 1
 }
 
 func (s *server) tableConstraints(schema, table string) ([]xuguConstraintInfo, error) {
@@ -4405,16 +5188,132 @@ func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
 			builder.WriteString(renderXuguIndexKey(key))
 		}
 		builder.WriteByte(')')
-		if index.IndexType != nil && strings.TrimSpace(*index.IndexType) != "" {
-			builder.WriteString(" INDEXTYPE IS ")
-			builder.WriteString(strings.TrimSpace(*index.IndexType))
-		}
+		appendXuguIndexOptions(&builder, index)
 		builder.WriteByte(';')
 	}
 	if builder.Len() == 0 {
 		return ddl
 	}
 	return appendDDLStatement(ddl, builder.String())
+}
+
+func appendXuguIndexOptions(builder *strings.Builder, index indexInfo) {
+	if index.IndexType != nil && strings.TrimSpace(*index.IndexType) != "" {
+		builder.WriteString(" INDEXTYPE IS ")
+		builder.WriteString(strings.TrimSpace(*index.IndexType))
+	}
+	if index.IsLocal {
+		builder.WriteString(" LOCAL")
+		return
+	}
+	if index.PartitionType == 0 || !index.PartitionRowsLoaded {
+		return
+	}
+	partitionDDL := renderXuguIndexPartitionDDL(index)
+	if partitionDDL != "" {
+		builder.WriteString(" GLOBAL")
+		builder.WriteString(partitionDDL)
+	}
+}
+
+func renderXuguIndexPartitionDDL(index indexInfo) string {
+	typeName := xuguPartitionType(index.PartitionType)
+	key := strings.TrimSpace(index.PartitionKey)
+	if typeName == "" || key == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	builder.WriteString(" PARTITION BY ")
+	builder.WriteString(typeName)
+	builder.WriteString(" (")
+	builder.WriteString(key)
+	builder.WriteByte(')')
+	if index.PartitionType == 3 {
+		if index.PartitionCount <= 0 {
+			return ""
+		}
+		builder.WriteString(fmt.Sprintf(" PARTITIONS %d", index.PartitionCount))
+	} else if len(index.IndexPartitions) > 0 {
+		for _, partition := range index.IndexPartitions {
+			if strings.TrimSpace(partition.Name) == "" || strings.TrimSpace(partition.Value) == "" {
+				return ""
+			}
+		}
+		builder.WriteString(" PARTITIONS (\n")
+		for i, partition := range index.IndexPartitions {
+			if i > 0 {
+				builder.WriteString(",\n")
+			}
+			builder.WriteString("  ")
+			builder.WriteString(quoteIdentifier(partition.Name))
+			builder.WriteByte(' ')
+			if index.PartitionType == 1 {
+				builder.WriteString("VALUES LESS THAN (")
+			} else {
+				builder.WriteString("VALUES (")
+			}
+			builder.WriteString(strings.TrimSpace(partition.Value))
+			builder.WriteByte(')')
+		}
+		builder.WriteString("\n)")
+	} else {
+		return ""
+	}
+
+	subType := xuguPartitionType(index.SubpartitionType)
+	subKey := strings.TrimSpace(index.SubpartitionKey)
+	if subType == "" || subKey == "" {
+		return builder.String()
+	}
+	builder.WriteString(" SUBPARTITION BY ")
+	builder.WriteString(subType)
+	builder.WriteString(" (")
+	builder.WriteString(subKey)
+	builder.WriteByte(')')
+	if index.SubpartitionType == 3 {
+		if index.SubpartitionCount <= 0 {
+			return builderWithoutSubpartitionDDL(index, builder)
+		}
+		builder.WriteString(fmt.Sprintf(" SUBPARTITIONS %d", index.SubpartitionCount))
+	} else if len(index.IndexSubpartitions) > 0 {
+		for _, partition := range index.IndexSubpartitions {
+			if strings.TrimSpace(partition.Name) == "" || strings.TrimSpace(partition.Value) == "" {
+				return builderWithoutSubpartitionDDL(index, builder)
+			}
+		}
+		builder.WriteString(" SUBPARTITIONS (\n")
+		for i, partition := range index.IndexSubpartitions {
+			if i > 0 {
+				builder.WriteString(",\n")
+			}
+			builder.WriteString("  ")
+			builder.WriteString(quoteIdentifier(partition.Name))
+			builder.WriteByte(' ')
+			if index.SubpartitionType == 1 {
+				builder.WriteString("VALUES LESS THAN (")
+			} else {
+				builder.WriteString("VALUES (")
+			}
+			builder.WriteString(strings.TrimSpace(partition.Value))
+			builder.WriteByte(')')
+		}
+		builder.WriteString("\n)")
+	}
+	return builder.String()
+}
+
+// builderWithoutSubpartitionDDL returns the complete first-level definition
+// when Xugu exposes a subpartition marker but not enough detail to replay it.
+// Emitting an incomplete SUBPARTITION clause is worse than preserving a valid
+// global index DDL without that optional detail.
+func builderWithoutSubpartitionDDL(index indexInfo, builder strings.Builder) string {
+	firstLevel := index
+	firstLevel.SubpartitionType = 0
+	firstLevel.SubpartitionKey = ""
+	firstLevel.SubpartitionCount = 0
+	firstLevel.IndexSubpartitions = nil
+	return renderXuguIndexPartitionDDL(firstLevel)
 }
 
 // uniqueKeyColumnSets returns column lists for PRIMARY KEY and UNIQUE constraints.
@@ -4560,17 +5459,31 @@ func columnTypeDDL(column columnInfo) string {
 	if column.CharacterMaximumLength != nil {
 		return fmt.Sprintf("%s(%d)", dataType, *column.CharacterMaximumLength)
 	}
-	if column.NumericPrecision != nil && column.NumericScale != nil {
-		return fmt.Sprintf("%s(%d,%d)", dataType, *column.NumericPrecision, *column.NumericScale)
+	if column.NumericPrecision != nil {
+		if column.NumericScale != nil {
+			return fmt.Sprintf("%s(%d,%d)", dataType, *column.NumericPrecision, *column.NumericScale)
+		}
+		return xuguSingleParameterTypeDDL(dataType, *column.NumericPrecision)
 	}
 	return dataType
+}
+
+func xuguSingleParameterTypeDDL(dataType string, parameter int) string {
+	switch dataType {
+	case "TIME WITH TIME ZONE":
+		return fmt.Sprintf("TIME(%d) WITH TIME ZONE", parameter)
+	case "TIMESTAMP WITH TIME ZONE":
+		return fmt.Sprintf("TIMESTAMP(%d) WITH TIME ZONE", parameter)
+	default:
+		return fmt.Sprintf("%s(%d)", dataType, parameter)
+	}
 }
 
 func decodeXuguScale(dataType string, scale *int) (*int, *int, *int) {
 	if scale == nil || *scale < 0 {
 		return nil, nil, nil
 	}
-	upper := strings.ToUpper(dataType)
+	upper := strings.Join(strings.Fields(strings.ToUpper(dataType)), " ")
 	if strings.Contains(upper, "CHAR") || strings.Contains(upper, "BINARY") {
 		length := *scale
 		return nil, nil, &length
@@ -4579,6 +5492,10 @@ func decodeXuguScale(dataType string, scale *int) (*int, *int, *int) {
 		precision := *scale / 65536
 		numericScale := *scale % 65536
 		return &precision, &numericScale, nil
+	}
+	if upper == "BIT" || upper == "VARBIT" || upper == "TIME" || upper == "TIME WITH TIME ZONE" || upper == "TIMESTAMP" || upper == "TIMESTAMP WITH TIME ZONE" {
+		precision := *scale
+		return &precision, nil, nil
 	}
 	return nil, nil, nil
 }
@@ -4889,6 +5806,42 @@ func xuguInt(value any) int {
 	}
 }
 
+func xuguInt64(value any) int64 {
+	value = normalizeValue(value)
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case uint64:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case string:
+		parsed, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return parsed
+	default:
+		parsed, _ := strconv.ParseInt(strings.TrimSpace(fmt.Sprint(v)), 10, 64)
+		return parsed
+	}
+}
+
+func optionalInt64(value any) *int64 {
+	if normalizeValue(value) == nil {
+		return nil
+	}
+	parsed := xuguInt64(value)
+	return &parsed
+}
+
+func optionalStringPtr(value any) *string {
+	if normalizeValue(value) == nil {
+		return nil
+	}
+	parsed := xuguString(value)
+	return &parsed
+}
+
 func stringPtr(value string) *string {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -5018,8 +5971,8 @@ func stringSliceParam(params map[string]json.RawMessage, key string) []string {
 	return nil
 }
 
-func errorResponse(id json.RawMessage, err error) response {
-	return response{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: -1, Message: err.Error()}}
+func errorResponse(id json.RawMessage, method, agentSessionID string, err error) response {
+	return response{JSONRPC: "2.0", ID: id, Error: classifyRPCError(method, agentSessionID, err)}
 }
 
 func trimStatementSQL(sqlText string) string {
@@ -5123,13 +6076,27 @@ func quoteIdentifier(value string) string {
 }
 
 func normalizeValue(value any) any {
+	return normalizeValueWithType(value, "")
+}
+
+// normalizeValueWithType converts a scanned driver value into a JSON-friendly
+// value. columnTypeName drives temporal formatting: XuguDB rejects the ISO
+// "T"/"Z" literal (E19138 时间值常数错误) that time.RFC3339Nano produces, so
+// the round-trippable form is a space-separated wall-clock string. Timezone-
+// aware Xugu types keep the numeric offset; timezone-less ones (DATE/DATETIME/
+// TIME/TIMESTAMP) drop it so clients do not double-apply a shift. Mirrors the
+// oracle-go/kingbase-go timezone-less handling, adapted to Xugu's space rule.
+func normalizeValueWithType(value any, columnTypeName string) any {
 	switch v := value.(type) {
 	case nil:
 		return nil
 	case []byte:
 		return string(v)
 	case time.Time:
-		return v.Format(time.RFC3339Nano)
+		if isXuguTimezoneAwareTemporal(columnTypeName) {
+			return v.Format("2006-01-02 15:04:05.999999999 -07:00")
+		}
+		return v.Format("2006-01-02 15:04:05.999999999")
 	case int:
 		return int64(v)
 	case int8:
@@ -5159,6 +6126,13 @@ func normalizeValue(value any) any {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+// isXuguTimezoneAwareTemporal reports whether the column type carries a real
+// timezone (…WITH TIME ZONE), so its formatted literal must keep the offset.
+func isXuguTimezoneAwareTemporal(columnTypeName string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(columnTypeName))
+	return strings.Contains(normalized, "WITH TIME ZONE")
 }
 
 func emptyIfNil[T any](values []T) []T {

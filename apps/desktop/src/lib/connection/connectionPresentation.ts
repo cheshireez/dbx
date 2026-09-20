@@ -1,11 +1,12 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { GAUSSDB_M_JDBC_DRIVER_PROFILE } from "@/lib/database/jdbcDialect";
+import { isLocalFileDatabaseType } from "@/lib/database/databaseDriverManifest";
 import { parseGaussdbHosts, serializeGaussdbHosts } from "@/lib/connection/gaussdbHosts";
+import { spannerDisplayDatabase } from "@/lib/connection/spannerResourcePath";
 
 type ConnectionPresentationConfig = Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "host" | "port" | "database">;
 type ConnectionNamePresentationConfig = ConnectionPresentationConfig & Pick<ConnectionConfig, "name">;
 
-const LOCAL_DATABASE_TYPES = new Set(["sqlite", "duckdb", "access"]);
 const REDACTED_HOST_SEGMENT = "***";
 const REDACTED_PORT = "****";
 
@@ -20,7 +21,10 @@ export function connectionDriverLabel(connection?: Pick<ConnectionConfig, "db_ty
 export function connectionEndpointLabel(connection?: ConnectionPresentationConfig): string {
   if (!connection) return "";
   if (connection.db_type === "cloudflare-d1") return [connection.host, connection.database].filter(Boolean).join("/");
-  if (LOCAL_DATABASE_TYPES.has(connection.db_type) || (connection.db_type === "h2" && connection.port === 0)) {
+  // Cloud Spanner stores the whole resource path in `database`; only the trailing
+  // database ID is short enough for a subtitle, and the host is empty on Google Cloud.
+  if (connection.db_type === "spanner") return connection.host ? `${connection.host}:${connection.port}` : spannerDisplayDatabase(connection.database);
+  if (isLocalFilePresentationConnection(connection)) {
     return connection.host || connection.database || "local";
   }
   const endpoint = normalizedPresentationEndpoint(connection);
@@ -80,7 +84,11 @@ function redactSingleHost(host: string): string {
 export function connectionRedactedEndpointLabel(connection?: ConnectionPresentationConfig): string {
   if (!connection) return "";
   if (connection.db_type === "cloudflare-d1") return `${REDACTED_HOST_SEGMENT}/${REDACTED_HOST_SEGMENT}`;
-  if (LOCAL_DATABASE_TYPES.has(connection.db_type) || (connection.db_type === "h2" && connection.port === 0)) {
+  // The Spanner endpoint label already drops project and instance, so it carries
+  // no more than any other database name; without this branch the fallback below
+  // would print the full `projects/.../databases/...` path.
+  if (connection.db_type === "spanner") return connection.host ? `${redactConnectionHost(connection.host)}:${REDACTED_PORT}` : spannerDisplayDatabase(connection.database);
+  if (isLocalFilePresentationConnection(connection)) {
     return connectionEndpointLabel(connection);
   }
 
@@ -98,7 +106,7 @@ export function connectionRedactedEndpointLabel(connection?: ConnectionPresentat
 
 export function connectionRedactedNameLabel(connection?: ConnectionNamePresentationConfig): string {
   const name = connection?.name.trim() || "";
-  if (!connection || !name || LOCAL_DATABASE_TYPES.has(connection.db_type) || (connection.db_type === "h2" && connection.port === 0)) return name;
+  if (!connection || !name || isLocalFilePresentationConnection(connection)) return name;
 
   const host = connection.host.trim();
   if (!host) return name;
@@ -115,6 +123,10 @@ export function connectionRedactedNameLabel(connection?: ConnectionNamePresentat
   return hostNames.has(name) ? connectionRedactedEndpointLabel(connection) : name;
 }
 
+function isLocalFilePresentationConnection(connection: Pick<ConnectionPresentationConfig, "db_type" | "port">): boolean {
+  return isLocalFileDatabaseType(connection.db_type) && (connection.db_type !== "h2" || connection.port === 0);
+}
+
 export function connectionDisplayUrlScheme(connection: Pick<ConnectionConfig, "db_type"> & Partial<Pick<ConnectionConfig, "driver_profile" | "ssl">>): string {
   switch (connection.db_type) {
     case "postgres":
@@ -129,12 +141,14 @@ export function connectionDisplayUrlScheme(connection: Pick<ConnectionConfig, "d
       return "mssql";
     case "elasticsearch":
     case "easysearch":
+    case "meilisearch":
     case "qdrant":
     case "milvus":
     case "weaviate":
     case "chromadb":
     case "rqlite":
     case "turso":
+    case "dynamodb":
     case "mq":
     case "consul":
       return connection.ssl ? "https" : "http";
@@ -147,7 +161,7 @@ export function connectionDisplayUrlScheme(connection: Pick<ConnectionConfig, "d
   }
 }
 
-export function connectionUrlPlaceholder(dbType: DatabaseType): string {
+export function connectionUrlPlaceholder(dbType: DatabaseType, driverProfile?: string): string {
   switch (dbType) {
     case "mysql":
     case "doris":
@@ -196,6 +210,9 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "mongodb":
       return "mongodb://user:password@host:port/database";
 
+    case "dynamodb":
+      return "https://dynamodb.us-east-1.amazonaws.com";
+
     case "clickhouse":
       return "clickhouse://user:password@host:port/database";
 
@@ -212,6 +229,9 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "weaviate":
     case "chromadb":
       return "http://user:password@host:port";
+
+    case "meilisearch":
+      return "http://host:port/base/path";
 
     case "dameng":
       return "dm://user:password@host:port";
@@ -234,11 +254,17 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "bigquery":
       return "bigquery://https://www.googleapis.com/bigquery/v2:443/project-id";
 
+    case "spanner":
+      return "spanner:///projects/{project}/instances/{instance}/databases/{database}";
+
     case "iris":
-      return "iris://user:password@host:port/namespace";
+      return driverProfile === "cache" ? "cache://user:password@host:port/namespace" : "iris://user:password@host:port/namespace";
 
     case "influxdb":
       return "influxdb://user:password@host:port/database";
+
+    case "influxdb3":
+      return "influxdb3://token@host:8181/database";
 
     case "victoriametrics":
       return "http://user:password@host:port/prometheus";

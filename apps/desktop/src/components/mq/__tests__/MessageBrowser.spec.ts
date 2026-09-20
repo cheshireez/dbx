@@ -8,12 +8,28 @@ const backend = vi.hoisted(() => ({
   mqPeekMessages: vi.fn(),
 }));
 
+const clipboard = vi.hoisted(() => ({
+  copyToClipboard: vi.fn(),
+}));
+
+const toast = vi.hoisted(() => ({
+  toast: vi.fn(),
+}));
+
 vi.mock("vue-i18n", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({ t: (key: string, params?: Record<string, unknown>) => (params ? `${key}:${JSON.stringify(params)}` : key) }),
 }));
 
 vi.mock("@/lib/backend/api", () => ({
   mqPeekMessages: backend.mqPeekMessages,
+}));
+
+vi.mock("@/lib/common/clipboard", () => ({
+  copyToClipboard: clipboard.copyToClipboard,
+}));
+
+vi.mock("@/composables/useToast", () => ({
+  useToast: () => toast,
 }));
 
 vi.mock("@/components/ui/select", async () => (await import("./selectStub")).createSelectStub());
@@ -58,13 +74,14 @@ async function setSelectValue(trigger: HTMLElement, value: string) {
   await flushUi();
 }
 
-async function mountBrowser(mqSystemKind: "kafka" | "rabbitmq" = "kafka") {
+async function mountBrowser(mqSystemKind: "kafka" | "rabbitmq" = "kafka", appearance: "form" | "monitoring" = "form") {
   root = document.createElement("div");
   document.body.appendChild(root);
   app = createApp(MessageBrowser, {
     connectionId: "mq-1",
     topic: { ...TOPIC, tenant: mqSystemKind === "rabbitmq" ? "_rabbitmq" : "_kafka" },
     mqSystemKind,
+    appearance,
   });
   app.mount(root);
   await flushUi();
@@ -105,8 +122,15 @@ async function loadMessages(container: ParentNode) {
   await flushUi();
 }
 
+function displayedPayloads(container: ParentNode): string[] {
+  return [...container.querySelectorAll<HTMLElement>(".message-payload")].map((element) => element.textContent || "");
+}
+
 beforeEach(() => {
   backend.mqPeekMessages.mockReset();
+  clipboard.copyToClipboard.mockReset();
+  clipboard.copyToClipboard.mockResolvedValue(undefined);
+  toast.toast.mockReset();
   backend.mqPeekMessages.mockResolvedValue([
     {
       position: 1,
@@ -127,12 +151,132 @@ afterEach(() => {
 });
 
 describe("MessageBrowser", () => {
+  it("copies a message's displayed payload", async () => {
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const copyButton = browser.querySelector<HTMLButtonElement>('[data-testid="copy-message-payload"]');
+    if (!copyButton) throw new Error("Message payload copy button not found");
+    copyButton.click();
+    await flushUi();
+
+    expect(clipboard.copyToClipboard).toHaveBeenCalledWith("existing message");
+    expect(copyButton.dataset.variant).toBe("outline");
+    expect(copyButton.dataset.size).toBe("sm");
+    expect(copyButton.getAttribute("aria-label")).toBe("grid.copy mqMessages.messageContent");
+    expect(toast.toast).toHaveBeenCalledWith("grid.copied");
+    expect(browser.querySelector('[data-testid="copy-message-headers"]')).toBeNull();
+  });
+
+  it("copies the base64 payload when no text payload is available", async () => {
+    backend.mqPeekMessages.mockResolvedValueOnce([
+      {
+        position: 1,
+        messageId: "binary",
+        payloadBase64: "AAE=",
+        properties: { partition: "0" },
+        headers: {},
+      },
+    ]);
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const copyButton = browser.querySelector<HTMLButtonElement>('[data-testid="copy-message-payload"]');
+    if (!copyButton) throw new Error("Message payload copy button not found");
+    copyButton.click();
+    await flushUi();
+
+    expect(clipboard.copyToClipboard).toHaveBeenCalledWith("AAE=");
+  });
+
+  it("copies message headers as formatted JSON", async () => {
+    backend.mqPeekMessages.mockResolvedValueOnce([
+      {
+        position: 1,
+        messageId: "17",
+        payloadBase64: "",
+        payloadText: "existing message",
+        properties: { partition: "0" },
+        headers: { source: "billing", traceId: "abc-123" },
+      },
+    ]);
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const copyButton = browser.querySelector<HTMLButtonElement>('[data-testid="copy-message-headers"]');
+    if (!copyButton) throw new Error("Message headers copy button not found");
+    copyButton.click();
+    await flushUi();
+
+    expect(clipboard.copyToClipboard).toHaveBeenCalledWith('{\n  "source": "billing",\n  "traceId": "abc-123"\n}');
+    expect(copyButton.getAttribute("aria-label")).toBe("grid.copy mqMessages.messageHeaders");
+  });
+
+  it("shows a copy failure toast without breaking the message browser", async () => {
+    clipboard.copyToClipboard.mockRejectedValueOnce(new Error("Clipboard unavailable"));
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const copyButton = browser.querySelector<HTMLButtonElement>('[data-testid="copy-message-payload"]');
+    if (!copyButton) throw new Error("Message payload copy button not found");
+    copyButton.click();
+    await flushUi();
+
+    expect(toast.toast).toHaveBeenCalledWith('grid.copyFailed:{"message":"Clipboard unavailable"}', 5000);
+    expect(browser.textContent).toContain("existing message");
+  });
+
   it("loads Kafka's latest messages by default", async () => {
     const browser = await mountBrowser();
 
     await loadMessages(browser);
 
     expect(backend.mqPeekMessages).toHaveBeenCalledWith("mq-1", expect.objectContaining({ topic: "events" }), "__dbx_kafka_viewer__", 20, { startPosition: "latest" });
+  });
+
+  it("orders loaded Kafka messages newest first by default and changes presentation without reloading", async () => {
+    backend.mqPeekMessages.mockResolvedValueOnce([
+      { position: 1, messageId: "1", publishTime: "1000", payloadBase64: "", payloadText: "oldest", properties: {}, headers: {} },
+      { position: 2, messageId: "2", publishTime: "3000", payloadBase64: "", payloadText: "newest", properties: {}, headers: {} },
+      { position: 3, messageId: "3", publishTime: "2000", payloadBase64: "", payloadText: "middle", properties: {}, headers: {} },
+    ]);
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    expect(displayedPayloads(browser)).toEqual(["newest", "middle", "oldest"]);
+
+    const displayOrder = browser.querySelector<HTMLElement>('[data-testid="kafka-message-display-order"]');
+    if (!displayOrder) throw new Error("Kafka message display order select not found");
+    await setSelectValue(displayOrder, "oldest");
+
+    expect(displayedPayloads(browser)).toEqual(["oldest", "middle", "newest"]);
+    expect(backend.mqPeekMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the selected Kafka display order when filtering loaded messages", async () => {
+    backend.mqPeekMessages.mockResolvedValueOnce([
+      { position: 1, messageId: "1", publishTime: "1000", payloadBase64: "", payloadText: "matching oldest", properties: {}, headers: {} },
+      { position: 2, messageId: "2", publishTime: "3000", payloadBase64: "", payloadText: "matching newest", properties: {}, headers: {} },
+      { position: 3, messageId: "3", publishTime: "2000", payloadBase64: "", payloadText: "excluded", properties: {}, headers: {} },
+    ]);
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const displayOrder = browser.querySelector<HTMLElement>('[data-testid="kafka-message-display-order"]');
+    const filter = browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]');
+    if (!displayOrder || !filter) throw new Error("Kafka message presentation controls not found");
+    await setSelectValue(displayOrder, "oldest");
+    await setInputValue(filter, "matching");
+
+    expect(displayedPayloads(browser)).toEqual(["matching oldest", "matching newest"]);
+    expect(backend.mqPeekMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows Kafka display ordering in the monitoring appearance", async () => {
+    const browser = await mountBrowser("kafka", "monitoring");
+
+    expect(browser.querySelector('[data-testid="kafka-message-display-order"]')).not.toBeNull();
+    expect(browser.querySelector('[data-testid="kafka-peek-start-position"]')).toBeNull();
   });
 
   it("normalizes a decimal count before sending the request", async () => {
@@ -167,6 +311,129 @@ describe("MessageBrowser", () => {
 
     expect(browser.querySelector('[data-testid="peek-incomplete"]')?.textContent).toContain("mqMessages.peekIncomplete");
     expect(browser.textContent).toContain("partial message");
+  });
+
+  it("filters loaded Kafka messages and shows the matching count", async () => {
+    backend.mqPeekMessages.mockResolvedValueOnce([
+      {
+        position: 1,
+        messageId: "11",
+        key: "order-alpha",
+        payloadBase64: "",
+        payloadText: "first payload",
+        properties: { partition: "0" },
+        headers: {},
+      },
+      {
+        position: 2,
+        messageId: "12",
+        key: "order-beta",
+        payloadBase64: "",
+        payloadText: "second payload",
+        properties: { partition: "1" },
+        headers: { TraceId: "REQUEST-99" },
+      },
+    ]);
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const filter = browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]');
+    if (!filter) throw new Error("Kafka message filter input not found");
+    expect(filter.getAttribute("aria-label")).toBe("mqMessages.filterLoadedPlaceholder");
+    expect(browser.querySelector('[data-testid="kafka-message-filter-count"]')?.textContent).toContain('mqMessages.filterLoadedCount:{"matched":2,"loaded":2}');
+
+    await setInputValue(filter, "request-99");
+
+    expect(browser.textContent).not.toContain("first payload");
+    expect(browser.textContent).toContain("second payload");
+    expect(browser.querySelector('[data-testid="kafka-message-filter-count"]')?.textContent).toContain('mqMessages.filterLoadedCount:{"matched":1,"loaded":2}');
+  });
+
+  it("shows a dedicated empty state without hiding an incomplete warning", async () => {
+    backend.mqPeekMessages.mockResolvedValueOnce({
+      messages: [
+        {
+          position: 1,
+          messageId: "partial",
+          payloadBase64: "",
+          payloadText: "partial message",
+          properties: {},
+          headers: {},
+        },
+      ],
+      incomplete: true,
+    });
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const filter = browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]');
+    if (!filter) throw new Error("Kafka message filter input not found");
+    await setInputValue(filter, "missing value");
+
+    expect(browser.querySelector('[data-testid="peek-incomplete"]')).not.toBeNull();
+    expect(browser.querySelector('[data-testid="kafka-message-filter-empty"]')?.textContent).toContain("mqMessages.noMatchingMessages");
+    expect(browser.textContent).not.toContain("partial message");
+  });
+
+  it("keeps a filter across reloads and Kafka start-position changes", async () => {
+    backend.mqPeekMessages.mockResolvedValue([
+      {
+        position: 1,
+        messageId: "17",
+        payloadBase64: "",
+        payloadText: "keep this message",
+        properties: {},
+        headers: {},
+      },
+    ]);
+    const browser = await mountBrowser();
+
+    await loadMessages(browser);
+    const filter = browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]');
+    const startPosition = browser.querySelector<HTMLElement>('[data-testid="kafka-peek-start-position"]');
+    if (!filter || !startPosition) throw new Error("Kafka message filter controls not found");
+    await setInputValue(filter, "keep");
+    await loadMessages(browser);
+    expect(browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]')?.value).toBe("keep");
+
+    await setSelectValue(startPosition, "earliest");
+    await loadMessages(browser);
+
+    expect(browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]')?.value).toBe("keep");
+    expect(browser.textContent).toContain("keep this message");
+  });
+
+  it("clears the filter when the topic or connection context changes", async () => {
+    const { browser, topic, connectionId } = await mountBrowserWithMutableTopic();
+
+    await loadMessages(browser);
+    const filter = browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]');
+    if (!filter) throw new Error("Kafka message filter input not found");
+    await setInputValue(filter, "existing");
+
+    topic.value = { ...TOPIC, topic: "payments" };
+    await flushUi();
+    await loadMessages(browser);
+
+    expect(browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]')?.value).toBe("");
+
+    const reloadedFilter = browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]');
+    if (!reloadedFilter) throw new Error("Reloaded Kafka message filter input not found");
+    await setInputValue(reloadedFilter, "existing");
+    connectionId.value = "mq-2";
+    await flushUi();
+    await loadMessages(browser);
+
+    expect(browser.querySelector<HTMLInputElement>('[data-testid="kafka-message-filter-input"]')?.value).toBe("");
+  });
+
+  it("does not expose the loaded-message filter for non-Kafka browsers", async () => {
+    const browser = await mountBrowser("rabbitmq");
+
+    await loadMessages(browser);
+
+    expect(browser.querySelector('[data-testid="kafka-message-filter"]')).toBeNull();
+    expect(browser.querySelector('[data-testid="kafka-message-display-order"]')).toBeNull();
   });
 
   it("sends explicit earliest and offset read positions", async () => {

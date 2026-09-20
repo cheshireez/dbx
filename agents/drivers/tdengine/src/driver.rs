@@ -3,6 +3,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono_tz::Tz;
 use futures::future::poll_fn;
 use serde_json::Value;
 use taos::{AsyncFetchable, AsyncQueryable, AsyncTBuilder, RawBlock, ResultSet, Taos, TaosBuilder};
@@ -27,6 +28,7 @@ pub struct TdengineDriver {
     connection: Option<Taos>,
     params: ConnectParams,
     server_version: Option<String>,
+    session_timezone: Option<Tz>,
     current_database: String,
     query_sessions: HashMap<String, QueryCursor>,
     table_cache: Option<TableCache>,
@@ -40,6 +42,8 @@ struct TableCache {
 
 struct QueryCursor {
     result_set: ResultSet,
+    timezone: Option<Tz>,
+    session_timezone: Option<Tz>,
     columns: Vec<String>,
     column_types: Vec<String>,
     affected_rows: i64,
@@ -57,6 +61,7 @@ impl TdengineDriver {
             connection: None,
             params: ConnectParams::default(),
             server_version: None,
+            session_timezone: None,
             current_database: String::new(),
             query_sessions: HashMap::new(),
             table_cache: None,
@@ -74,8 +79,13 @@ impl TdengineDriver {
             .map_err(|_| anyhow!("TDengine connection timed out after {} seconds", connect_timeout.as_secs()))??;
         let token = CancellationToken::new();
         let server_version = query_scalar_string(&connection, "SELECT server_version()", &token, 5).await.ok();
+        let session_timezone = query_scalar_string(&connection, "SELECT timezone()", &token, 5)
+            .await
+            .ok()
+            .and_then(|value| parse_server_timezone(&value));
         self.current_database = dsn.database;
         self.server_version = server_version;
+        self.session_timezone = session_timezone;
         self.params = params;
         self.connection = Some(connection);
         Ok(())
@@ -93,6 +103,7 @@ impl TdengineDriver {
         self.query_sessions.clear();
         self.table_cache = None;
         self.server_version = None;
+        self.session_timezone = None;
         self.current_database.clear();
         self.connection = None;
     }
@@ -460,11 +471,14 @@ impl TdengineDriver {
             bail!("SQL is required");
         }
         let result_set = cancellable(token, timeout_secs, self.require_connection()?.query(sql)).await?;
+        let timezone = result_set.timezone();
         let columns = result_set.fields().iter().map(|field| field.name().to_string()).collect();
         let column_types = result_set.fields().iter().map(|field| field.ty().name().to_string()).collect();
         let affected_rows = i64::from(result_set.affected_rows());
         Ok(QueryCursor {
             result_set,
+            timezone,
+            session_timezone: self.session_timezone,
             columns,
             column_types,
             affected_rows,
@@ -690,7 +704,7 @@ impl QueryCursor {
         loop {
             if let Some(block) = &self.pending_block {
                 if self.pending_row_index < block.nrows() {
-                    let timezone = block.timezone();
+                    let timezone = preferred_timezone(self.timezone, block.timezone(), self.session_timezone);
                     let row_index = self.pending_row_index;
                     self.pending_row_index += 1;
                     let row = (0..block.ncols())
@@ -749,6 +763,7 @@ async fn query_scalar_string(
     timeout_secs: u64,
 ) -> Result<String> {
     let mut result = cancellable(token, timeout_secs, connection.query(sql)).await?;
+    let timezone = result.timezone();
     loop {
         let block = cancellable(token, timeout_secs, poll_fn(|context| result.fetch_raw_block(context))).await?;
         let Some(block) = block else {
@@ -758,11 +773,23 @@ async fn query_scalar_string(
             continue;
         }
         let value = block.get_ref(0, 0).ok_or_else(|| anyhow!("TDengine query returned an empty value"))?;
-        return match borrowed_value_to_json(value, block.timezone()) {
+        return match borrowed_value_to_json(value, preferred_timezone(timezone, block.timezone(), None)) {
             Value::String(value) => Ok(value),
             value => Ok(value.to_string()),
         };
     }
+}
+
+fn preferred_timezone(
+    query_timezone: Option<Tz>,
+    block_timezone: Option<Tz>,
+    session_timezone: Option<Tz>,
+) -> Option<Tz> {
+    query_timezone.or(block_timezone).or(session_timezone)
+}
+
+fn parse_server_timezone(value: &str) -> Option<Tz> {
+    value.split_whitespace().next()?.parse().ok()
 }
 
 async fn cancellable<T, F>(token: &CancellationToken, timeout_secs: u64, future: F) -> Result<T>
@@ -1050,6 +1077,27 @@ mod tests {
         assert!(text_matches("sensor_metrics", "metrics"));
         assert!(text_matches("sensor_metrics", "snm"));
         assert!(!text_matches("sensor_metrics", "xyz"));
+    }
+
+    #[test]
+    fn prefers_query_timezone_and_falls_back_to_block_timezone() {
+        assert_eq!(
+            preferred_timezone(Some(chrono_tz::UTC), Some(chrono_tz::Asia::Tokyo), Some(chrono_tz::Asia::Shanghai)),
+            Some(chrono_tz::UTC)
+        );
+        assert_eq!(
+            preferred_timezone(None, Some(chrono_tz::Asia::Tokyo), Some(chrono_tz::Asia::Shanghai)),
+            Some(chrono_tz::Asia::Tokyo)
+        );
+        assert_eq!(preferred_timezone(None, None, Some(chrono_tz::Asia::Shanghai)), Some(chrono_tz::Asia::Shanghai));
+        assert_eq!(preferred_timezone(None, None, None), None);
+    }
+
+    #[test]
+    fn parses_tdengine_timezone_description() {
+        assert_eq!(parse_server_timezone("Asia/Shanghai (CST, +0800)"), Some(chrono_tz::Asia::Shanghai));
+        assert_eq!(parse_server_timezone("Etc/UTC (UTC, +0000)"), Some(chrono_tz::Etc::UTC));
+        assert_eq!(parse_server_timezone("unknown (+0800)"), None);
     }
 
     #[test]

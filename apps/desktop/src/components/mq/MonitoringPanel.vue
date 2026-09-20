@@ -10,6 +10,7 @@ import VChart from "vue-echarts";
 import { Activity, AlertTriangle, BarChart3, Boxes, CheckCircle2, Database, Download, Gauge, Hash, HardDrive, Layers3, Loader2, Package, RadioTower, RefreshCw, Send, ShieldCheck, Table2, Upload, Users } from "@lucide/vue";
 import type { MqSystemKind, TopicRef, TopicInfo, TopicStats, BacklogStats } from "@/types/mq";
 import { mqGetTopicStats, mqGetBacklog } from "@/lib/backend/api";
+import { extractKafkaPartitionRows, isKafkaStatsPayload, type KafkaPartitionStatsRow } from "@/lib/mq/kafkaTopicStats";
 import MessageBrowser from "./MessageBrowser.vue";
 
 use([CanvasRenderer, LineChart, GridComponent, LegendComponent, TooltipComponent]);
@@ -24,8 +25,8 @@ interface Props {
 
 interface MetricPoint {
   time: string;
-  msgRateIn: number;
-  msgRateOut: number;
+  msgRateIn: number | null;
+  msgRateOut: number | null;
   backlogSize: number;
   msgBacklog: number;
   consumerLagMs: number;
@@ -54,17 +55,10 @@ interface RocketMqPartitionStatsRow {
   messageCount: number;
 }
 
-interface KafkaPartitionStatsRow {
-  partition: number;
-  beginOffset: number;
-  endOffset: number;
-  messageCount: number;
-  leader: number;
-  replicas: number[];
-  isr: number[];
-}
-
 const props = defineProps<Props>();
+const emit = defineEmits<{
+  "navigate-tab": [payload: { tab: "messages"; topic?: TopicInfo }];
+}>();
 const { t } = useI18n();
 
 const stats = ref<TopicStats>();
@@ -78,6 +72,16 @@ const selectedPartitionName = ref<string>();
 let refreshTimer: number | undefined;
 const history = ref<MetricPoint[]>([]);
 const MAX_HISTORY_POINTS = 60;
+const messageFlowStatus = computed(() => {
+  if (!stats.value || stats.value.ratesUnavailable) {
+    return { kind: "unavailable", label: "-" };
+  }
+  const active = stats.value.msgRateIn > 0 || stats.value.msgRateOut > 0;
+  return {
+    kind: active ? "healthy" : "idle",
+    label: active ? t("mqMonitoring.flowActive") : t("mqMonitoring.flowIdle"),
+  };
+});
 
 const partitionRows = computed(() => extractPartitionRows(stats.value?.raw));
 const kafkaPartitionRows = computed(() => extractKafkaPartitionRows(stats.value?.raw));
@@ -219,10 +223,11 @@ function refreshNow() {
 }
 
 function appendHistoryPoint(statsData: TopicStats, backlogData?: BacklogStats) {
+  const ratesUnavailable = statsData.ratesUnavailable === true;
   const point: MetricPoint = {
     time: new Date().toLocaleTimeString(),
-    msgRateIn: statsData.msgRateIn,
-    msgRateOut: statsData.msgRateOut,
+    msgRateIn: ratesUnavailable ? null : statsData.msgRateIn,
+    msgRateOut: ratesUnavailable ? null : statsData.msgRateOut,
     backlogSize: statsData.backlogSize,
     msgBacklog: backlogData?.msgBacklog ?? 0,
     consumerLagMs: extractConsumerLagMs(statsData.raw),
@@ -281,26 +286,6 @@ function extractRocketMqPartitionRows(raw: unknown): RocketMqPartitionStatsRow[]
     .sort((a, b) => a.partition - b.partition || a.brokerName.localeCompare(b.brokerName));
 }
 
-function extractKafkaPartitionRows(raw: unknown): KafkaPartitionStatsRow[] {
-  return arrayObjects(objectRecord(raw).partitionStats)
-    .map((body) => ({
-      partition: numberField(body.partition) ?? 0,
-      beginOffset: numberField(body.beginOffset) ?? 0,
-      endOffset: numberField(body.endOffset) ?? 0,
-      messageCount: numberField(body.messageCount) ?? 0,
-      leader: numberField(body.leader) ?? -1,
-      replicas: numberArrayField(body.replicas),
-      isr: numberArrayField(body.isr),
-    }))
-    .sort((a, b) => a.partition - b.partition);
-}
-
-function isKafkaStatsPayload(raw: unknown): boolean {
-  if (props.mqSystemKind === "rocketmq") return false;
-  const root = objectRecord(raw);
-  return Array.isArray(root.partitionStats) || (numberField(root.partitions) !== undefined && numberField(root.replicationFactor) !== undefined && numberField(root.totalMessages) !== undefined);
-}
-
 function isKafkaPartitionHealthy(row: KafkaPartitionStatsRow): boolean {
   return row.leader >= 0 && (row.replicas.length === 0 || row.isr.length >= row.replicas.length);
 }
@@ -334,10 +319,6 @@ function arrayObjects(value: unknown): Record<string, unknown>[] {
 
 function numberField(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function numberArrayField(value: unknown): number[] {
-  return Array.isArray(value) ? value.map(numberField).filter((item): item is number => item !== undefined) : [];
 }
 
 function stringField(value: unknown): string {
@@ -379,6 +360,10 @@ function formatBytes(bytes: number): string {
 
 function formatNumber(num: number): string {
   return num.toLocaleString();
+}
+
+function formatMessageRate(rate: number, unavailable?: boolean): string {
+  return unavailable ? "-" : `${rate.toFixed(2)} msg/s`;
 }
 
 watch(
@@ -629,6 +614,9 @@ onUnmounted(() => {
       </div>
 
       <div class="stats-section">
+        <div class="monitoring-message-heading">
+          <button type="button" class="btn-sm" @click="emit('navigate-tab', { tab: 'messages', topic })">{{ t("mqMessages.queryTitle") }}</button>
+        </div>
         <MessageBrowser :connection-id="connectionId" :topic="getTopicRef()" mq-system-kind="kafka" appearance="monitoring" />
       </div>
     </div>
@@ -642,14 +630,14 @@ onUnmounted(() => {
             <div class="stat-icon"><Download :size="21" /></div>
             <div class="stat-content">
               <div class="stat-label">{{ t("mqMonitoring.inboundRate") }}</div>
-              <div class="stat-value">{{ stats.msgRateIn.toFixed(2) }} msg/s</div>
+              <div class="stat-value" data-testid="monitoring-rate-in">{{ formatMessageRate(stats.msgRateIn, stats.ratesUnavailable) }}</div>
             </div>
           </div>
           <div class="stat-card">
             <div class="stat-icon"><Upload :size="21" /></div>
             <div class="stat-content">
               <div class="stat-label">{{ t("mqMonitoring.outboundRate") }}</div>
-              <div class="stat-value">{{ stats.msgRateOut.toFixed(2) }} msg/s</div>
+              <div class="stat-value" data-testid="monitoring-rate-out">{{ formatMessageRate(stats.msgRateOut, stats.ratesUnavailable) }}</div>
             </div>
           </div>
           <div class="stat-card">
@@ -672,7 +660,7 @@ onUnmounted(() => {
       <div class="charts-grid">
         <div class="chart-panel">
           <h4>{{ t("mqMonitoring.rateTrend") }}</h4>
-          <VChart :option="rateChartOption" autoresize class="trend-chart" />
+          <VChart :option="rateChartOption" autoresize class="trend-chart" data-testid="monitoring-rate-chart" />
         </div>
         <div class="chart-panel">
           <h4>{{ t("mqMonitoring.backlogTrend") }}</h4>
@@ -847,8 +835,8 @@ onUnmounted(() => {
         <div class="health-indicators">
           <div class="health-item">
             <span class="health-label">{{ t("mqMonitoring.messageFlow") }}:</span>
-            <span :class="['health-badge', stats.msgRateIn > 0 || stats.msgRateOut > 0 ? 'healthy' : 'idle']">
-              {{ stats.msgRateIn > 0 || stats.msgRateOut > 0 ? t("mqMonitoring.flowActive") : t("mqMonitoring.flowIdle") }}
+            <span :class="['health-badge', messageFlowStatus.kind]" data-testid="monitoring-flow-status">
+              {{ messageFlowStatus.label }}
             </span>
           </div>
           <div class="health-item">
@@ -1492,6 +1480,19 @@ onUnmounted(() => {
 .health-badge.idle {
   background: color-mix(in srgb, var(--monitor-muted) 12%, transparent);
   color: var(--monitor-muted);
+}
+
+.health-badge.unavailable {
+  background: color-mix(in srgb, var(--monitor-muted) 8%, transparent);
+  color: var(--monitor-muted);
+}
+
+.monitoring-message-heading {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
 @keyframes monitor-spin {

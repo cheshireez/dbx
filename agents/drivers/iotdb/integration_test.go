@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,24 @@ func TestLiveIoTDBAgentTreeAndTable(t *testing.T) {
 		mustExecuteNonQuery(t, treeServer, fmt.Sprintf("INSERT INTO %s(time,s1) VALUES(%d,%d)", treeDevice, index, index*10), "")
 	}
 
+	// 1.3.x servers order aggregate TsBlock columns by their own aggregate
+	// layout, not the SELECT list; values must still line up with the headers
+	// (https://github.com/t8y2/dbx/issues/7306).
+	aggregate, err := treeServer.executeQuery(queryOptions{
+		SQL:     "SELECT max_time(s1), avg(s1), max_value(s1), min_value(s1) FROM " + treeDevice,
+		MaxRows: 10,
+	})
+	if err != nil || len(aggregate.Rows) != 1 {
+		t.Fatalf("tree aggregate = %#v, %v", aggregate, err)
+	}
+	wantAggregateRow := []any{"4", 25.0, int64(40), int64(10)}
+	if !reflect.DeepEqual(aggregate.Rows[0], wantAggregateRow) {
+		t.Fatalf("tree aggregate row = %#v, want %#v", aggregate.Rows[0], wantAggregateRow)
+	}
+	if aggregate.ColumnTypes[0] != "TIMESTAMP(ms)" {
+		t.Fatalf("tree aggregate max_time type = %#v", aggregate.ColumnTypes)
+	}
+
 	tables, err := treeServer.listTables(treeDatabase, metadataListConstraints{})
 	if err != nil || len(tables) != 1 || tables[0].Name != "d1" {
 		t.Fatalf("tree listTables() = %#v, %v", tables, err)
@@ -42,6 +61,9 @@ func TestLiveIoTDBAgentTreeAndTable(t *testing.T) {
 	page, err := treeServer.executeQueryPage(queryOptions{SQL: "SELECT * FROM " + treeDevice, MaxRows: 3}, 2)
 	if err != nil || len(page.Rows) != 2 || !page.HasMore || page.SessionID == nil {
 		t.Fatalf("tree first page = %#v, %v", page, err)
+	}
+	if page.ColumnTypes[0] != "TIMESTAMP(ms)" || page.Rows[0][0] != "1" {
+		t.Fatalf("tree time column = types %#v row %#v", page.ColumnTypes, page.Rows[0])
 	}
 	lastPage, err := treeServer.fetchQueryPage(*page.SessionID, 2)
 	if err != nil || len(lastPage.Rows) != 1 || lastPage.HasMore || !lastPage.Truncated {
@@ -62,15 +84,15 @@ func TestLiveIoTDBAgentTreeAndTable(t *testing.T) {
 	mustExecuteNonQuery(t, tableServer, "CREATE DATABASE "+quoteTableIdentifier(tableDatabase), "")
 	mustExecuteNonQuery(t, tableServer,
 		"CREATE TABLE "+quoteTableIdentifier(tableDatabase)+"."+quoteTableIdentifier("d1")+
-			" (time TIMESTAMP TIME, device STRING TAG, s1 INT64 FIELD COMMENT 'value') COMMENT 'DBX live test' WITH (TTL='INF')",
+			" (time TIMESTAMP TIME, device STRING TAG, event_time TIMESTAMP FIELD, s1 INT64 FIELD COMMENT 'value') COMMENT 'DBX live test' WITH (TTL='INF')",
 		tableDatabase,
 	)
 	mustExecuteNonQuery(t, tableServer,
-		"INSERT INTO "+quoteTableIdentifier("d1")+"(time,device,s1) VALUES(1,'a',10),(2,'a',20)",
+		"INSERT INTO "+quoteTableIdentifier("d1")+"(time,device,event_time,s1) VALUES(1,'a',1001,10),(2,'a',1002,20)",
 		tableDatabase,
 	)
 	tableColumns, err := tableServer.getColumns(tableDatabase, "d1")
-	if err != nil || len(tableColumns) != 3 || !tableColumns[0].IsPrimaryKey || !tableColumns[1].IsPrimaryKey {
+	if err != nil || len(tableColumns) != 4 || !tableColumns[0].IsPrimaryKey || !tableColumns[1].IsPrimaryKey || tableColumns[2].IsPrimaryKey {
 		t.Fatalf("table getColumns() = %#v, %v", tableColumns, err)
 	}
 	comment, err := tableServer.getTableComment(tableDatabase, "d1")
@@ -78,12 +100,67 @@ func TestLiveIoTDBAgentTreeAndTable(t *testing.T) {
 		t.Fatalf("table comment = %#v, %v", comment, err)
 	}
 	result, err := tableServer.executeQuery(queryOptions{SQL: "SELECT * FROM d1 ORDER BY time", Database: tableDatabase, MaxRows: 10})
-	if err != nil || len(result.Rows) != 2 || result.Rows[0][0] != "1970-01-01T08:00:00.001+08:00" {
+	if err != nil || len(result.Rows) != 2 || result.ColumnTypes[0] != "TIMESTAMP(ms)" || result.ColumnTypes[2] != "TIMESTAMP(ms)" || result.Rows[0][0] != "1" || result.Rows[0][2] != "1001" {
 		t.Fatalf("table query = %#v, %v", result, err)
 	}
 	tableDDL, err := tableServer.getTableDDL(tableDatabase, "d1")
 	if err != nil || !strings.Contains(tableDDL, "COMMENT 'DBX live test'") || !strings.Contains(tableDDL, `"device" STRING TAG`) {
 		t.Fatalf("table DDL = %q, %v", tableDDL, err)
+	}
+}
+
+func TestLiveIoTDBAgentTreeDatabaseConnection(t *testing.T) {
+	if os.Getenv("DBX_IOTDB_LIVE") != "1" {
+		t.Skip("set DBX_IOTDB_LIVE=1 to run against a real IoTDB server")
+	}
+	database := "root.dbx_go_connection_" + strconv.Itoa(os.Getpid())
+	bootstrap := liveIoTDBServer(t, connectParams{})
+	defer bootstrap.disconnect()
+	mustExecuteNonQuery(t, bootstrap, "CREATE DATABASE "+database, "")
+	defer func() { _ = bootstrap.executeNonQuery("DELETE DATABASE "+database, "", 0) }()
+
+	scoped := liveIoTDBServer(t, connectParams{Database: database})
+	defer scoped.disconnect()
+	if err := scoped.validateConnection(); err != nil {
+		t.Fatal(err)
+	}
+	tables, err := scoped.listTables(database, metadataListConstraints{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tables == nil {
+		t.Fatal("expected an initialized tree table list")
+	}
+}
+
+func TestLiveIoTDBAgentTreeTimeAggregates(t *testing.T) {
+	if os.Getenv("DBX_IOTDB_LIVE") != "1" {
+		t.Skip("set DBX_IOTDB_LIVE=1 to run against a real IoTDB server")
+	}
+	database := "root.dbx_go_time_" + strconv.Itoa(os.Getpid())
+	device := database + ".d1"
+	server := liveIoTDBServer(t, connectParams{Database: database})
+	defer server.disconnect()
+	defer func() { _ = server.executeNonQuery("DELETE DATABASE "+database, "", 0) }()
+
+	mustExecuteNonQuery(t, server, "CREATE DATABASE "+database, "")
+	mustExecuteNonQuery(t, server, "CREATE TIMESERIES "+device+".s1 WITH DATATYPE=INT64, ENCODING=RLE", "")
+	mustExecuteNonQuery(t, server, "INSERT INTO "+device+"(time,s1) VALUES(1,10),(2,20)", "")
+
+	result, err := server.executeQuery(queryOptions{
+		SQL:     "SELECT max_time(s1), max_by(time,s1), max_by(s1,time) FROM " + device,
+		MaxRows: 10,
+	})
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("tree time aggregates = %#v, %v", result, err)
+	}
+	wantTypes := []string{"TIMESTAMP(ms)", "TIMESTAMP(ms)", "INT64"}
+	if !reflect.DeepEqual(result.ColumnTypes, wantTypes) {
+		t.Fatalf("tree time aggregate types = %#v, want %#v", result.ColumnTypes, wantTypes)
+	}
+	wantRow := []any{"2", "2", int64(20)}
+	if !reflect.DeepEqual(result.Rows[0], wantRow) {
+		t.Fatalf("tree time aggregate row = %#v, want %#v", result.Rows[0], wantRow)
 	}
 }
 
