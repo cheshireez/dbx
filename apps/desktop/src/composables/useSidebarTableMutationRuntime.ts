@@ -12,7 +12,7 @@ import {
   buildTruncateTableSql,
   buildVacuumTableSql,
   supportsDropTableCascade,
-  supportsNativeMysqlAutoIncrement,
+  supportsMysqlAutoIncrement,
   supportsTruncateTableCascade,
   type MysqlAutoIncrementSqlOptions,
   type TableAdminSqlOptions,
@@ -24,6 +24,7 @@ import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
 import { uuid } from "@/lib/common/utils";
 import * as api from "@/lib/backend/api";
 import { normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";
+import { recordTableMutationHistory, type TableMutationHistoryStore } from "@/lib/history/tableMutationHistory";
 import {
   sidebarDangerTarget,
   sidebarDangerRunningExecutionId,
@@ -57,6 +58,7 @@ interface SidebarTableMutationRuntimeOptions {
   executeWithProductionGuard: (node: Pick<TreeNode, "connectionId" | "database" | "schema">, sql: string, options?: { database?: string; schema?: string; executionId?: string; isCancelledBeforeDispatch?: () => boolean; markDispatched?: () => void }) => Promise<unknown>;
   closeDroppedTableObjectTabsForNode: (node: TreeNode) => void;
   refreshMutatedTableDataTabsForNode: (node: TreeNode) => Promise<void>;
+  historyStore?: TableMutationHistoryStore;
 }
 
 export function useSidebarTableMutationRuntime(options: SidebarTableMutationRuntimeOptions) {
@@ -72,7 +74,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
   });
   const canDropTableCascade = computed(() => activeNode.value.type === "table" && supportsDropTableCascade(currentDatabaseType()));
   const canTruncateTableCascade = computed(() => activeNode.value.type === "table" && supportsTruncateTableCascade(currentDatabaseType()));
-  const supportsMysqlAutoIncrement = computed(() => activeNode.value.type === "table" && supportsNativeMysqlAutoIncrement(activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined));
+  const supportsMysqlAutoIncrementAction = computed(() => activeNode.value.type === "table" && supportsMysqlAutoIncrement(activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined));
 
   function tableAdminSqlOptions(optionsOverride?: { cascade?: boolean }): TableAdminSqlOptions {
     const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
@@ -151,7 +153,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
   }
 
   function mysqlAutoIncrement() {
-    if (!supportsMysqlAutoIncrement.value) return;
+    if (!supportsMysqlAutoIncrementAction.value) return;
     mysqlAutoIncrementValue.value = "1";
     mysqlAutoIncrementPreviewKey.value = "";
     void refreshMysqlAutoIncrementPreviewSql();
@@ -163,7 +165,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     if (!node.connectionId || !node.database) return;
     try {
       const config = connectionStore.getConfig(node.connectionId);
-      if (!supportsNativeMysqlAutoIncrement(config)) throw new Error("Setting AUTO_INCREMENT is supported only for native MySQL connections.");
+      if (!supportsMysqlAutoIncrement(config)) throw new Error("Setting AUTO_INCREMENT is supported only for compatible MySQL-family connections.");
       await connectionStore.ensureConnected(node.connectionId);
       const sqlOptions = mysqlAutoIncrementSqlOptionsForNode(node);
       const previewKey = mysqlAutoIncrementPreviewKeyForNode(node, sqlOptions);
@@ -458,9 +460,13 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     const { node, buildSql, onSuccess } = config;
     if (!node.connectionId || node.database == null) return;
     const { executionId, isCancelledBeforeDispatch, markDispatched, wasCancelled, cancelConfirmed, waitForCancelConfirmation, markHandedOff } = beginDangerRunningExecution(node.label);
+    const start = Date.now();
+    let executedSql = "";
+    let successRecorded = false;
     try {
       await connectionStore.ensureConnected(node.connectionId);
       const sql = await buildSql();
+      executedSql = sql;
       if (isCancelledBeforeDispatch()) throw new Error(DANGER_OPERATION_CANCELLED_BEFORE_DISPATCH_MESSAGE);
       const executed = await options.executeWithProductionGuard(node, sql, { database: node.database, schema: node.schema, executionId, isCancelledBeforeDispatch, markDispatched });
       if (executed === undefined) {
@@ -469,6 +475,18 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
         endDangerRunningExecution();
         return;
       }
+      if (options.historyStore) {
+        await recordTableMutationHistory(options.historyStore, {
+          connectionId: node.connectionId,
+          connectionName: connectionStore.getConfig(node.connectionId)?.name,
+          database: node.database,
+          sql,
+          elapsedMs: Date.now() - start,
+          success: true,
+          target: node.label,
+        }).catch((err) => console.warn("[DBX] failed to record table mutation history", err));
+        successRecorded = true;
+      }
       await onSuccess(node);
       endDangerRunningExecution();
     } catch (error: any) {
@@ -476,6 +494,18 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       const backendError = normalizeBackendError(error) ?? undefined;
       const cancellationWasRequested = wasCancelled();
       const cancellationWasConfirmed = cancelConfirmed() || (cancellationWasRequested && (await waitForCancelConfirmation()));
+      if (executedSql && !successRecorded && options.historyStore && !cancellationWasRequested && !cancellationWasConfirmed && !isCancelledBeforeDispatch()) {
+        await recordTableMutationHistory(options.historyStore, {
+          connectionId: node.connectionId,
+          connectionName: connectionStore.getConfig(node.connectionId)?.name,
+          database: node.database,
+          sql: executedSql,
+          elapsedMs: Date.now() - start,
+          success: false,
+          error: message,
+          target: node.label,
+        }).catch((err) => console.warn("[DBX] failed to record table mutation history", err));
+      }
       toastDangerOperationError(node.label, message, cancellationWasRequested, cancellationWasConfirmed, backendError);
       if (cancellationWasConfirmed || !isQueryTimeoutErrorMessage(message, backendError)) {
         endDangerRunningExecution();
@@ -541,7 +571,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     supportsVacuum,
     canDropTableCascade,
     canTruncateTableCascade,
-    supportsMysqlAutoIncrement,
+    supportsMysqlAutoIncrement: supportsMysqlAutoIncrementAction,
     refreshDropTablePreviewSql,
     refreshTruncateTablePreviewSql,
     dropTable,

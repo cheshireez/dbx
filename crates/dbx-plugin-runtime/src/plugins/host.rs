@@ -10,9 +10,9 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use super::{
     InstalledPlugin, PluginBinaryMessage, PluginConnectionActionContribution, PluginConnectionCapability,
     PluginConnectionProviderContribution, PluginEvent, PluginFormFieldBinding, PluginFormFieldDefinition,
-    PluginFormFieldType, PluginRegistry, PluginRuntimeEnv, PluginSessionState, PluginSidecarSession,
-    PLUGIN_CONNECTION_ACTION_METHOD, PLUGIN_CONNECTION_CONNECT_METHOD, PLUGIN_CONNECTION_DISCONNECT_METHOD,
-    PLUGIN_CONNECTION_TEST_METHOD,
+    PluginFormFieldType, PluginPackageInstaller, PluginRegistry, PluginRuntimeEnv, PluginSessionState,
+    PluginSidecarSession, PluginTrustStore, PLUGIN_CONNECTION_ACTION_METHOD, PLUGIN_CONNECTION_CONNECT_METHOD,
+    PLUGIN_CONNECTION_DISCONNECT_METHOD, PLUGIN_CONNECTION_TEST_METHOD,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +51,15 @@ pub struct PluginConnectionHandle {
 impl PluginConnectionHandle {
     pub fn is_running(&self) -> bool {
         self.session.as_ref().is_none_or(|session| session.status().state == PluginSessionState::Running)
+    }
+
+    /// The lifecycle payload this connection was opened with: provider,
+    /// hydrated connection, and the runtime endpoint *after* DBX transport
+    /// layers. Host-initiated calls that act on an open connection (for
+    /// example plugin MCP tools) must reuse it instead of rebuilding a payload
+    /// from the saved config, which would bypass the tunnel.
+    pub fn lifecycle_params(&self) -> &serde_json::Value {
+        &self.params
     }
 
     pub async fn disconnect(&self) -> Result<(), String> {
@@ -117,15 +126,16 @@ impl PluginHost {
         env: PluginRuntimeEnv,
     ) -> Result<Arc<PluginSidecarSession>, String> {
         let _activity = self.inner.registry.lifecycle.begin_operation(plugin_id)?;
-        if let Some(session) = self.running_session(plugin_id).await {
-            return Ok(session);
-        }
-
         let _activation = self.inner.activation_lock.lock().await;
         if let Some(session) = self.running_session(plugin_id).await {
             return Ok(session);
         }
-        self.inner.sessions.write().await.remove(plugin_id);
+        // Failed/stopping sessions still own process handles. Do not silently replace one.
+        let previous = self.inner.sessions.read().await.get(plugin_id).cloned();
+        if let Some(previous) = previous {
+            previous.shutdown().await?;
+            self.inner.sessions.write().await.remove(plugin_id);
+        }
 
         let plugin = self
             .inner
@@ -136,10 +146,104 @@ impl PluginHost {
             return Err(format!("Plugin '{plugin_id}' is incompatible: {}", plugin.compatibility.errors.join("; ")));
         }
         let env = env.with_plugin_data_dir(&self.inner.registry.plugin_data_dir(&plugin.manifest.id));
-        let session = PluginSidecarSession::start(plugin, self.inner.registry.app_version().to_string(), env).await?;
+        let runtime_lease = self.inner.registry.lifecycle.runtime_lease(plugin_id)?;
+        let probe = self.inner.registry.lifecycle.update_probe(plugin_id)?;
+        let session = PluginSidecarSession::start_with_runtime_lease(
+            plugin,
+            self.inner.registry.app_version().to_string(),
+            env,
+            runtime_lease,
+        )
+        .await?;
+        // Registration can wait for the session map; cancellation there must still stop the child.
+        let startup = super::runtime::ShutdownOnDrop::new(session.clone());
         self.forward_session_events(&session);
         self.inner.sessions.write().await.insert(plugin_id.to_string(), session.clone());
+        self.watch_session(&session, probe);
+        startup.disarm();
         Ok(session)
+    }
+
+    /// Discovery must not leave one idle process per installed plugin in every MCP client.
+    /// Reuse a live session, but keep a session started only for probing short-lived.
+    pub async fn probe<T>(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Option<Duration>,
+    ) -> Result<T, String>
+    where
+        T: DeserializeOwned,
+    {
+        let _activity = self.inner.registry.lifecycle.begin_operation(plugin_id)?;
+        if let Some(session) = self.running_session(plugin_id).await {
+            return session.invoke_with_timeout(method, params, None, timeout).await;
+        }
+        let plugin = self
+            .inner
+            .registry
+            .find_plugin(plugin_id)?
+            .ok_or_else(|| format!("Plugin '{plugin_id}' is not installed"))?;
+        if !plugin.compatibility.compatible {
+            return Err(format!("Plugin '{plugin_id}' is incompatible: {}", plugin.compatibility.errors.join("; ")));
+        }
+        let env = PluginRuntimeEnv::default().with_plugin_data_dir(&self.inner.registry.plugin_data_dir(plugin_id));
+        let session = PluginSidecarSession::start_with_runtime_lease(
+            plugin,
+            self.inner.registry.app_version().to_string(),
+            env,
+            self.inner.registry.lifecycle.runtime_lease(plugin_id)?,
+        )
+        .await?;
+        let _cleanup = super::runtime::ShutdownOnDrop::new(session.clone());
+        let result = session.invoke_with_timeout(method, params, None, timeout).await;
+        let shutdown = session.shutdown().await;
+        match (result, shutdown) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(shutdown)) => Err(format!("{error}; additionally failed to stop plugin: {shutdown}")),
+        }
+    }
+
+    fn watch_session(&self, session: &Arc<PluginSidecarSession>, probe: super::lifecycle::PluginUpdateProbe) {
+        let owner = Arc::downgrade(&self.inner);
+        let runtime = Arc::downgrade(session);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let Some(session) = runtime.upgrade() else { break };
+                let Some(inner) = owner.upgrade() else {
+                    // The stdout task owns an Arc to the session; dropping the host alone cannot
+                    // break that cycle while the sidecar is waiting for its next request.
+                    match session.shutdown().await {
+                        Ok(()) => break,
+                        Err(error) => log::warn!("{error}"),
+                    }
+                    continue;
+                };
+                let plugin_id = &session.plugin().manifest.id;
+                let stop = match probe.requested() {
+                    Ok(requested) => {
+                        requested
+                            || matches!(
+                                session.status().state,
+                                PluginSessionState::Stopping | PluginSessionState::Stopped | PluginSessionState::Exited
+                            )
+                    }
+                    Err(error) => {
+                        log::warn!("{error}");
+                        false
+                    }
+                };
+                if stop {
+                    match stop_host_session(&inner, plugin_id, Some(&session)).await {
+                        Ok(()) => break,
+                        Err(error) => log::warn!("{error}"),
+                    }
+                }
+            }
+        });
     }
 
     pub async fn invoke<T>(
@@ -330,17 +434,47 @@ impl PluginHost {
         active
     }
 
-    pub async fn stop(&self, plugin_id: &str) {
-        if let Some(session) = self.inner.sessions.write().await.remove(plugin_id) {
-            session.shutdown().await;
+    pub async fn stop(&self, plugin_id: &str) -> Result<(), String> {
+        stop_host_session(&self.inner, plugin_id, None).await
+    }
+
+    pub async fn stop_all(&self) -> Result<(), String> {
+        let plugins = self.inner.sessions.read().await.keys().cloned().collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for plugin_id in plugins {
+            if let Err(error) = self.stop(&plugin_id).await {
+                errors.push(format!("{plugin_id}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("Failed to stop plugin sessions: {}", errors.join("; ")))
         }
     }
 
-    pub async fn stop_all(&self) {
-        let sessions = std::mem::take(&mut *self.inner.sessions.write().await);
-        for (_, session) in sessions {
-            session.shutdown().await;
-        }
+    /// Runtime-aware uninstall. The lifecycle update lease is taken *before* the sidecar is stopped
+    /// and held until the store-level uninstall committed, so nothing can re-activate the plugin
+    /// and re-lock its container between the runtime stop and the filesystem rename. It also keeps
+    /// `PluginHost::sessions` and the plugin store consistent: the session is removed and the
+    /// container gone before the lease is released.
+    ///
+    /// Callers drain the plugin's connection pools and external driver pools first: the lease is
+    /// refused while the plugin still has an active connection or operation.
+    pub async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), String> {
+        let update = self.inner.registry.lifecycle.begin_update(plugin_id)?;
+        self.stop(plugin_id).await?;
+        let root_dir = self.inner.registry.root_dir().to_path_buf();
+        let app_version = self.inner.registry.app_version().to_string();
+        // Uninstall never validates a package signature, so it must not load the user trust store.
+        let installer = PluginPackageInstaller::with_trust_store(root_dir, app_version, PluginTrustStore::default());
+        let plugin_id = plugin_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            update.drain_runtimes()?;
+            installer.uninstall(&plugin_id)
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     async fn running_session(&self, plugin_id: &str) -> Option<Arc<PluginSidecarSession>> {
@@ -412,6 +546,24 @@ impl PluginHost {
             }
         });
     }
+}
+
+async fn stop_host_session(
+    inner: &PluginHostInner,
+    plugin_id: &str,
+    expected: Option<&Arc<PluginSidecarSession>>,
+) -> Result<(), String> {
+    let _activation = inner.activation_lock.lock().await;
+    let session = inner.sessions.read().await.get(plugin_id).cloned();
+    if let Some(session) = session {
+        if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &session)) {
+            return Ok(());
+        }
+        session.shutdown().await?;
+        // Keep a session tracked on failure, so a retry can still terminate its process tree.
+        inner.sessions.write().await.remove(plugin_id);
+    }
+    Ok(())
 }
 
 fn required_plugin_binding<'a>(value: &'a Option<String>, field: &str) -> Result<&'a str, String> {
@@ -826,6 +978,43 @@ mod tests {
     };
     use crate::models::connection::ConnectionConfig;
     use crate::plugins::PluginConnectionProviderContribution;
+
+    #[tokio::test]
+    async fn uninstall_plugin_holds_one_update_lease_across_the_runtime_and_the_store() {
+        use crate::plugins::installer::PLUGIN_TRASH_DIR;
+        use crate::plugins::{PluginHost, PluginRegistry};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let plugin_dir = root.join("sample.hello");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::json!({ "id": "sample.hello", "name": "Sample", "version": "1.0.0", "protocol_version": 1 })
+                .to_string(),
+        )
+        .unwrap();
+        let registry = PluginRegistry::new_with_app_version(root.clone(), "0.5.67");
+        let lifecycle = registry.lifecycle();
+        let host = PluginHost::new(registry);
+
+        // An active operation refuses the uninstall before anything is stopped or deleted, so the
+        // caller still sees a complete, discoverable plugin.
+        let operation = lifecycle.begin_operation("sample.hello").unwrap();
+        let refused = host.uninstall_plugin("sample.hello").await.unwrap_err();
+        assert!(refused.contains("active operations"), "{refused}");
+        assert!(plugin_dir.join("manifest.json").is_file(), "a refused uninstall must not touch the container");
+        drop(operation);
+
+        host.uninstall_plugin("sample.hello").await.unwrap();
+        assert!(!plugin_dir.exists());
+        let tombstones = std::fs::read_dir(root.join(PLUGIN_TRASH_DIR)).map(|entries| entries.count()).unwrap_or(0);
+        assert_eq!(tombstones, 0, "a successful uninstall sweeps its tombstone");
+
+        // The lease is released again, and it was scoped to just this plugin.
+        assert!(lifecycle.begin_update("sample.hello").is_ok());
+        assert!(lifecycle.begin_update("sample.other").is_ok());
+    }
 
     #[tokio::test]
     async fn ui_only_connections_hold_update_guards_but_saved_configs_do_not() {

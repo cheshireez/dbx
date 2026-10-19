@@ -12,6 +12,54 @@ pub enum IdentifierCase {
     Mixed,
 }
 
+/// Why the backend declared a connection's pools dead while nobody was using it.
+///
+/// A stable enum on purpose: the frontend only needs to tell the two cases apart, and raw
+/// driver/network error text must not leak into a background UI notification (#4339).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionLivenessFailureKind {
+    /// The keepalive probe ran and reported a dead connection.
+    ProbeFailed,
+    /// The keepalive probe exceeded its budget.
+    TimedOut,
+}
+
+/// A message on the connection-liveness channel (#4339).
+///
+/// One shape for both shells and both transports, discriminated by `kind`. The `Resync`
+/// variant exists because a broadcast subscriber can fall behind: without a way to say
+/// "you skipped messages", a dropped `Lost` would leave a sidebar claiming a dead
+/// connection is connected until the user happened to act on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ConnectionLivenessMessage {
+    /// The connection has no pools left, so the sidebar must stop showing it as connected.
+    Lost { connection_id: String, failure_kind: ConnectionLivenessFailureKind },
+    /// The transport skipped messages and must re-check every connection it currently
+    /// shows as connected.
+    Resync,
+}
+
+/// A message on the connection-idle-closed channel (#12112).
+///
+/// Published when a connection's pools were closed because the connection stayed idle
+/// longer than its own `idle_disconnect_secs`. One shape for both shells and both
+/// transports, so the frontend parses the same payload everywhere: the desktop shell
+/// forwards it as the `dbx:connection-idle-closed` event, the web shell streams it over
+/// SSE. `connectionId` is camelCase in JSON to match the frontend type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionIdleClosedEvent {
+    pub connection_id: String,
+    /// 关闭发生的墙钟时间（Unix 毫秒）。
+    ///
+    /// 前端用它识别「迟到事件」：SSE / 事件通道都有缓冲，事件可能在本连接已经重新建立
+    /// 之后才到达；此时这次断开描述的已经是上一个会话，前端应忽略，否则会连带关掉刚建好
+    /// 的新会话。用墙钟而非 `Instant` 是因为要跨进程（web 端是浏览器与服务端）比较。
+    pub closed_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DatabaseConnectionInfo {
@@ -93,6 +141,15 @@ pub struct RedisKeyGrouping {
     pub rules: Vec<RedisKeyGroupRule>,
 }
 
+/// Sidebar marker presentation only; never changes production safety assessment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionBadgeScope {
+    Connection,
+    Database,
+    Table,
+}
+
 #[derive(Clone, Serialize, PartialEq)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -123,6 +180,12 @@ pub struct ConnectionConfig {
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_system_schemas: bool,
+    /// Frontend navigation preference: exhaust the paginated Tables group when opened.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_auto_load_all_tables: bool,
+    /// Oracle sidebar preference. Absent means shown; only an explicit opt-out is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_database_links: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     /// SQL statements executed right after the connection is established
@@ -143,6 +206,14 @@ pub struct ConnectionConfig {
     pub query_timeout_secs: u64,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    #[serde(default = "default_manual_transaction_timeout_secs")]
+    pub manual_transaction_timeout_secs: u64,
+    /// 连接空闲自动断开阈值（秒）：该连接连续多少秒没有任何查询活动，就关闭其名下
+    /// 全部连接池。0 表示不启用（opt-in），旧配置缺字段时反序列化即为 0，行为不变。
+    /// 注意：与上面的 `idle_timeout_secs`（连接池内空闲物理连接的回收）语义不同，
+    /// 两者并存但互不影响。
+    #[serde(default = "default_idle_disconnect_secs")]
+    pub idle_disconnect_secs: u64,
     #[serde(default = "default_keepalive_interval_secs")]
     pub keepalive_interval_secs: u64,
     #[serde(default)]
@@ -157,6 +228,21 @@ pub struct ConnectionConfig {
     pub sysdba: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_connection_type: Option<String>,
+    /// Connection-level NLS_LANG override for OCI connections. Empty keeps the
+    /// global default; a value makes this connection own a dedicated agent
+    /// process so its client charset cannot bleed into other sessions (the
+    /// variable is process-scoped for OCI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_oci_nls_lang: Option<String>,
+    /// Connection-level `TNS_ADMIN` override for OCI (thick) connections.
+    ///
+    /// Points at the directory holding `tnsnames.ora` / `sqlnet.ora` / the
+    /// wallet, so any OCI connection can use an ADB wallet or network options
+    /// without switching to the TNS connection form. Resolved against the
+    /// global default and the TNS connection string in
+    /// `dbx_core::connection::AppState::agent_launch_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_oci_tns_admin: Option<String>,
     #[serde(default)]
     pub connection_string: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +269,9 @@ pub struct ConnectionConfig {
     /// Empty means inherit the global editor setting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redis_key_templates: Vec<String>,
+    /// Default Redis MATCH pattern for new key-browser tabs; empty means all keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_key_filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis_key_grouping: Option<RedisKeyGrouping>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -231,6 +320,8 @@ pub struct ConnectionConfig {
     /// Database-level production markers for multi-database connections.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub production_databases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_badge_scope: Option<ProductionBadgeScope>,
     /// Metadata captured from the latest successful connection test for this saved config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_info: Option<DatabaseConnectionInfo>,
@@ -421,6 +512,16 @@ pub struct SshTunnelConfig {
     /// TCP-forwarding policy; enable only for trusted JumpServer/Koko setups.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_exec_channel_proxy: bool,
+    /// OpenSSH-style `ProxyCommand` used to reach this SSH host instead of a
+    /// direct TCP connection (e.g. `nc %h %p` or
+    /// `cloudflared access ssh --hostname %h`). Empty means a direct
+    /// connection. Resolved from `~/.ssh/config` when the host is an alias and
+    /// otherwise taken from the connection form. `%h`/`%p`/`%r`/`%%` are
+    /// expanded from the effective host, port, and user before the command
+    /// starts; the executable must be one of
+    /// `dbx_drivers::db::ssh_proxy_command::ALLOWED_PROXY_COMMAND_BINARIES`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy_command: String,
     /// When non-empty, this layer references a shared tunnel profile
     /// (Settings > Tunnels). The profile's configuration replaces this
     /// layer's own fields at connect time; only `id` and `enabled` are
@@ -519,6 +620,22 @@ pub fn default_idle_timeout_secs() -> u64 {
     60
 }
 
+/// Seconds a manual transaction may sit without executing a statement before DBX
+/// rolls it back.
+pub const DEFAULT_MANUAL_TRANSACTION_TIMEOUT_SECS: u64 = 300;
+pub const MIN_MANUAL_TRANSACTION_TIMEOUT_SECS: u64 = 30;
+pub const MAX_MANUAL_TRANSACTION_TIMEOUT_SECS: u64 = 86_400;
+
+pub fn default_manual_transaction_timeout_secs() -> u64 {
+    DEFAULT_MANUAL_TRANSACTION_TIMEOUT_SECS
+}
+
+/// 「连接空闲自动断开」阈值的默认值：0 表示默认不启用（opt-in）。
+/// 独立于 `default_idle_timeout_secs`，避免老配置被赋予超时关闭语义。
+pub fn default_idle_disconnect_secs() -> u64 {
+    0
+}
+
 pub fn default_keepalive_interval_secs() -> u64 {
     30
 }
@@ -581,6 +698,10 @@ struct ConnectionConfigData {
     #[serde(default)]
     pub show_system_schemas: bool,
     #[serde(default)]
+    pub sidebar_auto_load_all_tables: bool,
+    #[serde(default)]
+    pub show_database_links: Option<bool>,
+    #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
     pub init_script: Option<String>,
@@ -596,6 +717,10 @@ struct ConnectionConfigData {
     pub query_timeout_secs: u64,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    #[serde(default = "default_manual_transaction_timeout_secs")]
+    pub manual_transaction_timeout_secs: u64,
+    #[serde(default = "default_idle_disconnect_secs")]
+    pub idle_disconnect_secs: u64,
     #[serde(default = "default_keepalive_interval_secs")]
     pub keepalive_interval_secs: u64,
     #[serde(default)]
@@ -610,6 +735,10 @@ struct ConnectionConfigData {
     pub sysdba: bool,
     #[serde(default)]
     pub oracle_connection_type: Option<String>,
+    #[serde(default)]
+    pub oracle_oci_nls_lang: Option<String>,
+    #[serde(default)]
+    pub oracle_oci_tns_admin: Option<String>,
     #[serde(default)]
     pub connection_string: Option<String>,
     #[serde(default)]
@@ -634,6 +763,8 @@ struct ConnectionConfigData {
     pub redis_database_aliases: HashMap<String, String>,
     #[serde(default)]
     pub redis_key_templates: Vec<String>,
+    #[serde(default)]
+    pub redis_key_filter: Option<String>,
     #[serde(default)]
     pub redis_key_grouping: Option<RedisKeyGrouping>,
     #[serde(default)]
@@ -666,6 +797,8 @@ struct ConnectionConfigData {
     pub is_production: bool,
     #[serde(default)]
     pub production_databases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_badge_scope: Option<ProductionBadgeScope>,
     #[serde(default)]
     pub database_info: Option<DatabaseConnectionInfo>,
 }
@@ -691,6 +824,8 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             visible_database_patterns: data.visible_database_patterns,
             visible_schemas: data.visible_schemas,
             show_system_schemas: data.show_system_schemas,
+            sidebar_auto_load_all_tables: data.sidebar_auto_load_all_tables,
+            show_database_links: data.show_database_links,
             attached_databases: data.attached_databases,
             init_script: data.init_script,
             color: data.color,
@@ -699,6 +834,8 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             connect_timeout_secs: data.connect_timeout_secs,
             query_timeout_secs: data.query_timeout_secs,
             idle_timeout_secs: data.idle_timeout_secs,
+            manual_transaction_timeout_secs: data.manual_transaction_timeout_secs,
+            idle_disconnect_secs: data.idle_disconnect_secs,
             keepalive_interval_secs: data.keepalive_interval_secs,
             ssl: data.ssl,
             ca_cert_path: data.ca_cert_path,
@@ -706,6 +843,8 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             client_key_path: data.client_key_path,
             sysdba: data.sysdba,
             oracle_connection_type: data.oracle_connection_type,
+            oracle_oci_nls_lang: data.oracle_oci_nls_lang,
+            oracle_oci_tns_admin: data.oracle_oci_tns_admin,
             connection_string: data.connection_string,
             redis_connection_mode: data.redis_connection_mode,
             redis_sentinel_master: data.redis_sentinel_master,
@@ -718,6 +857,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_scan_page_size: data.redis_scan_page_size,
             redis_database_aliases: data.redis_database_aliases,
             redis_key_templates: data.redis_key_templates,
+            redis_key_filter: data.redis_key_filter,
             redis_key_grouping: data.redis_key_grouping,
             etcd_endpoints: data.etcd_endpoints,
             gbase_server: data.gbase_server,
@@ -734,6 +874,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             read_only: data.read_only,
             is_production: data.is_production,
             production_databases: data.production_databases,
+            production_badge_scope: data.production_badge_scope,
             database_info: data.database_info,
         }
     }
@@ -746,6 +887,7 @@ impl<'de> Deserialize<'de> for ConnectionConfig {
     {
         let mut value = Value::deserialize(deserializer)?;
         migrate_legacy_transport_layers(&mut value);
+        migrate_legacy_gbase8s_profile(&mut value);
         let data = ConnectionConfigData::deserialize(value).map_err(serde::de::Error::custom)?;
         if let Some(grouping) = &data.redis_key_grouping {
             let mut ids = std::collections::HashSet::new();
@@ -765,6 +907,20 @@ impl<'de> Deserialize<'de> for ConnectionConfig {
             }
         }
         Ok(data.into())
+    }
+}
+
+/// GBase 8s used to be the `gbase8s` driver profile of the MySQL-based `gbase` type. It is its own
+/// `gbase8s` type now (Informix dialect), so saved and in-flight configs are rewritten on load.
+fn migrate_legacy_gbase8s_profile(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let is_gbase = object.get("db_type").and_then(Value::as_str) == Some("gbase");
+    let is_8s_profile =
+        object.get("driver_profile").and_then(Value::as_str).is_some_and(|p| p.eq_ignore_ascii_case("gbase8s"));
+    if is_gbase && is_8s_profile {
+        object.insert("db_type".to_string(), Value::String("gbase8s".to_string()));
     }
 }
 
@@ -904,6 +1060,17 @@ impl ConnectionConfig {
         }
     }
 
+    /// Idle window of a manual transaction. `0` (legacy or unset payloads) falls
+    /// back to the default instead of rolling back immediately.
+    pub fn effective_manual_transaction_timeout_secs(&self) -> u64 {
+        if self.manual_transaction_timeout_secs == 0 {
+            default_manual_transaction_timeout_secs()
+        } else {
+            self.manual_transaction_timeout_secs
+                .clamp(MIN_MANUAL_TRANSACTION_TIMEOUT_SECS, MAX_MANUAL_TRANSACTION_TIMEOUT_SECS)
+        }
+    }
+
     pub fn effective_query_timeout_secs(&self) -> u64 {
         if self.query_timeout_secs == 0 {
             // An explicit 0 is the UI's "no limit"; a floor must not impose one.
@@ -934,6 +1101,9 @@ impl ConnectionConfig {
             DatabaseType::Kingbase | DatabaseType::Vastbase => Some("postgres"),
             DatabaseType::Highgo => Some("highgo"),
             DatabaseType::Uxdb => Some("uxdb"),
+            // GBase 8c keeps the PostgreSQL-shaped `postgres` maintenance database
+            // (measured on GBase8cV6 1.0.0B20), so an empty database field resolves to it.
+            DatabaseType::Gbase8c => Some("postgres"),
             DatabaseType::Yashandb => Some("yasdb"),
             DatabaseType::Oracle
                 if !self.oracle_connection_type.as_deref().is_some_and(|mode| mode.eq_ignore_ascii_case("tns")) =>
@@ -971,8 +1141,14 @@ impl ConnectionConfig {
             || self.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("starrocks"))
     }
 
+    pub fn is_doris(&self) -> bool {
+        self.db_type == DatabaseType::Doris
+            || (self.db_type == DatabaseType::Mysql
+                && self.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("doris")))
+    }
+
     pub fn bare_mysql_supports_tls(&self) -> bool {
-        self.is_starrocks()
+        self.is_doris() || self.is_starrocks()
     }
 
     pub fn bare_mysql_uses_tls(&self) -> bool {
@@ -1115,6 +1291,8 @@ impl ConnectionConfig {
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
             DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
+            | DatabaseType::Solr
+            | DatabaseType::CouchDb
             | DatabaseType::Meilisearch
             | DatabaseType::Hbase
             | DatabaseType::Qdrant
@@ -1124,11 +1302,13 @@ impl ConnectionConfig {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
+            DatabaseType::Salesforce => salesforce_instance_url(raw_host, self.ssl, port),
             DatabaseType::Dameng => format!("dm://{host}:{port}{db_part}"),
             DatabaseType::Kingbase => format!("kingbase://{host}:{port}{db_part}"),
             DatabaseType::Highgo => format!("highgo://{host}:{port}{db_part}"),
             DatabaseType::Uxdb => format!("uxdb://{host}:{port}{db_part}"),
             DatabaseType::Vastbase => format!("vastbase://{host}:{port}{db_part}"),
+            DatabaseType::Gbase8c => format!("gbase8c://{host}:{port}{db_part}"),
             DatabaseType::Goldendb => format!("goldendb://{host}:{port}{db_part}"),
             DatabaseType::Gaussdb => {
                 if is_multi_host(raw_host) {
@@ -1159,17 +1339,20 @@ impl ConnectionConfig {
             DatabaseType::Ignite => format!("ignite://{host}:{port}{db_part}"),
             DatabaseType::Ignite3 => format!("ignite3://{host}:{port}{db_part}"),
             DatabaseType::Gbase => format!("gbase://{host}:{port}{db_part}"),
+            DatabaseType::Gbase8s => format!("gbase8s://{host}:{port}{db_part}"),
             DatabaseType::H2 => format!("h2://{host}:{port}{db_part}"),
             DatabaseType::Snowflake => format!("snowflake://{host}/{db_part}"),
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
             DatabaseType::PrestoSql => format!("prestosql://{host}:{port}{db_part}"),
             DatabaseType::Hive | DatabaseType::Argo => format!("hive://{host}:{port}{db_part}"),
+            DatabaseType::Transwarp => format!("transwarp://{host}:{port}{db_part}"),
             DatabaseType::Kyuubi => format!("kyuubi://{host}:{port}{db_part}"),
             DatabaseType::Impala => format!("impala://{host}:{port}{db_part}"),
             DatabaseType::Spark => format!("spark://{host}:{port}{db_part}"),
             DatabaseType::Db2 => format!("db2://{host}:{port}{db_part}"),
             DatabaseType::Informix => format!("informix://{host}:{port}{db_part}"),
             DatabaseType::Neo4j => format!("neo4j://{host}:{port}{db_part}"),
+            DatabaseType::Nebula => format!("nebula://{host}:{port}{db_part}"),
             DatabaseType::Cassandra => format!("cassandra://{host}:{port}{db_part}"),
             DatabaseType::Bigquery => format!("bigquery://{host}/{db_part}"),
             DatabaseType::Spanner => self.spanner_display_url(&host, port),
@@ -1299,6 +1482,8 @@ impl ConnectionConfig {
             }
             DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
+            | DatabaseType::Solr
+            | DatabaseType::CouchDb
             | DatabaseType::Meilisearch
             | DatabaseType::Hbase
             | DatabaseType::Qdrant
@@ -1308,6 +1493,7 @@ impl ConnectionConfig {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
+            DatabaseType::Salesforce => salesforce_instance_url(raw_host, self.ssl, port),
             DatabaseType::Dameng => {
                 format!("dm://{}:{}@{host}:{port}{db_part}", username, password)
             }
@@ -1322,6 +1508,9 @@ impl ConnectionConfig {
             }
             DatabaseType::Vastbase => {
                 format!("vastbase://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Gbase8c => {
+                format!("gbase8c://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Goldendb => {
                 format!("goldendb://{}:{}@{host}:{port}{db_part}", username, password)
@@ -1382,6 +1571,9 @@ impl ConnectionConfig {
             DatabaseType::Gbase => {
                 format!("gbase://{}:{}@{host}:{port}{db_part}", username, password)
             }
+            DatabaseType::Gbase8s => {
+                format!("gbase8s://{}:{}@{host}:{port}{db_part}", username, password)
+            }
             DatabaseType::H2 => {
                 format!("h2://{}:{}@{host}:{port}{db_part}", username, password)
             }
@@ -1394,7 +1586,7 @@ impl ConnectionConfig {
             DatabaseType::PrestoSql => {
                 format!("prestosql://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Hive | DatabaseType::Argo => {
+            DatabaseType::Hive | DatabaseType::Argo | DatabaseType::Transwarp => {
                 format!("hive://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Kyuubi => {
@@ -1424,6 +1616,9 @@ impl ConnectionConfig {
             }
             DatabaseType::Neo4j => {
                 format!("neo4j://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Nebula => {
+                format!("nebula://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Cassandra => {
                 format!("cassandra://{}:{}@{host}:{port}{db_part}", username, password)
@@ -2415,22 +2610,71 @@ fn rewrite_mongo_uri_host(uri: &str, new_host: &str, new_port: u16) -> String {
     result
 }
 
+#[derive(Debug)]
+enum JdbcTransportEndpoint {
+    Standard { host: String, port: u16 },
+    As400(As400JdbcEndpoint),
+}
+
+#[derive(Debug)]
+struct As400JdbcEndpoint {
+    host: String,
+    port: u16,
+    host_range: std::ops::Range<usize>,
+    port_range: std::ops::Range<usize>,
+}
+
+#[derive(Debug)]
+struct As400JdbcProperty<'a> {
+    key: &'a str,
+    value: &'a str,
+    value_range: std::ops::Range<usize>,
+}
+
 pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
-    let rest = jdbc_transport_rest(url)?;
+    match parse_jdbc_transport_endpoint(url).ok()? {
+        JdbcTransportEndpoint::Standard { host, port } => Some((host, port)),
+        JdbcTransportEndpoint::As400(endpoint) => Some((endpoint.host, endpoint.port)),
+    }
+}
+
+/// Validates the endpoint syntax before a static JDBC transport tunnel is
+/// opened. In particular, jt400's implicit port-mapper flow needs two remote
+/// sockets and therefore cannot be represented by one forwarded port.
+pub fn validate_jdbc_transport_url(url: &str) -> Result<(), String> {
+    parse_jdbc_transport_endpoint(url)
+        .map(|_| ())
+        .map_err(|reason| format!("Cannot route JDBC connection string through a transport: {reason}"))
+}
+
+fn parse_jdbc_transport_endpoint(url: &str) -> Result<JdbcTransportEndpoint, String> {
+    let rest = jdbc_transport_rest(url).ok_or_else(|| "unsupported URL format".to_string())?;
+
+    if let Some(after_as400) = strip_prefix_ignore_ascii_case(rest, "as400://") {
+        return parse_as400_jdbc_endpoint(url, after_as400).map(JdbcTransportEndpoint::As400);
+    }
 
     // jdbc:oracle:thin:@host:port:SID  or  jdbc:oracle:thin:@//host:port/service
     if let Some(after) = rest.strip_prefix("oracle:") {
-        let at_pos = after.find('@')?;
+        let at_pos = after.find('@').ok_or_else(|| "unsupported URL format".to_string())?;
         let after_at = &after[at_pos + 1..];
         if after_at.trim_start().starts_with('(') {
-            let host = oracle_descriptor_value(after_at, "HOST")?;
-            let port = oracle_descriptor_value(after_at, "PORT")?;
-            return Some((host, port.parse().ok()?));
+            let host = oracle_descriptor_value(after_at, "HOST").ok_or_else(|| "unsupported URL format".to_string())?;
+            let port = oracle_descriptor_value(after_at, "PORT")
+                .and_then(|port| port.parse().ok())
+                .ok_or_else(|| "unsupported URL format".to_string())?;
+            return Ok(JdbcTransportEndpoint::Standard { host, port });
         }
         let after_at = after_at.strip_prefix("//").unwrap_or(after_at);
-        let host_port = after_at.split(&['/', ':', '?'][..]).next()?;
-        let port_str = after_at.strip_prefix(host_port)?.strip_prefix(':')?.split(&[':', '/', ';', '?'][..]).next()?;
-        return Some((host_port.to_string(), port_str.parse().ok()?));
+        let host_port =
+            after_at.split(&['/', ':', '?'][..]).next().ok_or_else(|| "unsupported URL format".to_string())?;
+        let port_str = after_at
+            .strip_prefix(host_port)
+            .and_then(|value| value.strip_prefix(':'))
+            .and_then(|value| value.split(&[':', '/', ';', '?'][..]).next())
+            .ok_or_else(|| "unsupported URL format".to_string())?;
+        let port = port_str.parse().map_err(|_| "unsupported URL format".to_string())?;
+        return Ok(JdbcTransportEndpoint::Standard { host: host_port.to_string(), port });
     }
 
     // jdbc:sqlserver://host:port;prop=val  or  jdbc:sqlserver://host\instance:port;...
@@ -2438,13 +2682,16 @@ pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
         let authority = after.split(';').next().unwrap_or(after);
         let authority = authority.split('\\').next().unwrap_or(authority);
         return match authority.rsplit_once(':') {
-            Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
-            None => Some((authority.to_string(), 1433)),
+            Some((host, port)) => port
+                .parse()
+                .map(|port| JdbcTransportEndpoint::Standard { host: host.to_string(), port })
+                .map_err(|_| "unsupported URL format".to_string()),
+            None => Ok(JdbcTransportEndpoint::Standard { host: authority.to_string(), port: 1433 }),
         };
     }
 
     // Generic: jdbc:subprotocol://[user:pass@]host:port[/path][?query]
-    let scheme_end = rest.find("://")?;
+    let scheme_end = rest.find("://").ok_or_else(|| "unsupported URL format".to_string())?;
     let after_scheme = &rest[scheme_end + 3..];
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     let authority = authority.split('?').next().unwrap_or(authority);
@@ -2452,18 +2699,170 @@ pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
         Some(idx) => &authority[idx + 1..],
         None => authority,
     };
-    match host_port.rsplit_once(':') {
-        Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
-        None => None,
+    let (host, port) = host_port.rsplit_once(':').ok_or_else(|| "unsupported URL format".to_string())?;
+    let port = port.parse().map_err(|_| "unsupported URL format".to_string())?;
+    Ok(JdbcTransportEndpoint::Standard { host: host.to_string(), port })
+}
+
+fn parse_as400_jdbc_endpoint(url: &str, subname: &str) -> Result<As400JdbcEndpoint, String> {
+    let subname_offset = url.len() - subname.len();
+    let authority_end = subname.find(['/', ';']).unwrap_or(subname.len());
+    let authority = &subname[..authority_end];
+
+    let (host, host_range, authority_port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .map(|index| index + 1)
+            .ok_or_else(|| "AS/400 IPv6 system names must have a closing ']' before the port".to_string())?;
+        let host = &authority[1..close];
+        if !host.contains(':') {
+            return Err("AS/400 bracketed system names must contain an IPv6 address".to_string());
+        }
+        let suffix = &authority[close + 1..];
+        let authority_port = if suffix.is_empty() {
+            None
+        } else {
+            let raw_port = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| "AS/400 bracketed IPv6 system names may only be followed by ':PORT'".to_string())?;
+            let start = subname_offset + close + 2;
+            Some((raw_port, start..start + raw_port.len()))
+        };
+        (host, subname_offset..subname_offset + close + 1, authority_port)
+    } else {
+        if authority.matches(':').count() > 1 {
+            return Err("AS/400 IPv6 system names must be enclosed in '[' and ']'".to_string());
+        }
+        match authority.split_once(':') {
+            Some((host, raw_port)) => {
+                let port_start = subname_offset + host.len() + 1;
+                (
+                    host,
+                    subname_offset..subname_offset + host.len(),
+                    Some((raw_port, port_start..port_start + raw_port.len())),
+                )
+            }
+            None => (authority, subname_offset..subname_offset + authority.len(), None),
+        }
+    };
+
+    if host.is_empty() || host.trim() != host || host.contains([',', '@', '\\', '"', '[', ']']) {
+        return Err(
+            "AS/400 URLs must contain one non-empty system name; multiple hosts and userinfo are not supported"
+                .to_string(),
+        );
     }
+
+    let mut port_number = None;
+    let mut alternate_server = None;
+    let mut alternate_port = None;
+    let mut client_affinities = None;
+    let mut secondary_url = None;
+    let mut proxy_server = None;
+    for property in as400_jdbc_properties(subname, subname_offset)? {
+        match property.key {
+            "portNumber" => port_number = Some((property.value, property.value_range)),
+            "clientRerouteAlternateServerName" => alternate_server = Some(property.value),
+            "clientRerouteAlternatePortNumber" => alternate_port = Some(property.value),
+            "enableClientAffinitiesList" => client_affinities = Some(property.value),
+            "secondary URL" => secondary_url = Some(property.value),
+            "proxy server" => proxy_server = Some(property.value),
+            _ => {}
+        }
+    }
+
+    if alternate_server.is_some_and(|value| !value.is_empty())
+        || alternate_port.is_some_and(|value| !value.is_empty())
+        || client_affinities == Some("1")
+    {
+        return Err(
+            "AS/400 client reroute or affinity properties can select multiple hosts and cannot be safely routed through one transport endpoint"
+                .to_string(),
+        );
+    }
+    if secondary_url.is_some_and(|value| !value.is_empty()) {
+        return Err(
+            "the AS/400 `secondary URL` property can select another endpoint and cannot be safely routed through one transport endpoint"
+                .to_string(),
+        );
+    }
+    if proxy_server.is_some_and(|value| !value.is_empty()) {
+        return Err(
+            "the AS/400 `proxy server` property changes the network endpoint and cannot be combined with a DBX transport"
+                .to_string(),
+        );
+    }
+
+    let (raw_port, port_range, source) = match (authority_port, port_number) {
+        (Some((raw_port, range)), _) => (raw_port, range, "authority port"),
+        (None, Some((raw_port, range))) => (raw_port, range, "`portNumber`"),
+        (None, None) => {
+            return Err(
+                "AS/400 URLs without an explicit `:PORT` or `;portNumber=PORT` use jt400's port mapper on port 449 and then a separately resolved database service port; specify the actual database host-server port (the secure service port when `secure=true`) so one transport endpoint can be routed"
+                    .to_string(),
+            )
+        }
+    };
+    let port = raw_port.parse::<u16>().ok().filter(|port| *port != 0).ok_or_else(|| {
+        format!("the AS/400 {source} must be an integer from 1 to 65535 (port 0 invokes jt400 port mapping)")
+    })?;
+
+    Ok(As400JdbcEndpoint { host: host.to_string(), port, host_range, port_range })
+}
+
+fn as400_jdbc_properties<'a>(subname: &'a str, subname_offset: usize) -> Result<Vec<As400JdbcProperty<'a>>, String> {
+    let mut separators = Vec::new();
+    let mut quoted = false;
+    let mut token_start = 0;
+    for (index, ch) in subname.char_indices() {
+        if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ';' && !quoted && (index == 0 || subname.as_bytes()[index - 1] != b'\\') {
+            let token = &subname[token_start..index];
+            if token.contains('"') && !token.ends_with('"') {
+                return Err("AS/400 URL contains characters after a closing quote".to_string());
+            }
+            separators.push(index);
+            token_start = index + 1;
+        }
+    }
+    let final_token = &subname[token_start..];
+    if quoted || (final_token.contains('"') && !final_token.ends_with('"')) {
+        return Err("AS/400 URL contains an unterminated or malformed quoted value".to_string());
+    }
+
+    let mut properties = Vec::with_capacity(separators.len());
+    for (position, separator) in separators.iter().copied().enumerate() {
+        let token_start = separator + 1;
+        let token_end = separators.get(position + 1).copied().unwrap_or(subname.len());
+        let token = &subname[token_start..token_end];
+        let (raw_key, raw_value, raw_value_offset) = match token.find('=') {
+            Some(equal) => (&token[..equal], &token[equal + 1..], equal + 1),
+            None => (token, "", token.len()),
+        };
+        let key = trim_java_whitespace(raw_key);
+        let value = trim_java_whitespace(raw_value);
+        let leading_whitespace = raw_value.len() - trim_java_whitespace_start(raw_value).len();
+        let value_start = subname_offset + token_start + raw_value_offset + leading_whitespace;
+        properties.push(As400JdbcProperty { key, value, value_range: value_start..value_start + value.len() });
+    }
+    Ok(properties)
+}
+
+fn trim_java_whitespace(value: &str) -> &str {
+    value.trim_matches(|ch| ch <= '\u{20}')
+}
+
+fn trim_java_whitespace_start(value: &str) -> &str {
+    value.trim_start_matches(|ch| ch <= '\u{20}')
 }
 
 fn jdbc_transport_rest(url: &str) -> Option<&str> {
-    if let Some(rest) = url.strip_prefix("jdbc:").or_else(|| url.strip_prefix("JDBC:")) {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(url, "jdbc:") {
         return Some(rest);
     }
 
-    let rest = url.strip_prefix("jdbcx:").or_else(|| url.strip_prefix("JDBCX:"))?;
+    let rest = strip_prefix_ignore_ascii_case(url, "jdbcx:")?;
     if let Some(scheme_end) = rest.find("://") {
         let scheme = &rest[..scheme_end];
         return Some(match scheme.rfind(':') {
@@ -2483,6 +2882,13 @@ fn jdbc_transport_rest(url: &str) -> Option<&str> {
     }
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
+}
+
 pub fn rewrite_jdbc_url_host(url: &str, new_host: &str, new_port: u16) -> Result<String, String> {
     let normalized_url = url.to_ascii_uppercase();
     let normalized_rest = jdbc_transport_rest(url).map(str::to_ascii_uppercase).unwrap_or_default();
@@ -2491,10 +2897,28 @@ pub fn rewrite_jdbc_url_host(url: &str, new_host: &str, new_port: u16) -> Result
         return rewrite_oracle_descriptor_host(url, new_host, new_port);
     }
 
-    let Some((old_host, old_port)) = parse_jdbc_host_port(url) else {
-        return Err(format!(
-            "Cannot route JDBC connection string through transport endpoint {new_host}:{new_port}: unsupported URL format"
-        ));
+    let endpoint = parse_jdbc_transport_endpoint(url).map_err(|reason| {
+        format!("Cannot route JDBC connection string through transport endpoint {new_host}:{new_port}: {reason}")
+    })?;
+
+    let (old_host, old_port) = match endpoint {
+        JdbcTransportEndpoint::As400(endpoint) => {
+            let mut rewritten = url.to_string();
+            rewritten.replace_range(endpoint.port_range, &new_port.to_string());
+            rewritten.replace_range(endpoint.host_range, &bracket_ipv6(new_host));
+            return match parse_jdbc_transport_endpoint(&rewritten) {
+                Ok(JdbcTransportEndpoint::As400(rewritten_endpoint))
+                    if rewritten_endpoint.host.trim_matches(['[', ']']) == new_host.trim_matches(['[', ']'])
+                        && rewritten_endpoint.port == new_port =>
+                {
+                    Ok(rewritten)
+                }
+                _ => Err(format!(
+                    "Cannot route JDBC connection string through transport endpoint {new_host}:{new_port}: the rewritten URL does not resolve to a single local endpoint"
+                )),
+            };
+        }
+        JdbcTransportEndpoint::Standard { host, port } => (host, port),
     };
 
     if let Some(after_sqlserver) = normalized_rest.strip_prefix("SQLSERVER://") {
@@ -2602,6 +3026,19 @@ fn bracket_ipv6(host: &str) -> String {
     }
 }
 
+/// Salesforce connections store the org instance in `host`: either a full URL
+/// (`https://acme.my.salesforce.com`) or a bare hostname. The access token
+/// lives in the password field and never appears in the URL, so the redacted
+/// and full forms are identical.
+fn salesforce_instance_url(raw_host: &str, ssl: bool, port: u16) -> String {
+    let trimmed = raw_host.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    let scheme = if ssl { "https" } else { "http" };
+    format!("{scheme}://{}:{port}", bracket_ipv6(trimmed))
+}
+
 /// Returns `true` when `host` contains two or more comma-separated entries
 /// where each entry already embeds its own `:port` suffix.
 ///
@@ -2664,7 +3101,7 @@ mod tests {
         database_info_from_protocol_value, default_query_timeout_secs, default_redis_key_separator,
         default_ssh_connect_timeout_secs, sqlserver_legacy_compatibility_param,
         without_sqlserver_legacy_compatibility_param, ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo,
-        DatabaseType, IdentifierCase, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+        DatabaseType, IdentifierCase, ProductionBadgeScope, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
     };
 
     #[test]
@@ -2714,6 +3151,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_gbase8s_profile_connections_load_as_the_gbase8s_type() {
+        let config = |db_type: &str, driver_profile: Option<&str>| {
+            let mut value = serde_json::json!({
+                "id": "id",
+                "name": "GBase",
+                "db_type": db_type,
+                "host": "localhost",
+                "port": 9088,
+                "username": "gbasedbt",
+                "password": "",
+                "database": "app"
+            });
+            if let Some(profile) = driver_profile {
+                value["driver_profile"] = serde_json::json!(profile);
+            }
+            serde_json::from_value::<ConnectionConfig>(value).unwrap()
+        };
+
+        assert_eq!(config("gbase", Some("gbase8s")).db_type, DatabaseType::Gbase8s);
+        assert_eq!(config("gbase", Some("GBASE8S")).db_type, DatabaseType::Gbase8s);
+        assert_eq!(config("gbase8s", Some("gbase8s")).db_type, DatabaseType::Gbase8s);
+        assert_eq!(config("gbase", Some("gbase8a")).db_type, DatabaseType::Gbase);
+        assert_eq!(config("gbase", None).db_type, DatabaseType::Gbase);
+        assert_eq!(config("informix", Some("gbase8s")).db_type, DatabaseType::Informix);
+    }
+
+    #[test]
     fn default_schema_is_optional_and_round_trips() {
         let base = serde_json::json!({
             "id": "id",
@@ -2735,8 +3199,80 @@ mod tests {
         assert_eq!(serde_json::to_value(parsed).unwrap()["default_schema"], "archive");
     }
 
+    #[test]
+    fn sidebar_auto_load_all_tables_defaults_off_and_round_trips() {
+        let mut value = serde_json::json!({
+            "id": "id",
+            "name": "MariaDB",
+            "db_type": "mysql",
+            "host": "localhost",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": "app"
+        });
+        let legacy: ConnectionConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.sidebar_auto_load_all_tables);
+        let serialized_legacy = serde_json::to_value(legacy).unwrap();
+        assert!(serialized_legacy.get("sidebar_auto_load_all_tables").is_none());
+
+        value["sidebar_auto_load_all_tables"] = serde_json::json!(true);
+        let configured: ConnectionConfig = serde_json::from_value(value).unwrap();
+        assert!(configured.sidebar_auto_load_all_tables);
+        assert!(serde_json::to_value(configured).unwrap()["sidebar_auto_load_all_tables"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn production_badge_scope_legacy_and_all_options_round_trip() {
+        let mut value = serde_json::to_value(mysql_config("root", "", Some("app"))).unwrap();
+        value["is_production"] = serde_json::json!(true);
+        value["production_databases"] = serde_json::json!(["app"]);
+        let legacy: ConnectionConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy.production_badge_scope, None);
+        assert!(serde_json::to_value(legacy).unwrap().get("production_badge_scope").is_none());
+        for (name, expected) in [
+            ("connection", ProductionBadgeScope::Connection),
+            ("database", ProductionBadgeScope::Database),
+            ("table", ProductionBadgeScope::Table),
+        ] {
+            value["production_badge_scope"] = serde_json::json!(name);
+            let config: ConnectionConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.production_badge_scope, Some(expected));
+            assert!(config.is_production);
+            assert_eq!(config.production_databases, vec!["app"]);
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert_eq!(serialized["production_badge_scope"], name);
+            assert_eq!(
+                serde_json::from_value::<ConnectionConfig>(serialized).unwrap().production_badge_scope,
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn show_database_links_opt_out_round_trips() {
+        let mut value = serde_json::json!({
+            "id": "id",
+            "name": "Oracle",
+            "db_type": "oracle",
+            "host": "localhost",
+            "port": 1521,
+            "username": "system",
+            "password": "",
+            "database": "FREEPDB1"
+        });
+        let legacy: ConnectionConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(serde_json::to_value(legacy).unwrap().get("show_database_links").is_none());
+
+        value["show_database_links"] = serde_json::json!(false);
+        let hidden: ConnectionConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(serde_json::to_value(hidden).unwrap()["show_database_links"], serde_json::json!(false));
+    }
+
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "id".to_string(),
             name: "name".to_string(),
@@ -2756,6 +3292,8 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -2763,6 +3301,8 @@ mod tests {
             connect_timeout_secs: super::default_connect_timeout_secs(),
             query_timeout_secs: default_query_timeout_secs(),
             idle_timeout_secs: super::default_idle_timeout_secs(),
+            manual_transaction_timeout_secs: super::default_manual_transaction_timeout_secs(),
+            idle_disconnect_secs: super::default_idle_disconnect_secs(),
             keepalive_interval_secs: super::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
@@ -2782,6 +3322,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -2798,6 +3339,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -3146,6 +3688,31 @@ mod tests {
     }
 
     #[test]
+    fn missing_idle_disconnect_defaults_to_zero() {
+        // 老配置没有 idle_disconnect_secs 字段时，必须反序列化为 0（不启用），
+        // 保证既有连接不会被赋予空闲超时自动关闭的行为。
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "id",
+            "name": "name",
+            "db_type": "mysql",
+            "host": "10.1.2.3",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": null
+        }))
+        .unwrap();
+
+        assert_eq!(config.idle_disconnect_secs, 0);
+        // 显式配置后能正常往返，且不影响并存的 idle_timeout_secs。
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["idle_disconnect_secs"] = serde_json::json!(120);
+        let configured: ConnectionConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(configured.idle_disconnect_secs, 120);
+        assert_eq!(configured.idle_timeout_secs, super::default_idle_timeout_secs());
+    }
+
+    #[test]
     fn legacy_ssh_tunnels_migrate_to_ordered_transport_layers() {
         let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
             "id": "id",
@@ -3295,6 +3862,28 @@ mod tests {
     }
 
     #[test]
+    fn manual_transaction_timeout_defaults_when_absent_or_zero_and_is_clamped() {
+        let mut config = mysql_config("root", "", None);
+        assert_eq!(config.effective_manual_transaction_timeout_secs(), 300);
+
+        // Payloads saved before the setting existed deserialize to the default.
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut().unwrap().remove("manual_transaction_timeout_secs");
+        let legacy: ConnectionConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.manual_transaction_timeout_secs, 300);
+
+        // 0 must never mean "roll back immediately".
+        config.manual_transaction_timeout_secs = 0;
+        assert_eq!(config.effective_manual_transaction_timeout_secs(), 300);
+        config.manual_transaction_timeout_secs = 1;
+        assert_eq!(config.effective_manual_transaction_timeout_secs(), super::MIN_MANUAL_TRANSACTION_TIMEOUT_SECS);
+        config.manual_transaction_timeout_secs = 1_800;
+        assert_eq!(config.effective_manual_transaction_timeout_secs(), 1_800);
+        config.manual_transaction_timeout_secs = u64::MAX;
+        assert_eq!(config.effective_manual_transaction_timeout_secs(), super::MAX_MANUAL_TRANSACTION_TIMEOUT_SECS);
+    }
+
+    #[test]
     fn query_timeout_floor_is_scoped_to_spanner() {
         let mut config = mysql_config("root", "", None);
         config.query_timeout_secs = 30;
@@ -3439,6 +4028,72 @@ mod tests {
             config.connection_url(),
             "mysql://root:secret@10.1.2.3:2883/analytics?connect_timeout=10&sessionVariables=query_timeout=60&enable_cleartext_plugin=true"
         );
+    }
+
+    #[test]
+    fn doris_database_type_preserves_mysql_tls_params_when_enabled() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Doris;
+        config.ssl = true;
+        config.ca_cert_path = "/tmp/doris-ca.pem".to_string();
+        config.url_params = Some("verify_ca=true&verify_identity=true".to_string());
+
+        assert!(config.bare_mysql_uses_tls());
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_ca=true&verify_identity=true&charset=utf8mb4&enable_cleartext_plugin=true"
+        );
+    }
+
+    #[test]
+    fn legacy_doris_profile_preserves_mysql_tls_params_when_enabled() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.driver_profile = Some("doris".to_string());
+        config.ssl = true;
+        config.ca_cert_path = "/tmp/doris-ca.pem".to_string();
+        config.url_params = Some("verify_ca=true&verify_identity=false".to_string());
+
+        assert!(config.bare_mysql_uses_tls());
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_ca=true&verify_identity=false&charset=utf8mb4&enable_cleartext_plugin=true"
+        );
+    }
+
+    #[test]
+    fn doris_explicit_disabled_mode_remains_plaintext() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Doris;
+        config.ssl = true;
+        config.url_params = Some("ssl-mode=disabled&verify_ca=true&verify_identity=true".to_string());
+
+        assert!(!config.bare_mysql_uses_tls());
+        assert_eq!(config.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics?enable_cleartext_plugin=true");
+    }
+
+    #[test]
+    fn selectdb_profile_does_not_gain_bare_mysql_tls_support() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.driver_profile = Some("selectdb".to_string());
+        config.ssl = true;
+        config.url_params = Some("require_ssl=true&verify_ca=true&verify_identity=true".to_string());
+
+        assert!(!config.bare_mysql_supports_tls());
+        assert!(!config.bare_mysql_uses_tls());
+        assert_eq!(config.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics?enable_cleartext_plugin=true");
+    }
+
+    #[test]
+    fn doris_profile_on_unrelated_database_type_does_not_gain_bare_mysql_tls_support() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Postgres;
+        config.driver_profile = Some("doris".to_string());
+        config.ssl = true;
+        config.url_params = Some("require_ssl=true&verify_ca=true&verify_identity=true".to_string());
+
+        assert!(!config.is_doris());
+        assert!(!config.bare_mysql_supports_tls());
+        assert!(!config.bare_mysql_uses_tls());
     }
 
     #[test]
@@ -4376,6 +5031,151 @@ mod tests {
         let (h, p) = super::parse_jdbc_host_port("jdbc:mysql://db.example.com:3306/app?useSSL=false").unwrap();
         assert_eq!(h, "db.example.com");
         assert_eq!(p, 3306);
+    }
+
+    #[test]
+    fn parse_and_rewrite_as400_authority_port_preserves_properties() {
+        let url = "jdbc:as400://10.0.0.1:8471;libraries=clvmotdta,*LIBL;errors=full";
+
+        assert_eq!(super::parse_jdbc_host_port(url), Some(("10.0.0.1".to_string(), 8471)));
+        assert_eq!(
+            super::rewrite_jdbc_url_host(url, "127.0.0.1", 18471).unwrap(),
+            "jdbc:as400://127.0.0.1:18471;libraries=clvmotdta,*LIBL;errors=full"
+        );
+    }
+
+    #[test]
+    fn parse_and_rewrite_as400_port_number_preserves_schema_and_properties() {
+        let url = "jdbc:as400://ibmi.example.com/MYLIB;libraries=clvmotdta,*LIBL;portNumber=8471;errors=full";
+
+        assert_eq!(super::parse_jdbc_host_port(url), Some(("ibmi.example.com".to_string(), 8471)));
+        assert_eq!(
+            super::rewrite_jdbc_url_host(url, "127.0.0.1", 28471).unwrap(),
+            "jdbc:as400://127.0.0.1/MYLIB;libraries=clvmotdta,*LIBL;portNumber=28471;errors=full"
+        );
+
+        let quoted_schema = "jdbc:as400://ibmi.example.com/\"MY;LIB\";portNumber=8471;errors=full";
+        assert_eq!(
+            super::rewrite_jdbc_url_host(quoted_schema, "127.0.0.1", 38471).unwrap(),
+            "jdbc:as400://127.0.0.1/\"MY;LIB\";portNumber=38471;errors=full"
+        );
+
+        let duplicate_port = "jdbc:as400://ibmi.example.com;portNumber=8471;portNumber=9471;errors=full";
+        assert_eq!(super::parse_jdbc_host_port(duplicate_port), Some(("ibmi.example.com".to_string(), 9471)));
+        assert_eq!(
+            super::rewrite_jdbc_url_host(duplicate_port, "127.0.0.1", 49471).unwrap(),
+            "jdbc:as400://127.0.0.1;portNumber=8471;portNumber=49471;errors=full"
+        );
+    }
+
+    #[test]
+    fn parse_and_rewrite_secure_as400_uses_the_explicit_secure_service_port() {
+        let property_url = "jdbc:as400://ibmi.example.com;secure=true;portNumber=9471;errors=full";
+        assert_eq!(super::parse_jdbc_host_port(property_url), Some(("ibmi.example.com".to_string(), 9471)));
+        assert_eq!(
+            super::rewrite_jdbc_url_host(property_url, "127.0.0.1", 19471).unwrap(),
+            "jdbc:as400://127.0.0.1;secure=true;portNumber=19471;errors=full"
+        );
+
+        let authority_url = "jdbc:as400://ibmi.example.com:9471;secure=true;portNumber=8471";
+        assert_eq!(
+            super::rewrite_jdbc_url_host(authority_url, "127.0.0.1", 29471).unwrap(),
+            "jdbc:as400://127.0.0.1:29471;secure=true;portNumber=8471"
+        );
+    }
+
+    #[test]
+    fn parse_and_rewrite_as400_supports_bracketed_ipv6_and_uppercase_jdbc_prefixes() {
+        let jdbc_url = "JDBC:AS400://[2001:db8::10]:9471;secure=true";
+        assert_eq!(super::parse_jdbc_host_port(jdbc_url), Some(("2001:db8::10".to_string(), 9471)));
+        assert_eq!(
+            super::rewrite_jdbc_url_host(jdbc_url, "::1", 19471).unwrap(),
+            "JDBC:AS400://[::1]:19471;secure=true"
+        );
+
+        let jdbcx_url = "JDBCX:trace:AS400://[2001:db8::20];portNumber=8471;libraries=LIB1,*LIBL";
+        assert_eq!(super::parse_jdbc_host_port(jdbcx_url), Some(("2001:db8::20".to_string(), 8471)));
+        assert_eq!(
+            super::rewrite_jdbc_url_host(jdbcx_url, "127.0.0.1", 18471).unwrap(),
+            "JDBCX:trace:AS400://127.0.0.1;portNumber=18471;libraries=LIB1,*LIBL"
+        );
+
+        let mixed_case_url = "JdBc:aS400://ibmi.example.com;portNumber=8471";
+        assert_eq!(super::parse_jdbc_host_port(mixed_case_url), Some(("ibmi.example.com".to_string(), 8471)));
+    }
+
+    #[test]
+    fn as400_without_explicit_database_service_port_has_actionable_transport_error() {
+        for url in [
+            "jdbc:as400://10.0.0.1;libraries=clvmotdta,*LIBL;errors=full",
+            "jdbc:as400://10.0.0.1;secure=true;libraries=clvmotdta,*LIBL",
+            "jdbc:as400://10.0.0.1;PORTNUMBER=8471;libraries=clvmotdta,*LIBL",
+        ] {
+            assert_eq!(super::parse_jdbc_host_port(url), None);
+            let err = super::rewrite_jdbc_url_host(url, "127.0.0.1", 18471).unwrap_err();
+            assert!(err.contains("port mapper on port 449"), "{err}");
+            assert!(err.contains(":PORT"), "{err}");
+            assert!(err.contains("portNumber=PORT"), "{err}");
+
+            let validation_err = super::validate_jdbc_transport_url(url).unwrap_err();
+            assert!(validation_err.contains("port mapper on port 449"), "{validation_err}");
+        }
+    }
+
+    #[test]
+    fn as400_rejects_invalid_explicit_ports() {
+        for url in [
+            "jdbc:as400://ibmi.example.com:0;libraries=LIB1",
+            "jdbc:as400://ibmi.example.com:invalid;libraries=LIB1",
+            "jdbc:as400://ibmi.example.com:65536;libraries=LIB1",
+            "jdbc:as400://ibmi.example.com;portNumber=0;libraries=LIB1",
+            "jdbc:as400://ibmi.example.com;portNumber=invalid;libraries=LIB1",
+            "jdbc:as400://ibmi.example.com;portNumber=65536;libraries=LIB1",
+            "jdbc:as400://ibmi.example.com;portNumber=8471;portNumber",
+            "jdbc:as400://ibmi.example.com;portNumber=\u{a0}8471",
+        ] {
+            assert_eq!(super::parse_jdbc_host_port(url), None, "{url}");
+            let err = super::rewrite_jdbc_url_host(url, "127.0.0.1", 18471).unwrap_err();
+            assert!(err.contains("integer from 1 to 65535"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn as400_does_not_read_port_number_from_quoted_text() {
+        for url in [
+            "jdbc:as400://ibmi.example.com/\"MY;portNumber=8471;LIB\";errors=full",
+            "jdbc:as400://ibmi.example.com;libraries=\"LIB;portNumber=8471;OTHER\";errors=full",
+            "jdbc:as400://ibmi.example.com;libraries=LIB\\;portNumber=8471;errors=full",
+        ] {
+            assert_eq!(super::parse_jdbc_host_port(url), None, "{url}");
+            let err = super::rewrite_jdbc_url_host(url, "127.0.0.1", 18471).unwrap_err();
+            assert!(err.contains("port mapper on port 449"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn as400_rejects_multiple_or_indirect_transport_endpoints() {
+        for url in [
+            "jdbc:as400://primary.example.com,backup.example.com:8471;libraries=LIB1",
+            "jdbc:as400://primary.example.com;portNumber=8471;clientRerouteAlternateServerName=backup.example.com",
+            "jdbc:as400://primary.example.com;portNumber=8471;enableClientAffinitiesList=1",
+            "jdbc:as400://primary.example.com;portNumber=8471;secondary URL=jdbc:postgresql://other.example.com:5432/app",
+            "jdbc:as400://primary.example.com;portNumber=8471;proxy server=proxy.example.com:3470",
+            "jdbc:as400://2001:db8::10:8471;libraries=LIB1",
+            "jdbc:as400://\"primary.example.com:8471;ignored\"",
+        ] {
+            assert_eq!(super::parse_jdbc_host_port(url), None, "{url}");
+            let err = super::rewrite_jdbc_url_host(url, "127.0.0.1", 18471).unwrap_err();
+            assert!(err.contains("AS/400"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn jdbc_transport_validation_accepts_single_endpoints() {
+        assert!(
+            super::validate_jdbc_transport_url("jdbc:as400://ibmi.example.com;portNumber=8471;libraries=LIB1").is_ok()
+        );
+        assert!(super::validate_jdbc_transport_url("jdbc:postgresql://db.example.com:5432/app").is_ok());
     }
 
     #[test]

@@ -1,9 +1,16 @@
+pub mod batch_progress;
+pub use dbx_drivers::query_messages;
 pub mod document_ops;
 pub mod hbase_ops;
 pub mod mongo_ops;
 pub mod object_cache;
+pub mod plugin_data;
+pub mod plugin_plan;
 pub mod query_cancel;
 pub mod redis_ops;
+pub mod snapshot_export;
+mod sqlserver_agent_batch;
+pub mod sqlserver_manual_transaction;
 pub mod two_phase_commit;
 
 pub use dbx_drivers::execution::{
@@ -43,8 +50,7 @@ pub const METADATA_POOL_BUSY_ERROR: &str = "DBX metadata pool is busy; please re
 pub const MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR: &str =
     "Transaction session not found or expired; it may have been auto-rolled back due to inactivity";
-pub const MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR: &str =
-    "Transaction was auto-rolled back due to 5 minutes of inactivity";
+pub const MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR: &str = "Transaction was auto-rolled back due to inactivity";
 
 pub fn is_manual_transaction_session_expired_error(error: &str) -> bool {
     error.starts_with(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR) || error == MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR
@@ -252,6 +258,31 @@ pub struct ExecuteMultiResult {
     /// treat it as a no-op rather than an unproven statement.
     #[serde(skip_serializing_if = "is_false")]
     pub manual_transaction_no_statement: bool,
+    /// MySQL auto-commit tab: set on every result of the batch when the tab's
+    /// connection was settled. `Some(true)` means the connection still holds a
+    /// transaction the user opened explicitly and DBX kept it open
+    /// (`preserve_explicit_transaction`); `Some(false)` means the settlement ran
+    /// and no such transaction is open. `None` means this execution never
+    /// observed a tab-scoped MySQL connection, so it says nothing about the
+    /// tab's state. The frontend mirrors `Some(..)` into the tab's transaction
+    /// badge/actions so the state is never silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_commit_open_transaction: Option<bool>,
+    /// MySQL auto-commit tab: set on every result of the batch when DBX rolled
+    /// back a transaction the user opened explicitly (`BEGIN` /
+    /// `START TRANSACTION`) and left open. Lets the UI report the cleanup
+    /// instead of discarding the transaction silently.
+    #[serde(skip_serializing_if = "is_false")]
+    pub auto_commit_explicit_transaction_rolled_back: bool,
+    /// MySQL auto-commit tab: set on every result of the batch when DBX rolled
+    /// back a transaction nobody opened explicitly — the session turned
+    /// auto-commit off (`SET autocommit = 0`), so its transactions are implicit.
+    /// Reported separately from the explicit case: the user never asked for a
+    /// transaction, so the tab shows a distinct notice that is raised once per
+    /// connection instead of repeating "your explicit transaction was rolled
+    /// back" after every execution.
+    #[serde(skip_serializing_if = "is_false")]
+    pub auto_commit_session_autocommit_rolled_back: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +331,9 @@ impl ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 
@@ -315,6 +349,9 @@ impl ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 
@@ -332,6 +369,9 @@ impl ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 
@@ -345,6 +385,9 @@ impl ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 
@@ -369,6 +412,9 @@ impl ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 
@@ -392,6 +438,9 @@ impl ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 
@@ -434,10 +483,11 @@ struct ServerLargeValueMarker {
 }
 
 #[derive(Clone, Copy)]
-struct ServerLargeValueMarkerValue {
+struct ServerLargeValueMarkerValue<'a> {
     kind: ServerLargeValuePreviewKind,
     preview_size: usize,
     original_bytes: Option<usize>,
+    value_ref: Option<&'a str>,
 }
 
 /// Some PostgreSQL-compatible servers (for example KingbaseES instances with
@@ -479,7 +529,7 @@ fn server_large_value_alias(
     Some((source_index, Some(preview_kind), source_type))
 }
 
-fn server_large_value_marker(value: &serde_json::Value) -> Option<ServerLargeValueMarkerValue> {
+fn server_large_value_marker(value: &serde_json::Value) -> Option<ServerLargeValueMarkerValue<'_>> {
     let mut parts = value.as_str()?.split(':');
     let kind = parts.next()?;
     let preview_size = parts.next()?;
@@ -491,7 +541,13 @@ fn server_large_value_marker(value: &serde_json::Value) -> Option<ServerLargeVal
         _ => return None,
     };
     let original_bytes = parts.next().and_then(|value| value.parse::<usize>().ok());
-    Some(ServerLargeValueMarkerValue { kind, preview_size: preview_size.parse::<usize>().ok()?.max(1), original_bytes })
+    let value_ref = parts.next().filter(|value| !value.is_empty());
+    Some(ServerLargeValueMarkerValue {
+        kind,
+        preview_size: preview_size.parse::<usize>().ok()?.max(1),
+        original_bytes,
+        value_ref,
+    })
 }
 
 fn truncate_server_large_value_preview(
@@ -526,6 +582,10 @@ fn truncate_server_large_value_preview(
         ServerLargeValuePreviewKind::Text => text.char_indices().nth(preview_size).map(|(index, _)| index),
         ServerLargeValuePreviewKind::Binary => text
             .strip_prefix("0x")
+            .or_else(|| text.strip_prefix("0X"))
+            // PostgreSQL text-protocol queries (including rows with timestamps)
+            // return bytea as \x hex instead of the binary driver's 0x form.
+            .or_else(|| text.strip_prefix("\\x"))
             .filter(|hex| hex.len() > preview_size.saturating_mul(2))
             .map(|_| 2usize.saturating_add(preview_size.saturating_mul(2))),
         ServerLargeValuePreviewKind::Vector | ServerLargeValuePreviewKind::Deferred => unreachable!(),
@@ -577,18 +637,26 @@ fn extract_server_large_value_markers(result: &mut db::QueryResult) -> Vec<db::L
     }
     for (row_index, row) in result.rows.iter_mut().enumerate() {
         for marker in &markers {
-            let marker_value = row.get(marker.result_index).and_then(server_large_value_marker);
+            // Own the locator before mutating the preview in this row.
+            let value_ref = row
+                .get(marker.result_index)
+                .and_then(server_large_value_marker)
+                .and_then(|value| value.value_ref)
+                .map(str::to_owned);
+            let marker_value = row
+                .get(marker.result_index)
+                .and_then(server_large_value_marker)
+                .map(|value| (value.kind, value.preview_size, value.original_bytes));
             let source_result_index = marker.result_index.saturating_sub(1);
             if marker_value.is_some_and(|value| {
                 row.get_mut(source_result_index)
-                    .is_some_and(|source| truncate_server_large_value_preview(source, value.kind, value.preview_size))
+                    .is_some_and(|source| truncate_server_large_value_preview(source, value.0, value.1))
             }) {
                 large_value_cells.push(db::LargeValueCell {
                     row_index,
                     column_index: marker.source_index,
-                    original_bytes: marker_value
-                        .and_then(|value| value.original_bytes)
-                        .unwrap_or(SERVER_LARGE_VALUE_UNKNOWN_BYTES),
+                    original_bytes: marker_value.and_then(|value| value.2).unwrap_or(SERVER_LARGE_VALUE_UNKNOWN_BYTES),
+                    value_ref,
                 });
             }
         }
@@ -693,6 +761,9 @@ impl From<db::QueryResult> for ExecuteMultiResult {
             server_message: false,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 }
@@ -708,6 +779,9 @@ impl From<db::sqlserver::SqlServerBatchResult> for ExecuteMultiResult {
             server_message: result.server_message,
             manual_transaction_proven_read_only: false,
             manual_transaction_no_statement: false,
+            auto_commit_open_transaction: None,
+            auto_commit_explicit_transaction_rolled_back: false,
+            auto_commit_session_autocommit_rolled_back: false,
         }
     }
 }
@@ -781,9 +855,32 @@ async fn connection_is_mongodb(state: &AppState, connection_id: &str) -> bool {
     configs.get(connection_id).is_some_and(|config| config.db_type == DatabaseType::MongoDb)
 }
 
+/// Idle window for a new manual transaction on `connection_id`.
+pub(crate) async fn manual_transaction_idle_timeout(state: &AppState, connection_id: &str) -> std::time::Duration {
+    let configs = state.configs.read().await;
+    let secs = configs.get(connection_id).map(ConnectionConfig::effective_manual_transaction_timeout_secs);
+    std::time::Duration::from_secs(secs.unwrap_or(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS))
+}
+
 async fn connection_database_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
     let configs = state.configs.read().await;
     configs.get(connection_id).map(|config| config.db_type)
+}
+
+async fn connection_statement_split_database_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
+    let configs = state.configs.read().await;
+    configs.get(connection_id).map(statement_split_database_type)
+}
+
+/// A generic JDBC connection to Oracle runs PL/SQL through the JDBC plugin, so its
+/// script is split with the Oracle rules. The plain `Jdbc` profile would cut every
+/// routine body at its first inner semicolon and replace the object with the fragment.
+fn statement_split_database_type(config: &ConnectionConfig) -> DatabaseType {
+    if crate::schema::is_oracle_external_driver_config(config) {
+        DatabaseType::Oracle
+    } else {
+        config.db_type
+    }
 }
 
 async fn connection_sql_compatibility_mode(
@@ -1142,6 +1239,13 @@ pub struct QueryExecutionOptions {
     /// `PostgresReadOnlyTransaction` executes on an isolated client session and
     /// always rolls the transaction back after the result is collected.
     pub execution_mode: QueryExecutionMode,
+    /// MySQL auto-commit tabs only: keep a transaction the user opened
+    /// explicitly (`BEGIN` / `START TRANSACTION`, or a batch that disabled
+    /// auto-commit) open across executions instead of rolling it back when the
+    /// batch finishes. Opt-in per execution (driven by the editor setting);
+    /// `false` keeps the historical cleanup that stops a leftover transaction
+    /// from pinning the tab's read view (#9479).
+    pub preserve_explicit_transaction: bool,
 }
 
 fn validate_query_execution_mode(
@@ -1370,7 +1474,7 @@ fn options_for_sequential_statements(
     statement_options
 }
 
-fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> bool {
+pub(crate) fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> bool {
     let Some(db_type) = db_type else {
         return false;
     };
@@ -1645,6 +1749,7 @@ async fn do_execute_typed(
     schema: Option<&str>,
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
+    transaction_outcome: &mut Option<MysqlAutoCommitTransaction>,
 ) -> Result<db::QueryResult, QueryExecutionError> {
     crate::sql_diagnostics::debug_sql("do_execute", sql);
     if let Some(execution_id) = options.execution_id.as_deref() {
@@ -1662,6 +1767,13 @@ async fn do_execute_typed(
     let pool_db_type = connection_database_type_for_pool_key(state, pool_key).await;
     let mysql_catalog_dialect = connection_mysql_catalog_dialect_for_pool_key(state, pool_key).await;
     let pool = state.pool_handle(pool_key).await.ok_or("Connection not found")?;
+    // Everything the driver dispatch does for this statement — pool checkout,
+    // schema/search_path setup, the statement, and the post-statement cleanup —
+    // is what the user actually waited for. Report that span instead of the
+    // driver-internal timer, which starts only after a client is in hand and
+    // therefore hides connection-pool stalls from the summary (#6097 fixed the
+    // same mismatch for SQL Server's shared-connection lock).
+    let dispatch_start = std::time::Instant::now();
 
     let mut typed_agent_error = None;
     #[cfg(feature = "duckdb-sidecar")]
@@ -1768,19 +1880,39 @@ async fn do_execute_typed(
             // would therefore leave its transaction open and pin the
             // connection's REPEATABLE READ read view, so every later
             // auto-commit query in the tab would keep reading the same stale
-            // snapshot until the connection was closed. Clear it here, exactly
-            // like the multi-statement MySQL path does, so each execution
-            // restores the auto-commit contract (ROLLBACK is a server no-op
-            // when no transaction is open).
+            // snapshot until the connection was closed. Settle it here, exactly
+            // like the multi-statement MySQL path does: roll the transaction
+            // back, unless the tab keeps explicit user transactions open
+            // (`preserve_explicit_transaction`) or a later execution already
+            // decided to keep this one.
             if p.is_client_session_pool() {
-                if let Err(error) = db::mysql::rollback_open_transaction(&mut conn).await {
-                    log::warn!(
-                        "[query][mysql] trace_id={} open_txn_rollback_failed error={}",
-                        options.execution_id.as_deref().unwrap_or_default(),
-                        error
-                    );
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;
-                    state.remove_pool_by_key(pool_key).await;
+                // A truncated or failed result, or result sets still pending
+                // behind the one that was read, may leave the last status packet
+                // short of the end, so only a complete response can prove that
+                // the cleanup `ROLLBACK` is unnecessary.
+                let status_is_final = *mode == crate::connection::MysqlMode::Normal
+                    && statement_result.as_ref().is_ok_and(|result| !result.truncated)
+                    && db::mysql::last_ok_ends_response(&conn);
+                let transaction = settle_mysql_auto_commit_transaction_boxed(
+                    state,
+                    pool_key,
+                    &mut conn,
+                    options.preserve_explicit_transaction,
+                    crate::query_execution_sql::mysql_statement_opens_explicit_transaction(sql),
+                    status_is_final,
+                )
+                .await;
+                match transaction {
+                    Ok(transaction) => *transaction_outcome = Some(transaction),
+                    Err(error) => {
+                        log::warn!(
+                            "[query][mysql] trace_id={} open_txn_rollback_failed error={}",
+                            options.execution_id.as_deref().unwrap_or_default(),
+                            error
+                        );
+                        let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;
+                        state.remove_pool_by_key(pool_key).await;
+                    }
                 }
             }
             statement_result
@@ -1962,6 +2094,33 @@ async fn do_execute_typed(
             }
             result
         }
+        PoolKind::Solr(client) => {
+            let client = client.clone();
+            let sql = sql.to_string();
+            let max_rows = options.max_rows;
+            // cursorMark 分页只服务文档浏览器；REST 查询是一次性请求，不需要 session 游标。
+            let result =
+                wait_for_query_opt(cancel_token, query_timeout, db::solr_driver::execute_rest_query(&client, &sql))
+                    .await
+                    .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
+        }
+        PoolKind::CouchDb(client) => {
+            let client = client.clone();
+            let sql = sql.to_string();
+            let max_rows = options.max_rows;
+            let result =
+                wait_for_query_opt(cancel_token, query_timeout, db::couchdb_driver::execute_rest_query(&client, &sql))
+                    .await
+                    .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
+        }
         PoolKind::Meilisearch(client) => {
             let client = client.clone();
             let sql = sql.to_string();
@@ -1973,6 +2132,23 @@ async fn do_execute_typed(
             )
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
+        }
+        PoolKind::Salesforce(client) => {
+            let client = client.clone();
+            let sql = sql.to_string();
+            let max_rows = options.max_rows;
+            let result = wait_for_query_opt(cancel_token, query_timeout, async move {
+                if let Some(cursor) = options.result_session_id.as_deref() {
+                    client.fetch_more(cursor).await
+                } else {
+                    client.execute_query(&sql, max_rows).await
+                }
+            })
+            .await;
             if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -2058,6 +2234,7 @@ async fn do_execute_typed(
             }
             let cancel_for_agent = cancel_token.clone();
             let result = async move {
+                let lock_started = std::time::Instant::now();
                 let mut client = match cancel_for_agent.as_ref() {
                     Some(token) => {
                         tokio::select! {
@@ -2071,7 +2248,10 @@ async fn do_execute_typed(
                     }
                     None => client.lock().await,
                 };
-                if let Some(session_id) = options.result_session_id.as_deref() {
+                let lock_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
+                let response: Result<db::QueryResult, AgentCallError> = if let Some(session_id) =
+                    options.result_session_id.as_deref()
+                {
                     let params = agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS));
                     client
                         .fetch_query_page_typed_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
@@ -2086,7 +2266,14 @@ async fn do_execute_typed(
                     client
                         .execute_query_typed_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
                         .await
-                }
+                };
+                response.map(|mut result| {
+                    // Older agents have no phase map. Do not imply complete telemetry.
+                    if let Some(timings) = result.query_timings_ms.as_mut() {
+                        timings.insert("core_lock".into(), lock_ms);
+                    }
+                    result
+                })
             }
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
@@ -2148,6 +2335,10 @@ async fn do_execute_typed(
         PoolKind::Consul(_) => Err("SQL execution is not supported for Consul connections".to_string()),
     };
     result
+        .map(|mut result| {
+            result.execution_time_ms = result.execution_time_ms.max(dispatch_start.elapsed().as_millis());
+            result
+        })
         .map_err(|error| {
             #[cfg(feature = "duckdb-sidecar")]
             if let Some(duckdb_error) = typed_duckdb_error {
@@ -2206,7 +2397,7 @@ pub async fn do_execute(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
-    do_execute_typed(state, pool_key, mysql_dialect, database, sql, schema, cancel_token, options)
+    do_execute_typed(state, pool_key, mysql_dialect, database, sql, schema, cancel_token, options, &mut None)
         .await
         .map_err(QueryExecutionError::into_legacy_string)
 }
@@ -2595,8 +2786,52 @@ pub async fn execute_sql_statement_with_options_typed(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, QueryExecutionError> {
+    // `_with_outcome` is a second async layer in front of
+    // `execute_sql_statement_with_options_typed_inner`. Awaiting it inline nests
+    // one more concrete future type into every caller's generator, which pushed
+    // Rust targets of this workspace past rustc's query depth limit on Linux
+    // (`error: queries overflow the depth limit!`). Erasing the type keeps this
+    // wrapper as shallow as it was before the outcome was added.
+    let executed: ExecutedSqlStatement<'_> = Box::pin(execute_sql_statement_with_options_typed_with_outcome(
+        state,
+        connection_id,
+        database,
+        sql,
+        schema,
+        cancel_token,
+        options,
+    ));
+    executed.await.map(|(result, _)| result)
+}
+
+/// Boxed, type-erased run of one SQL statement, awaiting it without nesting
+/// another concrete future type into the caller's generator.
+type ExecutedSqlStatement<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ExecutedSqlStatementOutcome> + Send + 'a>>;
+
+/// Result of [`ExecutedSqlStatement`].
+type ExecutedSqlStatementOutcome = Result<(db::QueryResult, Option<MysqlAutoCommitTransaction>), QueryExecutionError>;
+
+/// Same as [`execute_sql_statement_with_options_typed`], but also returns how
+/// the MySQL auto-commit settlement left the tab-scoped connection (see
+/// [`MysqlAutoCommitTransaction`]). `None` means the statement did not run on a
+/// tab-scoped MySQL connection, so there is no such state to report.
+pub(crate) async fn execute_sql_statement_with_options_typed_with_outcome(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    sql: &str,
+    schema: Option<&str>,
+    cancel_token: Option<CancellationToken>,
+    options: QueryExecutionOptions,
+) -> Result<(db::QueryResult, Option<MysqlAutoCommitTransaction>), QueryExecutionError> {
     let db_type = connection_database_type(state, connection_id).await;
     let invalidate = crate::object_cache::sql_may_change_object_metadata(sql, db_type);
+    let mut transaction = None;
+    // Same contract as the multi-statement entry point: a single statement is
+    // reported with the duration of the whole request, including creating or
+    // reconnecting the pool, so the summary matches the loading indicator.
+    let request_start = std::time::Instant::now();
     let result = execute_sql_statement_with_options_typed_inner(
         state,
         connection_id,
@@ -2605,12 +2840,16 @@ pub async fn execute_sql_statement_with_options_typed(
         schema,
         cancel_token,
         options,
+        &mut transaction,
     )
     .await;
     if invalidate {
         crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
     }
-    result
+    result.map(|mut result| {
+        result.execution_time_ms = result.execution_time_ms.max(request_start.elapsed().as_millis());
+        (result, transaction)
+    })
 }
 
 async fn recover_postgres_create_table_after_connection_error(
@@ -2650,6 +2889,7 @@ async fn recover_postgres_create_table_after_connection_error(
         schema,
         cancel_token.clone(),
         options.clone(),
+        &mut None,
     )
     .await
     {
@@ -2684,6 +2924,7 @@ async fn recover_postgres_create_table_after_connection_error(
         None,
         cancel_token,
         verify_options,
+        &mut None,
     )
     .await
     .ok()
@@ -2700,6 +2941,7 @@ async fn execute_sql_statement_with_options_typed_inner(
     schema: Option<&str>,
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
+    transaction_outcome: &mut Option<MysqlAutoCommitTransaction>,
 ) -> Result<db::QueryResult, QueryExecutionError> {
     // MongoDB connections use shell-style commands dispatched through the
     // frontend parser. Queries that fall through to the generic SQL executor
@@ -2715,7 +2957,7 @@ async fn execute_sql_statement_with_options_typed_inner(
         || crate::sql::has_executable_sql(sql),
         |db_type| crate::sql::has_executable_sql_for_database(sql, db_type),
     );
-    if !has_executable_sql {
+    if !has_executable_sql && options.result_session_id.is_none() {
         return Ok(empty_query_result(0));
     }
 
@@ -2748,6 +2990,7 @@ async fn execute_sql_statement_with_options_typed_inner(
         schema,
         cancel_token.clone(),
         options.clone(),
+        transaction_outcome,
     )
     .await;
 
@@ -2781,8 +3024,18 @@ async fn execute_sql_statement_with_options_typed_inner(
                 .await
                 .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?;
             with_sql_context(
-                do_execute_typed(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options)
-                    .await,
+                do_execute_typed(
+                    state,
+                    &new_key,
+                    mysql_dialect,
+                    Some(database),
+                    sql,
+                    schema,
+                    cancel_token,
+                    options,
+                    &mut None,
+                )
+                .await,
             )
         }
         Some(PoolErrorAction::Discard) => {
@@ -2887,6 +3140,210 @@ fn parse_drop_database_target(sql: &str) -> Option<String> {
     parts[0].as_ident().map(|ident| ident.value.clone())
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LargeValueRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub value_ref: String,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub limit: u32,
+    pub execution_id: Option<String>,
+    pub client_session_id: Option<String>,
+    pub catalog: Option<String>,
+    pub txn_session_id: Option<String>,
+    pub download_encoding: Option<String>,
+}
+
+/// Fetches only the original captured locator; never retries by selecting the current row.
+pub async fn request_large_value(
+    state: &AppState,
+    request: LargeValueRequest,
+    release: bool,
+) -> Result<serde_json::Value, String> {
+    if request.value_ref.len() > 128 || (!release && (request.limit == 0 || request.limit > 4096)) {
+        return Err("Invalid LOB chunk request".to_string());
+    }
+    let registered = request.execution_id.as_ref().map(|id| {
+        state.running_queries.register_task(
+            id.clone(),
+            crate::query_cancel::RunningTaskMetadata::query(
+                request.connection_id.clone(),
+                request.database.clone(),
+                request.client_session_id.clone(),
+            ),
+        )
+    });
+    let cancel_token = registered.as_ref().map(|task| task.token());
+    request_large_value_with_cancel(state, request, release, cancel_token).await
+}
+
+async fn request_large_value_with_cancel(
+    state: &AppState,
+    request: LargeValueRequest,
+    release: bool,
+    cancel_token: Option<CancellationToken>,
+) -> Result<serde_json::Value, String> {
+    if request.value_ref.len() > 128 || (!release && (request.limit == 0 || request.limit > 4096)) {
+        return Err("Invalid LOB chunk request".to_string());
+    }
+    let method = if release { "release_large_value" } else { "read_large_value_chunk" };
+    let params = serde_json::json!({ "valueRef": request.value_ref, "offset": request.offset, "limit": request.limit });
+    let timeout = Some(std::time::Duration::from_secs(30));
+    if let Some(txn_id) = request.txn_session_id.as_deref() {
+        let connection = {
+            let mut sessions =
+                wait_for_value_opt(cancel_token.clone(), timeout, state.transaction_sessions.write()).await?;
+            let session = sessions.get_mut(txn_id).ok_or(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR)?;
+            if session.connection_id != request.connection_id
+                || session.busy
+                || session.last_activity.elapsed() >= session.idle_timeout
+            {
+                return Err("LOB transaction context expired or busy".to_string());
+            }
+            session.last_activity = std::time::Instant::now();
+            Arc::clone(&session.connection)
+        };
+        let connection = wait_for_value_opt(cancel_token.clone(), timeout, connection.lock()).await?;
+        let TxnConnection::Agent { client, .. } = &*connection else {
+            return Err("LOB snapshot chunks require an agent transaction".to_string());
+        };
+        let result = wait_for_value_opt(cancel_token.clone(), timeout, client.lock())
+            .await?
+            .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
+            .await;
+        if !wait_for_value_opt(cancel_token, timeout, state.transaction_sessions.read()).await?.contains_key(txn_id) {
+            return Err("LOB transaction context expired".to_string());
+        }
+        return result;
+    }
+    let pool_database = query_pool_database(&request.database, request.catalog.as_deref());
+    let (pool_key, handle) = wait_for_value_opt(
+        cancel_token.clone(),
+        timeout,
+        state.existing_workload_pool_for_session(
+            &request.connection_id,
+            pool_database,
+            request.client_session_id.as_deref(),
+        ),
+    )
+    .await?
+    .ok_or_else(|| "LOB context has expired; rerun the query".to_string())?;
+    let _activity = state.pool_activity_touch(pool_key.as_str());
+    let PoolKind::Agent(client) = handle else {
+        return Err("LOB snapshot chunks require an agent connection".to_string());
+    };
+    let mut client = wait_for_value_opt(cancel_token.clone(), timeout, client.lock()).await?;
+    client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await
+}
+
+pub async fn write_large_value_snapshot(
+    state: &AppState,
+    mut request: LargeValueRequest,
+    output: &mut std::fs::File,
+) -> Result<u64, String> {
+    use std::io::Write;
+    let registered = request.execution_id.as_ref().map(|id| {
+        state.running_queries.register_task(
+            id.clone(),
+            crate::query_cancel::RunningTaskMetadata::query(
+                request.connection_id.clone(),
+                request.database.clone(),
+                request.client_session_id.clone(),
+            ),
+        )
+    });
+    let cancel = registered.as_ref().map(|task| task.token());
+    request.offset = 0;
+    request.limit = 4096;
+    let mut written = 0;
+    let mut value_kind: Option<String> = None;
+    let mut decoder = match request.download_encoding.as_deref() {
+        None | Some("binary") => None,
+        Some("utf8") => Some(encoding_rs::UTF_8.new_decoder_without_bom_handling()),
+        Some("gbk") => Some(encoding_rs::GBK.new_decoder_without_bom_handling()),
+        Some(_) => return Err("Unsupported LOB download encoding".to_string()),
+    };
+    let mut first_decoded_output = request.download_encoding.as_deref() == Some("utf8");
+    loop {
+        if is_canceled(&cancel) {
+            return Err(canceled_error());
+        }
+        let chunk = request_large_value_with_cancel(state, request.clone(), false, cancel.clone()).await?;
+        if is_canceled(&cancel) {
+            return Err(canceled_error());
+        }
+        let (data, next, eof, kind) = snapshot_export::checked_chunk(&chunk, request.offset)?;
+        if value_kind.as_deref().is_some_and(|original| original != kind) {
+            return Err("LOB chunk type changed".to_string());
+        }
+        value_kind = Some(kind.to_string());
+        if next < request.offset || (!eof && next == request.offset) {
+            return Err("Invalid LOB offset".to_string());
+        }
+        let bytes = if kind == "binary" {
+            let bytes = decode_lob_hex_chunk(data)?;
+            if bytes.len() as u64 != next - request.offset {
+                return Err("Invalid LOB byte count".to_string());
+            }
+            if let Some(decoder) = decoder.as_mut() {
+                let mut text = decode_lob_text_chunk(decoder, &bytes, eof)?;
+                if first_decoded_output && !text.is_empty() {
+                    if text.starts_with('\u{feff}') {
+                        text.drain(..3);
+                    }
+                    first_decoded_output = false;
+                }
+                text.into_bytes()
+            } else {
+                bytes
+            }
+        } else if kind == "text" {
+            if data.chars().count() as u64 != next - request.offset {
+                return Err("Invalid LOB character count".to_string());
+            }
+            data.as_bytes().to_vec()
+        } else {
+            return Err("Invalid LOB type".to_string());
+        };
+        output.write_all(&bytes).map_err(|error| error.to_string())?;
+        written += bytes.len() as u64;
+        if eof {
+            break;
+        }
+        request.offset = next;
+    }
+    if is_canceled(&cancel) {
+        return Err(canceled_error());
+    }
+    output.flush().map_err(|error| error.to_string())?;
+    Ok(written)
+}
+
+fn decode_lob_hex_chunk(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() > 8192 || !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+        return Err("Invalid LOB binary encoding".to_string());
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).map_err(|_| "Invalid LOB binary encoding".to_string())?, 16)
+                .map_err(|_| "Invalid LOB binary encoding".to_string())
+        })
+        .collect()
+}
+
+fn decode_lob_text_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], eof: bool) -> Result<String, String> {
+    let mut text = String::with_capacity(bytes.len() * 3 + 12);
+    let (status, consumed, _) = decoder.decode_to_string(bytes, &mut text, eof);
+    if status != encoding_rs::CoderResult::InputEmpty || consumed != bytes.len() {
+        return Err("LOB download decoding did not consume the complete chunk".to_string());
+    }
+    Ok(text)
+}
+
 pub async fn close_query_session(
     state: &AppState,
     connection_id: &str,
@@ -2923,6 +3380,16 @@ pub async fn close_query_session(
         PoolKind::Easysearch(client) => {
             let client = client.clone();
             db::easysearch_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
+        }
+        PoolKind::Solr(client) => {
+            let client = client.clone();
+            db::solr_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
+        }
+        PoolKind::CouchDb(client) => {
+            let client = client.clone();
+            db::couchdb_driver::close_cursor(&client, session_id).await?;
             Ok(true)
         }
         _ => Ok(false),
@@ -3039,6 +3506,11 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
 ) -> Result<Vec<ExecuteMultiResult>, QueryExecutionError> {
     let db_type = connection_database_type(state, connection_id).await;
     let invalidate = crate::object_cache::sql_may_change_object_metadata(sql, db_type);
+    // A run that produced a single statement result is reported back as one
+    // duration, so make it the duration of the whole request: pool creation or
+    // reconnection for a cold pool happens outside the statement dispatcher and
+    // would otherwise be invisible while the loading indicator counts it.
+    let request_start = std::time::Instant::now();
     let result = execute_multi_core_with_options_for_client_and_progress_typed_inner(
         state,
         connection_id,
@@ -3053,7 +3525,14 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     if invalidate {
         crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
     }
-    result
+    result.map(|mut results| {
+        if results.len() == 1 {
+            if let Some(item) = results.first_mut() {
+                item.result.execution_time_ms = item.result.execution_time_ms.max(request_start.elapsed().as_millis());
+            }
+        }
+        results
+    })
 }
 
 async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
@@ -3100,8 +3579,11 @@ async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
     };
 
     let compatibility_mode = connection_sql_compatibility_mode(state, &pool_key, db_type).await;
+    let complete_sqlserver_agent_batch =
+        is_sqlserver_agent && sqlserver_agent_batch::requires_complete_results(sql, &options);
+    let split_db_type = connection_statement_split_database_type(state, connection_id).await;
     let execution_plan =
-        query_execution_plan_with_compatibility(sql, db_type, is_sqlserver_agent, compatibility_mode.as_deref());
+        query_execution_plan_with_compatibility(sql, split_db_type, is_sqlserver_agent, compatibility_mode.as_deref());
     let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
     let statements = execution_plan.statements;
     if statements.is_empty() {
@@ -3164,6 +3646,7 @@ async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
             )
             .await,
             table_data_preview,
+            None,
         );
     }
 
@@ -3176,6 +3659,7 @@ async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
     };
 
     if statements.len() == 1
+        && !complete_sqlserver_agent_batch
         && !mysql_single_statement_uses_batch_route(
             db_type,
             mysql_pool.is_some(),
@@ -3185,19 +3669,21 @@ async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
     {
         let single_sql = statements.into_iter().next().unwrap_or_default();
         let table_data_preview = options.table_data_preview;
-        return single_statement_multi_result(
-            execute_sql_statement_with_options_typed(
-                state,
-                connection_id,
-                database,
-                &single_sql,
-                schema,
-                cancel_token,
-                options,
-            )
-            .await,
-            table_data_preview,
-        );
+        let executed = execute_sql_statement_with_options_typed_with_outcome(
+            state,
+            connection_id,
+            database,
+            &single_sql,
+            schema,
+            cancel_token,
+            options,
+        )
+        .await;
+        let (result, transaction) = match executed {
+            Ok((result, transaction)) => (Ok(result), transaction),
+            Err(error) => (Err(error), None),
+        };
+        return single_statement_multi_result(result, table_data_preview, transaction);
     }
 
     if let Some((pool, mode)) = mysql_pool {
@@ -3238,24 +3724,56 @@ async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
             ));
             break;
         }
-        match execute_sql_statement_with_options_typed(
-            state,
-            connection_id,
-            database,
-            stmt,
-            schema,
-            cancel_token.clone(),
-            statement_options.clone(),
-        )
-        .await
-        {
-            Ok(r) => {
-                report_execute_multi_progress(progress.as_ref(), statement_index, statements.len(), &r, true, None);
-                results.push(ExecuteMultiResult::success_with_index_and_optional_server_large_values(
-                    r,
-                    statement_index,
-                    options.table_data_preview,
-                ));
+        let execution = if complete_sqlserver_agent_batch {
+            Box::pin(sqlserver_agent_batch::execute(
+                state,
+                &pool_key,
+                database,
+                stmt,
+                schema,
+                cancel_token.clone(),
+                statement_options.clone(),
+            ))
+            .await
+        } else {
+            execute_sql_statement_with_options_typed(
+                state,
+                connection_id,
+                database,
+                stmt,
+                schema,
+                cancel_token.clone(),
+                statement_options.clone(),
+            )
+            .await
+            .map(|result| vec![result])
+        };
+        match execution {
+            Ok(batch_results) => {
+                for result in batch_results {
+                    report_execute_multi_progress(
+                        progress.as_ref(),
+                        statement_index,
+                        statements.len(),
+                        &result,
+                        true,
+                        None,
+                    );
+                    results.push(if complete_sqlserver_agent_batch {
+                        // One GO batch can contain several statements/results;
+                        // do not label every result as its first statement.
+                        ExecuteMultiResult::success_with_optional_server_large_values(
+                            result,
+                            options.table_data_preview,
+                        )
+                    } else {
+                        ExecuteMultiResult::success_with_index_and_optional_server_large_values(
+                            result,
+                            statement_index,
+                            options.table_data_preview,
+                        )
+                    });
+                }
             }
             Err(error) => {
                 let action = query_execution_error_action(db_type, stmt, &error);
@@ -3352,8 +3870,15 @@ pub async fn connection_pool_is_sqlserver_agent(state: &AppState, connection_id:
 fn single_statement_multi_result(
     result: Result<db::QueryResult, QueryExecutionError>,
     table_data_preview: bool,
+    transaction: Option<MysqlAutoCommitTransaction>,
 ) -> Result<Vec<ExecuteMultiResult>, QueryExecutionError> {
-    result.map(|result| vec![ExecuteMultiResult::success_with_optional_server_large_values(result, table_data_preview)])
+    result.map(|result| {
+        let mut result = ExecuteMultiResult::success_with_optional_server_large_values(result, table_data_preview);
+        if let Some(transaction) = transaction {
+            transaction.mark(&mut result);
+        }
+        vec![result]
+    })
 }
 
 fn mysql_single_statement_uses_batch_route(
@@ -3638,6 +4163,178 @@ where
     (results, None)
 }
 
+/// Settled transaction state of a tab-scoped MySQL connection after one
+/// execution finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MysqlAutoCommitTransaction {
+    /// No transaction is open on the connection.
+    None,
+    /// A transaction the user opened explicitly is still open and was kept.
+    Preserved,
+    /// DBX rolled back a transaction the user opened explicitly.
+    RolledBackExplicit,
+    /// DBX rolled back a transaction the session opened implicitly because
+    /// auto-commit was turned off (`SET autocommit = 0`).
+    RolledBackSessionAutocommit,
+}
+
+impl MysqlAutoCommitTransaction {
+    fn mark(self, result: &mut ExecuteMultiResult) {
+        result.auto_commit_open_transaction = Some(self == Self::Preserved);
+        result.auto_commit_explicit_transaction_rolled_back = self == Self::RolledBackExplicit;
+        result.auto_commit_session_autocommit_rolled_back = self == Self::RolledBackSessionAutocommit;
+    }
+}
+
+/// What the settlement did with the transaction that was still open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MysqlAutoCommitRollback {
+    /// Nothing was rolled back.
+    None,
+    /// A transaction the batch opened explicitly (`BEGIN` / `START TRANSACTION`).
+    Explicit,
+    /// A transaction the session opened implicitly: auto-commit was off
+    /// (`SET autocommit = 0`), so every statement starts one.
+    SessionAutocommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MysqlAutoCommitDecision {
+    preserve: bool,
+    rollback: MysqlAutoCommitRollback,
+}
+
+/// Decides what to do with a transaction that is still open when an
+/// auto-commit tab finished executing.
+///
+/// A `BEGIN` / `START TRANSACTION` the user typed (or a batch that turned
+/// auto-commit off) is an explicit request to hold the changes until `COMMIT` /
+/// `ROLLBACK`, so `preserve_explicit_transaction` keeps it — including the
+/// later executions that never mention a transaction, which is what
+/// `already_preserved` carries. Everything else keeps the historical cleanup
+/// that stops a leftover transaction from pinning the tab's read view (#9479),
+/// and is reported so the cleanup is never silent.
+fn decide_mysql_auto_commit_transaction(
+    allow_preserve: bool,
+    already_preserved: bool,
+    explicit_start_in_batch: bool,
+    status: Option<db::mysql::MySqlSessionStatus>,
+) -> MysqlAutoCommitDecision {
+    // A session or batch that turned auto-commit off opens its transactions
+    // implicitly, so the server status is the only signal for those.
+    let explicit_transaction = explicit_start_in_batch || status.is_some_and(|status| !status.autocommit);
+    let transaction_open = match status {
+        Some(status) => status.in_transaction,
+        // No usable status packet (the last statement ended with an ERR packet
+        // and the refresh failed): an explicit opener is the only evidence left.
+        None => explicit_start_in_batch || already_preserved,
+    };
+    if !transaction_open {
+        return MysqlAutoCommitDecision { preserve: false, rollback: MysqlAutoCommitRollback::None };
+    }
+    if already_preserved || (allow_preserve && explicit_transaction) {
+        return MysqlAutoCommitDecision { preserve: true, rollback: MysqlAutoCommitRollback::None };
+    }
+    // Distinguish who opened it: only a batch with its own `BEGIN` /
+    // `START TRANSACTION` is a user transaction; `autocommit = 0` opens
+    // transactions implicitly for every statement.
+    let rollback = if explicit_start_in_batch {
+        MysqlAutoCommitRollback::Explicit
+    } else if status.is_some_and(|status| !status.autocommit) {
+        MysqlAutoCommitRollback::SessionAutocommit
+    } else {
+        MysqlAutoCommitRollback::None
+    };
+    MysqlAutoCommitDecision { preserve: false, rollback }
+}
+
+/// Whether the cleanup `ROLLBACK` after an execution would be a server no-op.
+///
+/// Every final status packet carries `SERVER_STATUS_IN_TRANS`, and MariaDB
+/// Connector/J skips `ROLLBACK`/`COMMIT` on the same flag. DBX only relies on it
+/// when the packet provably closes the execution (`status_is_final`: a native
+/// MySQL-mode connection whose response was read to the end without an error,
+/// so neither an earlier command's packet nor a pending result set is left
+/// behind) and the batch did not open a transaction itself. A batch with
+/// `BEGIN` keeps the historical cleanup, so a server or proxy that never
+/// reports the flag cannot leave the user's transaction open.
+fn mysql_cleanup_rollback_is_noop(
+    status_is_final: bool,
+    explicit_start_in_batch: bool,
+    status: Option<db::mysql::MySqlSessionStatus>,
+) -> bool {
+    status_is_final
+        && !explicit_start_in_batch
+        && status.is_some_and(|status| !status.in_transaction && status.autocommit)
+}
+
+/// Type-erased entry point for [`settle_mysql_auto_commit_transaction`].
+///
+/// `do_execute_typed` is one of the largest async fns in the crate and is
+/// reached transitively by the workspace's live tests and examples. Awaiting the
+/// settle future inline nests its concrete future type inside that generator,
+/// which pushed `dbx-core` targets past rustc's query depth limit on Linux
+/// (`error: queries overflow the depth limit!`). Erasing the type keeps the
+/// enclosing generators as shallow as they were before the settlement moved in.
+fn settle_mysql_auto_commit_transaction_boxed<'a>(
+    state: &'a AppState,
+    pool_key: &'a str,
+    conn: &'a mut mysql_async::Conn,
+    allow_preserve: bool,
+    explicit_start_in_batch: bool,
+    status_is_final: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MysqlAutoCommitTransaction, String>> + Send + 'a>> {
+    Box::pin(settle_mysql_auto_commit_transaction(
+        state,
+        pool_key,
+        conn,
+        allow_preserve,
+        explicit_start_in_batch,
+        status_is_final,
+    ))
+}
+
+/// Settles the open transaction of a tab-scoped MySQL connection after an
+/// execution: keeps an explicit user transaction when the caller opted in,
+/// otherwise rolls it back exactly as before.
+///
+/// `Err` means the transaction state could not be settled, so the caller must
+/// discard the connection instead of returning it to the pool.
+async fn settle_mysql_auto_commit_transaction(
+    state: &AppState,
+    pool_key: &str,
+    conn: &mut mysql_async::Conn,
+    allow_preserve: bool,
+    explicit_start_in_batch: bool,
+    status_is_final: bool,
+) -> Result<MysqlAutoCommitTransaction, String> {
+    let already_preserved = state.has_preserved_explicit_transaction(pool_key).await;
+    let mut status = db::mysql::session_status_from_last_ok(conn);
+    if status.is_none() && (allow_preserve || already_preserved) {
+        // Only pay for the extra round trip when the answer can change the
+        // outcome: without the opt-in the historical cleanup runs regardless.
+        status = db::mysql::ping_session_status_on_conn(conn).await.ok();
+    }
+    let decision =
+        decide_mysql_auto_commit_transaction(allow_preserve, already_preserved, explicit_start_in_batch, status);
+    if decision.preserve {
+        state.mark_preserved_explicit_transaction(pool_key).await;
+        return Ok(MysqlAutoCommitTransaction::Preserved);
+    }
+    state.clear_preserved_explicit_transaction(pool_key).await;
+    // Historical cleanup: `ROLLBACK` releases the read view of a transaction
+    // that is still open. Skip the round trip only when the final status
+    // packet proves nothing is open.
+    if !mysql_cleanup_rollback_is_noop(status_is_final, explicit_start_in_batch, status) {
+        db::mysql::rollback_open_transaction(conn).await?;
+    }
+    Ok(match decision.rollback {
+        MysqlAutoCommitRollback::Explicit => MysqlAutoCommitTransaction::RolledBackExplicit,
+        MysqlAutoCommitRollback::SessionAutocommit => MysqlAutoCommitTransaction::RolledBackSessionAutocommit,
+        MysqlAutoCommitRollback::None => MysqlAutoCommitTransaction::None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_multi_mysql(
     state: &AppState,
@@ -3714,7 +4411,7 @@ async fn execute_multi_mysql(
         diagnostic_trace_id: options.execution_id.as_deref(),
     };
     let statements_started_at = std::time::Instant::now();
-    let (results, error_action) = execute_mysql_batch_statements(
+    let (mut results, error_action) = execute_mysql_batch_statements(
         &mut executor,
         statements,
         db_type,
@@ -3735,18 +4432,55 @@ async fn execute_multi_mysql(
     // the REPEATABLE READ snapshot for every later auto-commit query on that
     // tab, making the tab read stale rows until disconnect. Closing any open
     // transaction before returning the connection restores the auto-commit
-    // contract; ROLLBACK on an already-committed/implicit transaction is a
-    // server no-op, and a failure here only discards this connection.
+    // contract, unless the tab keeps explicit user transactions open
+    // (`preserve_explicit_transaction`). The ROLLBACK round trip is skipped when
+    // the final status packet proves nothing is open, and a failure here only
+    // discards this connection.
     {
+        let tab_scoped = pool.is_client_session_pool();
+        let explicit_start_in_batch = statements
+            .iter()
+            .any(|statement| crate::query_execution_sql::mysql_statement_opens_explicit_transaction(statement));
+        // An error, a truncated result, or result sets still pending may leave
+        // the last status packet short of the end, so only a batch whose
+        // response was read completely can prove that the cleanup `ROLLBACK`
+        // is unnecessary.
+        let status_is_final = mode == crate::connection::MysqlMode::Normal
+            && error_action.is_none()
+            && results.iter().all(|result| !result.execution_error && !result.result.truncated)
+            && db::mysql::last_ok_ends_response(&conn);
         let rollback_started_at = std::time::Instant::now();
-        match db::mysql::rollback_open_transaction(&mut conn).await {
-            Ok(()) => {
+        let transaction = if tab_scoped {
+            settle_mysql_auto_commit_transaction(
+                state,
+                pool_key,
+                &mut conn,
+                options.preserve_explicit_transaction,
+                explicit_start_in_batch,
+                status_is_final,
+            )
+            .await
+        } else if mysql_cleanup_rollback_is_noop(
+            status_is_final,
+            explicit_start_in_batch,
+            db::mysql::session_status_from_last_ok(&conn),
+        ) {
+            Ok(MysqlAutoCommitTransaction::None)
+        } else {
+            db::mysql::rollback_open_transaction(&mut conn).await.map(|()| MysqlAutoCommitTransaction::None)
+        };
+        match transaction {
+            Ok(transaction) => {
                 if rollback_started_at.elapsed() > std::time::Duration::from_millis(5) {
                     log::info!(
-                        "[query][mysql-batch] trace_id={} open_txn_rollback_ms={}",
+                        "[query][mysql-batch] trace_id={} open_txn_rollback_ms={} preserved={}",
                         trace_id,
-                        rollback_started_at.elapsed().as_millis()
+                        rollback_started_at.elapsed().as_millis(),
+                        transaction == MysqlAutoCommitTransaction::Preserved
                     );
+                }
+                for result in &mut results {
+                    transaction.mark(result);
                 }
             }
             Err(error) => {
@@ -3789,6 +4523,7 @@ fn error_query_result(message: String) -> db::QueryResult {
         affected_rows: 0,
         execution_time_ms: 0,
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -3808,6 +4543,7 @@ fn empty_query_result(execution_time_ms: u128) -> db::QueryResult {
         affected_rows: 0,
         execution_time_ms,
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -3947,6 +4683,140 @@ pub async fn execute_statements(
     result
 }
 
+/// Execute a batch, optionally on a single transaction.
+///
+/// `use_transaction` is opt-in and only the structure editor sets it, for
+/// batches that change a partition hierarchy: a mid-batch failure there would
+/// otherwise leave a half-created hierarchy behind. The shared transaction
+/// kernel rejects backends whose DDL cannot roll back, and statements that
+/// cannot run inside a transaction block (`... CONCURRENTLY`) are refused up
+/// front rather than half-applied.
+pub async fn execute_statements_with_transaction_option(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    statements: &[String],
+    schema: Option<&str>,
+    use_transaction: bool,
+    timeout_secs: Option<u64>,
+) -> Result<db::QueryResult, String> {
+    if use_transaction && statements.len() > 1 {
+        if batch_has_concurrently_statement(statements) {
+            return Err(
+                "use_transaction cannot wrap CONCURRENTLY statements: they cannot run inside a transaction block. Run the batch without use_transaction."
+                    .to_string(),
+            );
+        }
+        let db_type = connection_database_type(state, connection_id).await;
+        if batch_transaction_ddl_is_unrollbackable(db_type, statements) {
+            return Err(
+                "use_transaction cannot be used with a batch whose DDL cannot be rolled back: DDL statements implicitly commit and cannot be undone. Run the batch without use_transaction (auto-commit, one result per statement) or split the DDL and DML into separate calls."
+                    .to_string(),
+            );
+        }
+        let result = execute_statements_in_transaction_typed(
+            state,
+            connection_id,
+            database,
+            statements,
+            schema,
+            None,
+            timeout_secs,
+        )
+        .await
+        .map_err(|error| error.into_legacy_string())?;
+        let invalidate = statements.iter().any(|sql| crate::object_cache::sql_may_change_object_metadata(sql, db_type));
+        if invalidate {
+            crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
+        }
+        return Ok(result);
+    }
+    execute_statements(state, connection_id, database, statements, schema, timeout_secs).await
+}
+
+/// Whether a batch contains a statement PostgreSQL-family servers refuse to run
+/// inside a transaction block (`CREATE/DROP INDEX CONCURRENTLY`,
+/// `ALTER TABLE ... DETACH PARTITION CONCURRENTLY`, ...).
+fn batch_has_concurrently_statement(statements: &[String]) -> bool {
+    statements.iter().any(|statement| {
+        let upper = statement.to_ascii_uppercase();
+        // Real CONCURRENTLY statements always start with one of these verbs.
+        // Requiring the verb plus a standalone keyword keeps the word inside
+        // string literals, comments or plain identifiers (e.g. a table named
+        // `concurrently`) from silently demoting the batch to auto-commit; the
+        // direction stays fail-safe because no CONCURRENTLY statement form
+        // starts with another verb.
+        let trimmed = upper.trim_start();
+        let starts_with_ddl_verb =
+            ["CREATE ", "DROP ", "REINDEX", "REFRESH ", "ALTER "].iter().any(|verb| trimmed.starts_with(verb));
+        starts_with_ddl_verb && contains_standalone_concurrently_keyword(&upper)
+    })
+}
+
+fn contains_standalone_concurrently_keyword(upper: &str) -> bool {
+    let keyword = "CONCURRENTLY";
+    let mut search_from = 0;
+    while let Some(pos) = upper[search_from..].find(keyword) {
+        let pos = search_from + pos;
+        let boundary =
+            |ch: Option<char>| ch.map(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '"').unwrap_or(false);
+        let before = boundary(upper[..pos].chars().next_back());
+        let after = boundary(upper[pos + keyword.len()..].chars().next());
+        if !before && !after {
+            return true;
+        }
+        search_from = pos + 1;
+    }
+    false
+}
+
+pub async fn execute_blob_bound_statements(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    previews: &[String],
+    bound: &[dbx_types::types::BlobBoundStatement],
+    schema: Option<&str>,
+    use_transaction: bool,
+    timeout_secs: Option<u64>,
+) -> Result<db::QueryResult, String> {
+    dbx_types::types::validate_blob_bound_statements(previews, bound)?;
+    if connection_database_type(state, connection_id).await != Some(DatabaseType::OceanbaseOracle) {
+        return Err("Bound BLOB saves are only supported for OceanBase Oracle.".into());
+    }
+    let pool_key = if database.is_empty() {
+        connection_id.to_string()
+    } else {
+        state.get_or_create_pool(connection_id, Some(database)).await?
+    };
+    let sql = bound.iter().map(|statement| statement.sql.clone()).collect::<Vec<_>>();
+    check_read_only_for_connection_multi(state, &pool_key, &sql).await?;
+    let pool = state.pool_handle(&pool_key).await;
+    let Some(PoolKind::Agent(source_client)) = pool.as_ref() else {
+        return Err("Bound BLOB saves require an updated JDBC Agent.".into());
+    };
+    let mut client = source_client.lock().await;
+    let result = client
+        .execute_blob_bound_typed(
+            if database.is_empty() { None } else { Some(database) },
+            previews,
+            bound,
+            schema,
+            use_transaction,
+            resolve_query_timeout(timeout_secs),
+        )
+        .await;
+    drop(client);
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            discard_agent_pool_after_typed_error(state, &pool_key, source_client, &error, RecoveryScope::UserOperation)
+                .await;
+            Err(error.into_legacy_string())
+        }
+    }
+}
+
 async fn execute_statements_inner(
     state: &AppState,
     connection_id: &str,
@@ -4068,6 +4938,7 @@ async fn execute_statements_inner(
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -4213,7 +5084,10 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::DynamoDb(_)
         | PoolKind::Elasticsearch(_)
         | PoolKind::Easysearch(_)
+        | PoolKind::Solr(_)
+        | PoolKind::CouchDb(_)
         | PoolKind::Meilisearch(_)
+        | PoolKind::Salesforce(_)
         | PoolKind::VectorDb(_)
         | PoolKind::InfluxDb(_)
         | PoolKind::InfluxDb3(_)
@@ -4616,7 +5490,10 @@ fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
         | PoolKind::CloudflareD1(_)
         | PoolKind::Elasticsearch(_)
         | PoolKind::Easysearch(_)
+        | PoolKind::Solr(_)
+        | PoolKind::CouchDb(_)
         | PoolKind::Meilisearch(_)
+        | PoolKind::Salesforce(_)
         | PoolKind::VectorDb(_)
         | PoolKind::InfluxDb(_)
         | PoolKind::InfluxDb3(_)
@@ -4678,6 +5555,7 @@ async fn exec_tx_pg_inner(
             affected_rows: total_affected,
             execution_time_ms: start.elapsed().as_millis(),
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -4696,6 +5574,8 @@ async fn exec_tx_pg_statements(
     budget: &DbOperationBudget,
     cancel_context: Option<db::postgres::PostgresCancelContext>,
 ) -> Result<u64, QueryExecutionError> {
+    let statements =
+        statements.iter().map(|sql| db::postgres::encode_postgres_sql(client, sql)).collect::<Result<Vec<_>, _>>()?;
     let tx = tokio::time::timeout(budget.recycle_timeout, client.transaction())
         .await
         .map_err(|_| {
@@ -4772,6 +5652,7 @@ async fn exec_tx_mysql_inner(
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -4815,6 +5696,9 @@ async fn exec_tx_sqlite_inner(
 ) -> Result<db::QueryResult, String> {
     let statements = statements.to_vec();
     let query_timeout = budget.query_timeout;
+    if let Some(worker) = pool.worker() {
+        return exec_tx_sqlite_worker_inner(worker, statements, start, query_timeout).await;
+    }
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
             conn.execute_batch("BEGIN").map_err(|e| format!("Failed to begin transaction: {}", e))?;
@@ -4965,6 +5849,7 @@ async fn exec_tx_sqlite_inner(
                         affected_rows: total_affected,
                         execution_time_ms: start.elapsed().as_millis(),
                         server_execute_time_us: None,
+                        query_timings_ms: None,
                         truncated: false,
                         session_id: None,
                         has_more: false,
@@ -4980,6 +5865,55 @@ async fn exec_tx_sqlite_inner(
                 }
             }
         })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn exec_tx_sqlite_worker_inner(
+    worker: Arc<db::sqlite_worker::SqliteWorkerClient>,
+    statements: Vec<String>,
+    start: std::time::Instant,
+    query_timeout: Option<Duration>,
+) -> Result<db::QueryResult, String> {
+    // Detached like the local spawn_blocking path, so a dropped caller cannot leave the
+    // worker connection inside an open transaction. One session keeps other requests out.
+    tokio::spawn(async move {
+        let mut session = worker.session().await;
+        session.query("BEGIN", None).await.map_err(|e| format!("Failed to begin transaction: {e}"))?;
+        // ponytail: the worker cannot interrupt a running statement, so the budget is only
+        // checked between statements; bounding one slow statement needs a worker interrupt op.
+        let within_budget = || match query_timeout {
+            Some(timeout) if start.elapsed() >= timeout => {
+                Err(format!("Query timed out after {} seconds", timeout.as_secs()))
+            }
+            _ => Ok(()),
+        };
+        let outcome: Result<db::QueryResult, String> = async {
+            let mut total_affected = 0;
+            for (i, sql) in statements.iter().enumerate() {
+                within_budget()?;
+                total_affected += session
+                    .query(sql, None)
+                    .await
+                    .map_err(|e| {
+                        query_error_with_omitted_sql_context(&format!("Statement {} failed: {}", i + 1, e), sql)
+                    })?
+                    .affected_rows;
+            }
+            within_budget()?;
+            let committed = session.query("COMMIT", None).await.map_err(|e| format!("COMMIT failed: {e}"))?;
+            Ok(db::QueryResult {
+                affected_rows: total_affected,
+                execution_time_ms: start.elapsed().as_millis(),
+                ..committed
+            })
+        }
+        .await;
+        if outcome.is_err() {
+            let _ = session.query("ROLLBACK", None).await;
+        }
+        outcome
     })
     .await
     .map_err(|e| e.to_string())?
@@ -5049,6 +5983,7 @@ async fn exec_tx_explicit_inner(
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -5140,16 +6075,25 @@ fn mysql_error_is_syntax_error(error: &mysql_async::Error) -> bool {
             let message = server_error.message.to_ascii_lowercase();
             message.contains("syntax error") && (message.contains("encountered:") || message.contains("expected"))
         }
+        // PolarDB-X exposes parser failures such as PXC-4500 / ERR_PARSER
+        // through the generic MySQL protocol ERR_HANDLE_DATA code (3009).
+        mysql_async::Error::Server(server_error) if server_error.code == 3009 => {
+            let message = server_error.message.to_ascii_lowercase();
+            message.contains("[err_parser]") || message.contains("syntax error") || message.contains("语法错误")
+        }
         _ => false,
     }
 }
 
 /// Compute per-execution-statement proven-read-only markers for the sticky
-/// manual-transaction UX (#7122 Oracle, #9018 MySQL/PostgreSQL). The user-facing
-/// classification SQL is split with the same dialect-aware splitter as the
-/// execution SQL and paired by count/position; any mismatch is fail-closed (no
-/// markers). Oracle/OceanBase-Oracle keep the lexical classifier, MySQL and
-/// PostgreSQL use the strict `sql_risk` proof; every other dialect is unproven.
+/// manual-transaction UX (#7122 Oracle, #9018 MySQL/PostgreSQL, ... GaussDB).
+/// The user-facing classification SQL is split with the same dialect-aware
+/// splitter as the execution SQL and paired by count/position; any mismatch is
+/// fail-closed (no markers). Oracle/OceanBase-Oracle reach the same AST proof as
+/// the PostgreSQL family through `is_oracle_proven_read_only_statement`, which
+/// keeps the Oracle-specific lexical guard rails (see `sql_risk`); MySQL and the
+/// PostgreSQL family use the strict `sql_risk` proof directly; every other
+/// dialect is unproven.
 fn classify_manual_transaction_statements(
     database_type: Option<DatabaseType>,
     execution_statement_count: usize,
@@ -5158,7 +6102,12 @@ fn classify_manual_transaction_statements(
     let Some(database_type) = database_type.filter(|database_type| {
         matches!(
             database_type,
-            DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Mysql | DatabaseType::Postgres
+            DatabaseType::Oracle
+                | DatabaseType::OceanbaseOracle
+                | DatabaseType::Mysql
+                | DatabaseType::Postgres
+                | DatabaseType::Gaussdb
+                | DatabaseType::OpenGauss
         )
     }) else {
         return Vec::new();
@@ -5174,7 +6123,7 @@ fn classify_manual_transaction_statements(
     user_statements
         .iter()
         .map(|statement| match database_type {
-            DatabaseType::Mysql | DatabaseType::Postgres => {
+            DatabaseType::Mysql | DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss => {
                 crate::sql_risk::prove_read_only_for_database(statement, database_type)
                     == crate::sql_risk::ReadProof::ProvenReadOnly
             }
@@ -5191,6 +6140,9 @@ async fn begin_transaction_session(
     catalog: Option<&str>,
     consistent_snapshot: bool,
 ) -> Result<String, String> {
+    if !consistent_snapshot && connection_database_type(state, connection_id).await == Some(DatabaseType::SqlServer) {
+        return sqlserver_manual_transaction::begin(state, connection_id, database, schema, catalog).await;
+    }
     let mysql_catalog_dialect = connection_mysql_catalog_dialect(state, connection_id).await;
     let pool_database = query_pool_database(database, catalog);
     // Probe the primary pool to learn the backend kind. Agent manual TX opens a
@@ -5349,9 +6301,11 @@ async fn begin_transaction_session(
 
     let txn_session_id = uuid::Uuid::new_v4().to_string();
     let session = TransactionSession {
+        sqlserver: None,
         connection: Arc::new(tokio::sync::Mutex::new(txn_conn)),
         pool_key: pool_key.clone(),
         last_activity: std::time::Instant::now(),
+        idle_timeout: manual_transaction_idle_timeout(state, connection_id).await,
         busy: false,
         snapshot_rotation_safe: !consistent_snapshot,
         connection_id: connection_id.to_string(),
@@ -5450,8 +6404,11 @@ pub async fn execute_in_manual_transaction(
 
 #[derive(Clone, Debug, Default)]
 pub struct ManualTransactionExecutionOptions {
+    pub bound_statements: Option<Vec<dbx_types::types::BlobBoundStatement>>,
     pub max_rows: Option<usize>,
     pub table_data_preview: bool,
+    pub execution_id: Option<String>,
+    pub timeout_secs: Option<u64>,
     pub page_size: Option<usize>,
     pub result_session_id: Option<String>,
     /// User-facing SQL to classify (Oracle-only). When present, the core
@@ -5470,8 +6427,12 @@ pub async fn execute_in_manual_transaction_with_options(
     schema: Option<&str>,
     options: ManualTransactionExecutionOptions,
 ) -> Result<Vec<ExecuteMultiResult>, String> {
-    const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
-
+    if sqlserver_manual_transaction::is_session_id(txn_session_id) {
+        if options.bound_statements.is_some() {
+            return Err("Bound BLOB saves are only supported for OceanBase Oracle.".into());
+        }
+        return sqlserver_manual_transaction::execute(state, txn_session_id, sql, database, schema, options).await;
+    }
     // Resolve statements and validate before taking the per-session connection
     // lock. The session stays visible in the map so close/disconnect cleanup can
     // remove it and roll back once the current DB operation releases the lock.
@@ -5483,16 +6444,28 @@ pub async fn execute_in_manual_transaction_with_options(
 
     let db_type = connection_database_type(state, &connection_id).await;
     let compatibility_mode = connection_sql_compatibility_mode(state, &pool_key, db_type).await;
-    let statements = db_type.map_or_else(
-        || split_sql_statements(sql),
-        |db_type| {
-            crate::sql::split_sql_statements_for_database_with_compatibility(
-                sql,
-                db_type,
-                compatibility_mode.as_deref(),
-            )
-        },
-    );
+    let statements = if let Some(bound) = options.bound_statements.as_ref() {
+        if db_type != Some(DatabaseType::OceanbaseOracle) {
+            return Err("Bound BLOB saves are only supported for OceanBase Oracle.".into());
+        }
+        let previews = bound.iter().map(|statement| statement.preview_sql.clone()).collect::<Vec<_>>();
+        if sql != previews.join(";\n") {
+            return Err("The reviewed SQL changed; regenerate the BLOB save preview before saving.".into());
+        }
+        dbx_types::types::validate_blob_bound_statements(&previews, bound)?;
+        previews
+    } else {
+        db_type.map_or_else(
+            || split_sql_statements(sql),
+            |db_type| {
+                crate::sql::split_sql_statements_for_database_with_compatibility(
+                    sql,
+                    db_type,
+                    compatibility_mode.as_deref(),
+                )
+            },
+        )
+    };
     if statements.is_empty() {
         // Sticky-dialect UX marker: the no-op is Core's decision that the script
         // (empty/whitespace/comments-only) has no statements, so the frontend
@@ -5504,7 +6477,14 @@ pub async fn execute_in_manual_transaction_with_options(
         );
         if matches!(
             db_type,
-            Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Mysql | DatabaseType::Postgres)
+            Some(
+                DatabaseType::Oracle
+                    | DatabaseType::OceanbaseOracle
+                    | DatabaseType::Mysql
+                    | DatabaseType::Postgres
+                    | DatabaseType::Gaussdb
+                    | DatabaseType::OpenGauss
+            )
         ) {
             result = result.with_manual_transaction_no_statement();
         }
@@ -5526,6 +6506,26 @@ pub async fn execute_in_manual_transaction_with_options(
     // Read-only check while the session is still in the map. If this fails the
     // session remains intact.
     check_read_only_for_connection_multi(state, &pool_key, &statements).await?;
+    if let Some(bound) = options.bound_statements.as_ref() {
+        check_read_only_for_connection_multi(
+            state,
+            &pool_key,
+            &bound.iter().map(|statement| statement.sql.clone()).collect::<Vec<_>>(),
+        )
+        .await?;
+        let connection = state
+            .transaction_sessions
+            .read()
+            .await
+            .get(txn_session_id)
+            .map(|session| Arc::clone(&session.connection))
+            .ok_or(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR)?;
+        let connection = connection.lock().await;
+        if !matches!(&*connection, TxnConnection::Agent { client, .. } if client.lock().await.supports_capability(crate::db::agent_driver::AgentCapability::BlobBindStatementsV1))
+        {
+            return Err("This Agent does not support bound BLOB saves; update the Agent before saving.".into());
+        }
+    }
 
     let classification: Vec<bool> =
         classify_manual_transaction_statements(db_type, statements.len(), options.classification_sql.as_deref());
@@ -5538,7 +6538,7 @@ pub async fn execute_in_manual_transaction_with_options(
         if session.busy {
             return Err("Transaction session is already executing".to_string());
         }
-        if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
+        if session.last_activity.elapsed() > session.idle_timeout {
             let session = sessions.remove(txn_session_id).expect("session exists");
             Some(session)
         } else {
@@ -5567,8 +6567,15 @@ pub async fn execute_in_manual_transaction_with_options(
     let mut results = Vec::with_capacity(statements.len());
 
     let mut conn = connection.lock().await;
+    let mut bound_failure_can_keep = false;
     for (i, statement) in statements.iter().enumerate() {
+        if options.bound_statements.is_some() && i > 0 {
+            break;
+        }
         let result = match &mut *conn {
+            TxnConnection::SqlServer { .. } => {
+                return Err("SQL Server transaction must use its batch executor".to_string())
+            }
             TxnConnection::Postgres(conn) => {
                 execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit).await
             }
@@ -5581,18 +6588,41 @@ pub async fn execute_in_manual_transaction_with_options(
                 .await
             }
             TxnConnection::Agent { client, .. } => {
-                execute_manual_txn_agent_statement(
-                    client,
-                    db_type,
-                    statement,
-                    database,
-                    schema,
-                    row_limit,
-                    options.table_data_preview,
-                    options.page_size,
-                    options.result_session_id.as_deref(),
-                )
-                .await
+                if let Some(bound) = options.bound_statements.as_ref() {
+                    match client
+                        .lock()
+                        .await
+                        .execute_blob_bound_typed(
+                            if database.is_empty() { None } else { Some(database) },
+                            &statements,
+                            bound,
+                            schema,
+                            false,
+                            resolve_query_timeout(options.timeout_secs),
+                        )
+                        .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            bound_failure_can_keep = error.session_disposition()
+                                == Some(crate::db::agent_driver::AgentSessionDisposition::Keep);
+                            Err(error.into_legacy_string())
+                        }
+                    }
+                } else {
+                    execute_manual_txn_agent_statement(
+                        client,
+                        db_type,
+                        statement,
+                        database,
+                        schema,
+                        row_limit,
+                        options.table_data_preview,
+                        options.page_size,
+                        options.result_session_id.as_deref(),
+                    )
+                    .await
+                }
             }
             TxnConnection::ExternalDriver { session, config, .. } => {
                 execute_manual_txn_external_driver_statement(session, config, statement, database, schema, row_limit)
@@ -5611,6 +6641,13 @@ pub async fn execute_in_manual_transaction_with_options(
                 results.push(executed);
             }
             Err(e) => {
+                if bound_failure_can_keep {
+                    if let Some(session) = state.transaction_sessions.write().await.get_mut(txn_session_id) {
+                        session.busy = false;
+                        session.last_activity = std::time::Instant::now();
+                    }
+                    return Err(e);
+                }
                 // Statement failure ends the transaction. If another cleanup path
                 // already removed the session, it owns the final rollback.
                 let should_rollback = {
@@ -5621,7 +6658,11 @@ pub async fn execute_in_manual_transaction_with_options(
                     let _ = rollback_manual_txn_connection(&mut conn).await;
                     release_manual_txn_session_pool(state, &connection_id, &mut conn).await;
                 }
-                return Err(format!("Statement {} failed: {}. The manual transaction was rolled back.", i + 1, e));
+                return Err(if options.bound_statements.is_some() {
+                    format!("Bound BLOB save failed: {e}. The transaction session was discarded; the operation outcome may be unknown.")
+                } else {
+                    format!("Statement {} failed: {}. The manual transaction was rolled back.", i + 1, e)
+                });
             }
         }
     }
@@ -5694,8 +6735,6 @@ pub(crate) async fn stream_rows_in_manual_transaction_with_cancel<F>(
 where
     F: FnMut(Vec<Vec<serde_json::Value>>) -> Result<(), String> + Send,
 {
-    const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
-
     let expired_connection = {
         let mut sessions = state.transaction_sessions.write().await;
         let Some(session) = sessions.get_mut(txn_session_id) else {
@@ -5704,7 +6743,7 @@ where
         if session.busy {
             return Err("Transaction session is already executing".to_string());
         }
-        if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
+        if session.last_activity.elapsed() > session.idle_timeout {
             Some(sessions.remove(txn_session_id).expect("session exists").connection)
         } else {
             session.busy = true;
@@ -5816,6 +6855,7 @@ where
             .await
         }
         TxnConnection::Mysql(None) => Err(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string()),
+        TxnConnection::SqlServer { .. } => Err("Streaming SQL Server manual transactions is not supported".to_owned()),
         TxnConnection::Agent { .. } => {
             Err("Streaming rows inside an agent manual transaction is not supported".to_string())
         }
@@ -5917,6 +6957,28 @@ async fn rollback_manual_txn_connection_with_postgres_timeout(
     postgres_timeout: Option<Duration>,
 ) -> Result<(), String> {
     match conn {
+        TxnConnection::SqlServer { client, client_session_id: _client_session_id, .. } => {
+            if let Some(client) = client {
+                let mut client = client.lock().await;
+                let count = db::sqlserver::manual_transaction_status(&mut client).await?.count;
+                if count == 0 {
+                    return Err("The transaction has already ended; rollback cannot be confirmed".to_string());
+                }
+                #[cfg(feature = "test-support")]
+                sqlserver_manual_transaction::live_test_hooks::run(
+                    _client_session_id,
+                    sqlserver_manual_transaction::live_test_hooks::Phase::BeforeRollback,
+                );
+                db::sqlserver::execute_simple_batch_with_max_rows_metadata(
+                    &mut client,
+                    "ROLLBACK TRANSACTION",
+                    Some(1),
+                )
+                .await?;
+            } else {
+                return Err("The transaction connection was discarded; rollback cannot be confirmed".to_string());
+            }
+        }
         TxnConnection::Postgres(conn) => {
             if let Some(timeout) = postgres_timeout {
                 db::postgres::execute_postgres_infra_statement(conn, "ROLLBACK", timeout, "manual_txn.rollback")
@@ -5979,7 +7041,8 @@ async fn discard_mysql_manual_txn_connection(conn: &mut TxnConnection, timeout: 
 
 async fn release_manual_txn_session_pool(state: &AppState, connection_id: &str, conn: &mut TxnConnection) {
     let (client_session_id, database, cleanup_guard) = match conn {
-        TxnConnection::Agent { client_session_id, database, cleanup_guard, .. }
+        TxnConnection::SqlServer { client_session_id, database, cleanup_guard, .. }
+        | TxnConnection::Agent { client_session_id, database, cleanup_guard, .. }
         | TxnConnection::ExternalDriver { client_session_id, database, cleanup_guard, .. } => {
             (client_session_id, database, cleanup_guard)
         }
@@ -6052,7 +7115,9 @@ async fn execute_manual_txn_agent_statement(
         execution_schema,
         options,
     );
+    let lock_started = std::time::Instant::now();
     let mut locked = client.lock().await;
+    let lock_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
     let result = match request {
         ManualTxnAgentQueryRequest::Execute(params) => {
             locked.execute_query_typed_with_timeout::<db::QueryResult>(params, None).await
@@ -6065,7 +7130,12 @@ async fn execute_manual_txn_agent_statement(
         }
     };
     result
-        .map(|result| truncate_result_with_max_rows(result, Some(row_limit.max(1))))
+        .map(|mut result| {
+            if let Some(timings) = result.query_timings_ms.as_mut() {
+                timings.insert("core_lock".into(), lock_ms);
+            }
+            truncate_result_with_max_rows(result, Some(row_limit.max(1)))
+        })
         .map_err(|error| error.into_legacy_string())
 }
 
@@ -6095,7 +7165,7 @@ async fn execute_manual_txn_external_driver_statement(
 }
 
 /// Spawn a background task that removes and rolls back a transaction session
-/// after 5 minutes of inactivity. The task does not hold the global lock across
+/// after its idle timeout. The task does not hold the global lock across
 /// I/O: it briefly checks the map, and if the session exists and is expired,
 /// removes it, drops the lock, then rolls back the held connection.
 ///
@@ -6113,14 +7183,16 @@ fn spawn_txn_idle_watcher_for_sessions(
     txn_session_id: String,
 ) {
     tokio::spawn(async move {
-        const TXN_IDLE_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS);
-        tokio::time::sleep(TXN_IDLE_TIMEOUT).await;
+        // The window is fixed per session at BEGIN; a vanished session needs no watcher.
+        let Some(idle_timeout) = sessions.read().await.get(&txn_session_id).map(|session| session.idle_timeout) else {
+            return;
+        };
+        tokio::time::sleep(idle_timeout).await;
 
         let removed: Option<TransactionSession> = {
             let mut guard = sessions.write().await;
             match guard.get(&txn_session_id) {
-                Some(session) if !session.busy && session.last_activity.elapsed() >= TXN_IDLE_TIMEOUT => {
+                Some(session) if !session.busy && session.last_activity.elapsed() >= session.idle_timeout => {
                     guard.remove(&txn_session_id)
                 }
                 _ => None,
@@ -6131,8 +7203,9 @@ fn spawn_txn_idle_watcher_for_sessions(
             let mut conn = session.connection.lock().await;
             let _ = rollback_manual_txn_connection(&mut conn).await;
             log::info!(
-                "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after 5 minutes of inactivity",
-                txn_session_id
+                "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after {}s of inactivity",
+                txn_session_id,
+                session.idle_timeout.as_secs()
             );
         }
     });
@@ -6143,27 +7216,7 @@ async fn execute_manual_txn_postgres_statement(
     sql: &str,
     row_limit: usize,
 ) -> Result<db::QueryResult, String> {
-    if db::postgres::postgres_statement_returns_rows(sql) {
-        db::postgres::execute_select_query_unnamed(conn, sql, std::time::Instant::now(), row_limit).await
-    } else {
-        let affected = conn.execute_typed(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
-        Ok(db::QueryResult {
-            columns: vec![],
-            column_types: Vec::new(),
-            column_sortables: vec![],
-            spatial_columns: vec![],
-            spatial_values: vec![],
-            rows: vec![],
-            affected_rows: affected,
-            execution_time_ms: 0,
-            server_execute_time_us: None,
-            truncated: false,
-            session_id: None,
-            has_more: false,
-            elasticsearch_raw_body: None,
-            messages: Vec::new(),
-        })
-    }
+    db::postgres::execute_query_on_client_unnamed(conn, sql, row_limit).await
 }
 
 async fn execute_manual_txn_mysql_statement(
@@ -6176,6 +7229,30 @@ async fn execute_manual_txn_mysql_statement(
         let mut result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
         let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
         let column_types: Vec<String> = result.columns_ref().iter().map(db::mysql::mysql_column_type_name).collect();
+        // Some statements only *may* return rows — `EXECUTE` of a prepared DML statement
+        // finishes with a plain OK packet instead — so report the affected rows rather than
+        // failing on the missing result set.
+        if columns.is_empty() {
+            let affected_rows = result.affected_rows();
+            result.drop_result().await.map_err(|e| format!("Query failed: {e}"))?;
+            return Ok(db::QueryResult {
+                columns: Vec::new(),
+                column_types: Vec::new(),
+                column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
+                rows: vec![],
+                affected_rows,
+                execution_time_ms: start.elapsed().as_millis(),
+                server_execute_time_us: None,
+                query_timings_ms: None,
+                truncated: false,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
+            });
+        }
         let mut data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(row_limit.min(1024));
         let mut stream = result
             .stream::<mysql_async::Row>()
@@ -6201,6 +7278,7 @@ async fn execute_manual_txn_mysql_statement(
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated,
             session_id: None,
             has_more: false,
@@ -6221,6 +7299,7 @@ async fn execute_manual_txn_mysql_statement(
             affected_rows,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -6232,6 +7311,9 @@ async fn execute_manual_txn_mysql_statement(
 
 /// Commit an existing manual transaction session.
 pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -> Result<db::QueryResult, String> {
+    if sqlserver_manual_transaction::is_session_id(txn_session_id) {
+        return sqlserver_manual_transaction::finish(state, txn_session_id, true).await;
+    }
     let session = {
         let mut sessions = state.transaction_sessions.write().await;
         sessions.remove(txn_session_id).ok_or("Transaction session not found")?
@@ -6239,6 +7321,7 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
 
     let mut conn = session.connection.lock().await;
     match &mut *conn {
+        TxnConnection::SqlServer { .. } => return Err("SQL Server transaction must use its commit handler".to_string()),
         TxnConnection::Postgres(conn) => {
             conn.execute_typed("COMMIT", &[]).await.map_err(|e| format!("COMMIT failed: {e}"))?;
         }
@@ -6278,6 +7361,7 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
         affected_rows: 0,
         execution_time_ms: 0,
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -6288,6 +7372,9 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
 
 /// Rollback an existing manual transaction session.
 pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str) -> Result<db::QueryResult, String> {
+    if sqlserver_manual_transaction::is_session_id(txn_session_id) {
+        return sqlserver_manual_transaction::finish(state, txn_session_id, false).await;
+    }
     let session = {
         let mut sessions = state.transaction_sessions.write().await;
         sessions.remove(txn_session_id).ok_or("Transaction session not found")?
@@ -6308,6 +7395,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
         affected_rows: 0,
         execution_time_ms: 0,
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -6330,6 +7418,15 @@ mod tests {
         struct SnapshotTestConnect {
             commands: Arc<Mutex<Vec<String>>>,
             fail_once: Option<&'static str>,
+        }
+
+        fn record_snapshot_command(commands: &Mutex<Vec<String>>, statement: &str) {
+            // Infrastructure identity lookup for PostgreSQL notice attribution is
+            // unrelated to manual-transaction snapshot rotation semantics.
+            if statement.starts_with("SELECT pg_backend_pid()") {
+                return;
+            }
+            commands.lock().unwrap().push(statement.to_string());
         }
 
         impl deadpool_postgres::Connect for SnapshotTestConnect {
@@ -6371,7 +7468,7 @@ mod tests {
                                     (b'n', Vec::new())
                                 }
                                 b'E' => {
-                                    commands.lock().unwrap().push(statement.clone());
+                                    record_snapshot_command(&commands, &statement);
                                     if fail_once == Some(statement.as_str()) {
                                         fail_once = None;
                                         (b'E', b"SERROR\0CXX000\0Mtest statement failed\0\0".to_vec())
@@ -6409,7 +7506,9 @@ mod tests {
             fail_once: Option<&'static str>,
         ) -> (AppState, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
             let directory = tempfile::tempdir().unwrap();
-            let state = AppState::new(Storage::open(&directory.path().join("storage.db")).await.unwrap());
+            let state = AppState::new(
+                crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap(),
+            );
             let config = test_connection_config(DatabaseType::Postgres);
             state.configs.write().await.insert(config.id.clone(), config);
             let commands = Arc::new(Mutex::new(Vec::new()));
@@ -6423,9 +7522,11 @@ mod tests {
             state.transaction_sessions.write().await.insert(
                 "snapshot".to_string(),
                 TransactionSession {
+                    sqlserver: None,
                     connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::Postgres(Box::new(connection)))),
                     pool_key: "conn-1".to_string(),
                     last_activity: std::time::Instant::now(),
+                    idle_timeout: std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS),
                     busy: false,
                     snapshot_rotation_safe: true,
                     connection_id: "conn-1".to_string(),
@@ -6791,6 +7892,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_ssh_worker_transaction_rolls_back_on_failure_and_commits_on_success() {
+        let remote = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().expect("open remote SQLite")));
+        remote.lock().unwrap().execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").expect("create table");
+        let (client_stream, worker_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(fake_sqlite_ssh_worker(worker_stream, remote.clone()));
+        let pool = db::sqlite::SqliteHandle::from_worker(Arc::new(
+            db::sqlite_worker::SqliteWorkerClient::from_test_stream(client_stream),
+        ));
+        let budget = DbOperationBudget::with_defaults();
+        let row_count =
+            || remote.lock().unwrap().query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0)).unwrap();
+
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t VALUES (1)".to_string(), "INSERT INTO missing VALUES (2)".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("second statement fails");
+        assert!(error.contains("Statement 2 failed") && error.contains("no such table: missing"), "{error}");
+        assert_eq!(row_count(), 0);
+
+        let result = exec_tx_sqlite_inner(
+            pool,
+            &["INSERT INTO t VALUES (1)".to_string(), "INSERT INTO t VALUES (2)".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect("transaction commits");
+        assert_eq!(result.affected_rows, 2);
+        assert_eq!(row_count(), 2);
+    }
+
+    /// Answers SQLite worker JSONL requests from a real SQLite connection.
+    async fn fake_sqlite_ssh_worker(stream: tokio::io::DuplexStream, conn: Arc<Mutex<rusqlite::Connection>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let request: serde_json::Value = serde_json::from_str(&line).expect("worker request");
+            let mut response = {
+                let conn = conn.lock().unwrap();
+                match conn.execute_batch(request["sql"].as_str().unwrap_or_default()) {
+                    Ok(()) => serde_json::json!({ "affected_rows": conn.changes() }),
+                    Err(error) => serde_json::json!({ "error": error.to_string() }),
+                }
+            };
+            response["id"] = request["id"].clone();
+            writer.write_all(format!("{response}\n").as_bytes()).await.expect("worker response");
+        }
+    }
+
+    #[tokio::test]
     async fn sqlite_external_interrupt_without_budget_does_not_panic() {
         // Regression: with query_timeout = None (MCP policy can set it to 0 =
         // unlimited; resolve_query_timeout(Some(0)) -> None), an SQLITE_INTERRUPT
@@ -6874,7 +8030,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage = Storage::open(&dir.path().join("storage.db")).await.expect("open test storage");
+        let storage =
+            crate::persistence::test_storage::open(&dir.path().join("storage.db")).await.expect("open test storage");
         let state = Arc::new(AppState::new(storage));
         let connection_id = "sqlite-cancel-session";
         let client_session_id = "query-tab-8414";
@@ -7092,7 +8249,6 @@ mod tests {
         InstalledPlugin, PluginCompatibility, PluginDriverManifest, PluginDriverSession, PluginManifest,
         PluginRuntimeEnv,
     };
-    use crate::storage::Storage;
 
     #[cfg(unix)]
     async fn spawn_agent_batch_timeout_test_client() -> (AgentDriverClient, tempfile::NamedTempFile) {
@@ -7183,7 +8339,7 @@ for line in sys.stdin:
     async fn query_and_transaction_paths_resolve_catalog_dialect_from_connection() {
         let dir = std::env::temp_dir().join(format!("dbx-catalog-dialect-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
 
         let mut doris = test_connection_config(DatabaseType::Doris);
@@ -7365,8 +8521,59 @@ for line in sys.stdin:
         assert!(validate_query_execution_mode(Some(DatabaseType::Postgres), "SELECT 1; SELECT 2", &options).is_err());
     }
 
+    fn idle_test_session(idle_timeout: Duration) -> TransactionSession {
+        TransactionSession {
+            sqlserver: None,
+            connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::Mysql(None))),
+            pool_key: "conn-1".to_string(),
+            last_activity: std::time::Instant::now(),
+            idle_timeout,
+            busy: false,
+            snapshot_rotation_safe: false,
+            connection_id: "conn-1".to_string(),
+            database: "test".to_string(),
+            schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_rolls_back_after_the_session_own_timeout() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut guard = sessions.write().await;
+            guard.insert("short".to_string(), idle_test_session(Duration::from_millis(50)));
+            guard.insert("long".to_string(), idle_test_session(Duration::from_secs(3600)));
+        }
+        spawn_txn_idle_watcher_for_sessions(Arc::clone(&sessions), "short".to_string());
+        spawn_txn_idle_watcher_for_sessions(Arc::clone(&sessions), "long".to_string());
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let guard = sessions.read().await;
+        assert!(!guard.contains_key("short"), "a 50ms session must be reaped long before the 300s default");
+        assert!(guard.contains_key("long"), "a session with a longer window must survive the same wait");
+    }
+
+    #[tokio::test]
+    async fn manual_transaction_idle_timeout_follows_connection_config() {
+        let dir = std::env::temp_dir().join(format!("dbx-txn-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = test_connection_config(DatabaseType::Postgres);
+        config.manual_transaction_timeout_secs = 1_800;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        assert_eq!(manual_transaction_idle_timeout(&state, "conn-1").await, Duration::from_secs(1_800));
+        // An unknown connection keeps the historical five-minute window.
+        assert_eq!(manual_transaction_idle_timeout(&state, "missing").await, Duration::from_secs(300));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "conn-1".to_string(),
             name: "Connection".to_string(),
@@ -7386,6 +8593,8 @@ for line in sys.stdin:
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -7393,6 +8602,8 @@ for line in sys.stdin:
             connect_timeout_secs: 10,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 30,
             ssl: false,
             ca_cert_path: String::new(),
@@ -7412,6 +8623,7 @@ for line in sys.stdin:
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -7428,6 +8640,7 @@ for line in sys.stdin:
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -7445,7 +8658,7 @@ for line in sys.stdin:
         let (host, port) = address.rsplit_once(':').expect("DynamoDB endpoint must include a port");
         let dir = std::env::temp_dir().join(format!("dbx-query-dynamodb-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let mut config = test_connection_config(DatabaseType::DynamoDb);
         config.host = host.to_string();
@@ -7496,14 +8709,31 @@ for line in sys.stdin:
 print(json.dumps({'ready': True}), flush=True)
 for line in sys.stdin:
     req = json.loads(line)
+    with open(sys.argv[1], 'a') as calls:
+        calls.write(json.dumps(req) + '\n')
     if req['method'] == 'handshake':
         result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
-    elif req['method'] == 'execute_query':
+    elif req['method'] in ('execute_query', 'execute_query_page'):
         result = {
             'columns': ['sql'], 'column_types': ['nvarchar'], 'column_sortables': [],
             'rows': [[req['params']['sql']]], 'affected_rows': 0, 'execution_time_ms': 1,
             'truncated': False, 'session_id': None, 'has_more': False
         }
+        if req['params'].get('returnAllResults'):
+            result = [result]
+            sql = req['params']['sql']
+            if 'RAISERROR' in sql:
+                print(json.dumps({'jsonrpc':'2.0', 'id':req['id'], 'error': {
+                    'code': -1, 'message': 'late SQL Server batch error', 'data': {
+                        'category': 'sql', 'sqlState': 'S0001', 'vendorCode': 50000,
+                        'retryable': False, 'sessionDisposition': 'keep', 'stage': 'execute'
+                    }}}), flush=True)
+                continue
+            if 'SELECT 101' in sql and 'SELECT 303' in sql:
+                result = [dict(result[0], columns=[name], rows=rows) for name, rows in [
+                    ('first_result', [[101], [102], [103]]), ('second_result', [[202]]), ('third_result', [[303]])]]
+    elif req['method'] == 'fetch_query_page':
+        result = {'columns': ['next_page'], 'rows': [[2]], 'affected_rows': 0, 'execution_time_ms': 1}
     elif req['method'] in ('execute_batch', 'execute_transaction'):
         if req['params'].get('schema') is not None:
             print(json.dumps({
@@ -7525,15 +8755,17 @@ for line in sys.stdin:
 
         let python = if cfg!(windows) { "python" } else { "python3" };
         let runtime = crate::db::agent_driver::AgentRuntimeClient::spawn(
-            crate::db::agent_driver::AgentLaunchSpec::new(python)
-                .with_args([script_path.to_string_lossy().to_string()]),
+            crate::db::agent_driver::AgentLaunchSpec::new(python).with_args([
+                script_path.to_string_lossy().to_string(),
+                dir.join("calls.jsonl").to_string_lossy().to_string(),
+            ]),
             "test",
         )
         .await
         .unwrap();
         runtime.increment_session_count();
 
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         state.configs.write().await.insert("conn-1".to_string(), test_connection_config(DatabaseType::SqlServer));
         state
@@ -7577,6 +8809,172 @@ for line in sys.stdin:
         runtime.kill();
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn sqlserver_agent_calls(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("calls.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|request: &serde_json::Value| {
+                matches!(request["method"].as_str(), Some("execute_query" | "execute_query_page" | "fetch_query_page"))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_collects_all_results_without_cursor_or_replay() {
+        for page_size in [None, Some(100)] {
+            let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+            let sql = "SELECT 101 AS first_result; SELECT 202 AS second_result; SELECT 303 AS third_result;";
+            let results = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                sql,
+                None,
+                None,
+                QueryExecutionOptions { max_rows: Some(1), page_size, ..Default::default() },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0].result.rows, vec![vec![serde_json::json!(101)]]);
+            assert!(results[0].result.truncated);
+            assert_eq!(results[1].result.rows, vec![vec![serde_json::json!(202)]]);
+            assert_eq!(results[2].result.rows, vec![vec![serde_json::json!(303)]]);
+            assert!(results.iter().all(|result| result.statement_index.is_none()));
+            let calls = sqlserver_agent_calls(&dir);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["method"], "execute_query");
+            assert_eq!(calls[0]["params"]["returnAllResults"], true);
+            assert_eq!(calls[0]["params"]["sql"], sql);
+            assert_eq!(calls[0]["params"]["maxRows"], 1);
+            runtime.kill();
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_keeps_go_batches_and_variable_scope() {
+        let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+        let first = "DECLARE @n INT; SET @n=1; SELECT @n;";
+        let second = "SELECT 2 AS n;";
+        let results = execute_multi_core_with_options_for_client_and_progress_typed(
+            &state,
+            "conn-1",
+            "",
+            &format!("{first}\nGO\n{second}"),
+            None,
+            None,
+            QueryExecutionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        let calls = sqlserver_agent_calls(&dir);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["params"]["sql"], first);
+        assert_eq!(calls[1]["params"]["sql"], second);
+        assert!(calls.iter().all(|call| call["params"]["returnAllResults"] == true));
+        runtime.kill();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_preserves_errors_and_go_continue_policy() {
+        for continue_on_error in [false, true] {
+            let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+            let results = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                "SELECT 1; RAISERROR('late',16,1);\nGO\nSELECT 2;",
+                None,
+                None,
+                QueryExecutionOptions { continue_on_error, ..Default::default() },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(results[0].execution_error);
+            assert!(results[0].result.rows[0][0].as_str().unwrap().contains("late SQL Server batch error"));
+            assert!(results[0].error.is_some());
+            assert_eq!(results.len(), if continue_on_error { 2 } else { 1 });
+            assert_eq!(sqlserver_agent_calls(&dir).len(), if continue_on_error { 2 } else { 1 });
+            assert!(matches!(state.pool_handle("conn-1").await, Some(PoolKind::Agent(_))));
+            runtime.kill();
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_preserves_single_query_and_fetch_cursors() {
+        for session_id in [None, Some("cursor-1".to_string())] {
+            let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+            let results = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                "SELECT 1 AS n;",
+                None,
+                None,
+                QueryExecutionOptions {
+                    page_size: Some(100),
+                    result_session_id: session_id.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(results.len(), 1);
+            let calls = sqlserver_agent_calls(&dir);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0]["method"],
+                if session_id.is_some() { "fetch_query_page" } else { "execute_query_page" }
+            );
+            assert!(calls[0]["params"].get("returnAllResults").is_none());
+            runtime.kill();
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_preserves_read_only_and_pre_dispatch_cancel() {
+        for read_only in [true, false] {
+            let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+            state.configs.write().await.get_mut("conn-1").unwrap().read_only = read_only;
+            let cancel = CancellationToken::new();
+            if !read_only {
+                cancel.cancel();
+            }
+            let results = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                "SELECT 1; UPDATE users SET n=2;",
+                None,
+                Some(cancel),
+                QueryExecutionOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(results[0].execution_error);
+            assert!(sqlserver_agent_calls(&dir).is_empty());
+            runtime.kill();
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]
@@ -7650,7 +9048,7 @@ for line in sys.stdin:
         .unwrap();
         runtime.increment_session_count();
 
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         state.configs.write().await.insert("conn-1".to_string(), test_connection_config(DatabaseType::Dameng));
         state
@@ -7709,7 +9107,7 @@ for line in sys.stdin:
     async fn native_pre_dispatch_cancellation_stays_typed() {
         let dir = std::env::temp_dir().join(format!("dbx-query-native-cancel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "sqlite-cancel";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
@@ -7889,7 +9287,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn ddl_schema_cache_invalidates_persisted_object_snapshots() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "schema-cache";
         let sqlite =
@@ -7931,7 +9329,7 @@ for line in sys.stdin:
             ("BEGIN; ALTER TABLE users ADD COLUMN added INTEGER; COMMIT", false, false, true),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+            let storage = crate::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
             let state = AppState::new(storage);
             let sqlite = db::sqlite::connect_path_create_if_missing(dir.path().join("query.db").to_str().unwrap())
                 .await
@@ -7990,7 +9388,7 @@ for line in sys.stdin:
     async fn ddl_schema_cache_storage_failure_preserves_sql_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let storage_path = dir.path().join("storage.db");
-        let state = AppState::new(Storage::open(&storage_path).await.unwrap());
+        let state = AppState::new(crate::persistence::test_storage::open(&storage_path).await.unwrap());
         let sqlite =
             db::sqlite::connect_path_create_if_missing(dir.path().join("query.db").to_str().unwrap()).await.unwrap();
         state
@@ -8019,7 +9417,7 @@ for line in sys.stdin:
     async fn assert_sqlite_batch_error_behavior(failure_first: bool, continue_on_error: bool) {
         let dir = std::env::temp_dir().join(format!("dbx-query-batch-error-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "sqlite-batch";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
@@ -8070,7 +9468,7 @@ for line in sys.stdin:
     async fn transactional_sqlite_batch_rolls_back_when_a_later_statement_fails() {
         let dir = std::env::temp_dir().join(format!("dbx-query-transaction-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "sqlite-transaction";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
@@ -8113,7 +9511,7 @@ for line in sys.stdin:
     async fn transactional_batch_rejects_an_unsupported_backend_before_execution() {
         let dir = std::env::temp_dir().join(format!("dbx-query-unsupported-transaction-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "message-queue-transaction";
         state
@@ -8170,11 +9568,42 @@ for line in sys.stdin:
         assert!(!batch_transaction_ddl_is_unrollbackable(None, &ddl));
     }
 
+    #[test]
+    fn batch_has_concurrently_statement_detects_transaction_block_escapees() {
+        assert!(batch_has_concurrently_statement(&["CREATE INDEX CONCURRENTLY idx ON t (id)".to_string(),]));
+        assert!(batch_has_concurrently_statement(&[
+            "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY".to_string(),
+        ]));
+        // Case-insensitive, and a single CONCURRENTLY anywhere in the batch is enough.
+        assert!(batch_has_concurrently_statement(&[
+            "ALTER TABLE t ADD COLUMN c int".to_string(),
+            "drop index concurrently idx".to_string(),
+        ]));
+        assert!(!batch_has_concurrently_statement(&[
+            "CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (1)".to_string(),
+        ]));
+        // The word inside literals or plain identifiers must not demote a batch
+        // that would otherwise run in one transaction.
+        assert!(!batch_has_concurrently_statement(&[
+            "INSERT INTO notes (body) VALUES ('run CREATE INDEX CONCURRENTLY later')".to_string(),
+        ]));
+        assert!(!batch_has_concurrently_statement(&[
+            "SELECT id FROM concurrently WHERE label = 'drop index concurrently idx'".to_string(),
+        ]));
+        assert!(!batch_has_concurrently_statement(&[
+            "-- refresh materialized view concurrently next".to_string(),
+            "SELECT 1".to_string(),
+        ]));
+        // REINDEX/REFRESH forms still detect.
+        assert!(batch_has_concurrently_statement(&["REINDEX TABLE CONCURRENTLY t".to_string()]));
+        assert!(batch_has_concurrently_statement(&["REFRESH MATERIALIZED VIEW CONCURRENTLY mv".to_string()]));
+    }
+
     #[tokio::test]
     async fn connection_pool_is_sqlserver_agent_detects_agent_and_native_pools() {
         let dir = std::env::temp_dir().join(format!("dbx-query-sqlserver-agent-flag-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
 
         // Non-SQL-Server connections never use the SQL Server agent splitter.
@@ -8210,7 +9639,7 @@ for line in sys.stdin:
         // on failure for DDL that cannot be rolled back.
         let dir = std::env::temp_dir().join(format!("dbx-query-tx-predispatch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "message-queue-tx-ddl";
         state
@@ -8281,10 +9710,16 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn gaussdb_on_error_stop_overrides_continue_on_error() {
+    async fn postgres_family_on_error_stop_overrides_continue_on_error() {
+        for db_type in [DatabaseType::Postgres, DatabaseType::OpenGauss, DatabaseType::Gaussdb] {
+            assert_psql_on_error_stop_overrides_continue_on_error(db_type).await;
+        }
+    }
+
+    async fn assert_psql_on_error_stop_overrides_continue_on_error(db_type: DatabaseType) {
         let dir = std::env::temp_dir().join(format!("dbx-query-gaussdb-on-error-stop-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let connection_id = "gaussdb-on-error-stop";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
@@ -8293,7 +9728,7 @@ for line in sys.stdin:
                 connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
             })
             .await;
-        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Gaussdb));
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(db_type));
 
         let results = execute_multi_core_with_options(
             &state,
@@ -8438,6 +9873,7 @@ for line in sys.stdin:
                     affected_rows: 0,
                     execution_time_ms: 4,
                     server_execute_time_us: None,
+                    query_timings_ms: None,
                     truncated: false,
                     session_id: None,
                     has_more: false,
@@ -8713,6 +10149,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 1,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -8921,7 +10358,7 @@ for line in sys.stdin:
         let result = ExecuteMultiResult::success_with_index_and_large_values(
             empty_query_result(1),
             0,
-            vec![db::LargeValueCell { row_index: 2, column_index: 3, original_bytes: 65_536 }],
+            vec![db::LargeValueCell { row_index: 2, column_index: 3, original_bytes: 65_536, value_ref: None }],
             false,
         );
 
@@ -8935,28 +10372,28 @@ for line in sys.stdin:
     #[test]
     fn large_value_cell_merge_replaces_driver_entries_and_appends_server_entries() {
         let driver_cells = vec![
-            db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 10 },
-            db::LargeValueCell { row_index: 3, column_index: 4, original_bytes: 20 },
+            db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 10, value_ref: None },
+            db::LargeValueCell { row_index: 3, column_index: 4, original_bytes: 20, value_ref: None },
         ];
         let server_cells = vec![
-            db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 100 },
-            db::LargeValueCell { row_index: 5, column_index: 6, original_bytes: 200 },
+            db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 100, value_ref: None },
+            db::LargeValueCell { row_index: 5, column_index: 6, original_bytes: 200, value_ref: None },
         ];
 
         assert_eq!(
             merge_large_value_cells(driver_cells, server_cells),
             vec![
-                db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 100 },
-                db::LargeValueCell { row_index: 3, column_index: 4, original_bytes: 20 },
-                db::LargeValueCell { row_index: 5, column_index: 6, original_bytes: 200 },
+                db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 100, value_ref: None },
+                db::LargeValueCell { row_index: 3, column_index: 4, original_bytes: 20, value_ref: None },
+                db::LargeValueCell { row_index: 5, column_index: 6, original_bytes: 200, value_ref: None },
             ]
         );
     }
 
     #[test]
     fn large_value_cell_merge_preserves_single_source_inputs() {
-        let driver_cell = db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 10 };
-        let server_cell = db::LargeValueCell { row_index: 3, column_index: 4, original_bytes: 20 };
+        let driver_cell = db::LargeValueCell { row_index: 1, column_index: 2, original_bytes: 10, value_ref: None };
+        let server_cell = db::LargeValueCell { row_index: 3, column_index: 4, original_bytes: 20, value_ref: None };
 
         assert_eq!(merge_large_value_cells(vec![driver_cell.clone()], Vec::new()), vec![driver_cell]);
         assert_eq!(merge_large_value_cells(Vec::new(), vec![server_cell.clone()]), vec![server_cell]);
@@ -8966,10 +10403,10 @@ for line in sys.stdin:
     fn large_value_cell_merge_handles_large_disjoint_inputs() {
         const CELL_COUNT: usize = 100_000;
         let driver_cells = (0..CELL_COUNT)
-            .map(|row_index| db::LargeValueCell { row_index, column_index: 0, original_bytes: 10 })
+            .map(|row_index| db::LargeValueCell { row_index, column_index: 0, original_bytes: 10, value_ref: None })
             .collect();
         let server_cells = (0..CELL_COUNT)
-            .map(|row_index| db::LargeValueCell { row_index, column_index: 1, original_bytes: 20 })
+            .map(|row_index| db::LargeValueCell { row_index, column_index: 1, original_bytes: 20, value_ref: None })
             .collect();
 
         let merged = merge_large_value_cells(driver_cells, server_cells);
@@ -9014,6 +10451,22 @@ for line in sys.stdin:
         let plan = query_execution_plan(sql, Some(DatabaseType::SqlServer), true);
 
         assert_eq!(plan.statements, vec!["DECLARE @x TABLE (id INT);\nINSERT INTO @x VALUES (1);", "SELECT 2;"]);
+    }
+
+    #[test]
+    fn jdbc_oracle_execution_plan_keeps_plsql_units_whole() {
+        let mut oracle = test_connection_config(DatabaseType::Jdbc);
+        oracle.connection_string = Some("jdbc:oracle:thin:@//127.0.0.1:1521/FREEPDB1".to_string());
+        let function = "CREATE OR REPLACE EDITIONABLE FUNCTION \"APP\".\"F\" (p VARCHAR2) RETURN VARCHAR2 IS\n\
+                        l_ret VARCHAR2(200);\nBEGIN\n  SELECT p INTO l_ret FROM dual;\n  RETURN l_ret;\nEND;";
+
+        let plan = query_execution_plan(function, Some(statement_split_database_type(&oracle)), false);
+
+        assert_eq!(plan.statements, vec![function]);
+
+        let mut other = test_connection_config(DatabaseType::Jdbc);
+        other.connection_string = Some("jdbc:h2:mem:test".to_string());
+        assert_eq!(statement_split_database_type(&other), DatabaseType::Jdbc);
     }
 
     #[test]
@@ -9212,7 +10665,7 @@ for line in sys.stdin:
         )
         .with_omitted_sql_context("SELECT * FROM dbx_table_that_does_not_exist");
 
-        let error = single_statement_multi_result(Err(error), false).unwrap_err();
+        let error = single_statement_multi_result(Err(error), false, None).unwrap_err();
         let backend_error = error.into_backend_error();
 
         assert_eq!(backend_error.code(), "DBX-JDBC-4001");
@@ -9292,6 +10745,74 @@ for line in sys.stdin:
             "Unknown column executeQueryPage in field list",
             "executeQueryPage"
         ));
+    }
+
+    #[test]
+    fn original_lob_ref_survives_production_result_normalization_without_polluting_preview_values() {
+        let mut result = empty_query_result(0);
+        result.columns = vec!["Payload".to_string(), "__DBX_LARGE_VALUE_BYTES_C_0".to_string()];
+        result.column_types = vec!["CLOB".to_string(), "VARCHAR".to_string()];
+        result.rows = vec![
+            vec![serde_json::json!("原😀值"), serde_json::json!("D:1:unknown:original-ref")],
+            vec![serde_json::Value::Null, serde_json::Value::Null],
+            vec![serde_json::json!(""), serde_json::Value::Null],
+        ];
+        let normalized = ExecuteMultiResult::success_with_optional_server_large_values(result, true);
+        assert_eq!(normalized.result.columns, vec!["Payload"]);
+        assert_eq!(
+            normalized.result.rows,
+            vec![vec![serde_json::json!("原😀值")], vec![serde_json::Value::Null], vec![serde_json::json!("")]]
+        );
+        assert_eq!(
+            normalized.large_value_cells,
+            vec![db::LargeValueCell {
+                row_index: 0,
+                column_index: 0,
+                original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+                value_ref: Some("original-ref".to_string()),
+            }]
+        );
+        let wire = serde_json::to_value(normalized).unwrap();
+        assert_eq!(wire["large_value_cells"][0]["value_ref"], "original-ref");
+        assert_eq!(wire["rows"][0][0], "原😀值");
+        let legacy: db::LargeValueCell = serde_json::from_value(serde_json::json!({
+            "row_index": 0, "column_index": 1, "original_bytes": 128,
+        }))
+        .unwrap();
+        assert_eq!(legacy.value_ref, None);
+        assert!(serde_json::to_value(legacy).unwrap().get("value_ref").is_none());
+    }
+
+    #[test]
+    fn lob_binary_download_decodes_every_byte_without_text_conversion() {
+        let original: Vec<u8> = (0..=255).collect();
+        let hex: String = original.iter().map(|value| format!("{value:02x}")).collect();
+        assert_eq!(decode_lob_hex_chunk(&hex).unwrap(), original);
+        assert_eq!(decode_lob_hex_chunk("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_lob_hex_chunk("00FF").unwrap(), vec![0, 255]);
+        assert!(decode_lob_hex_chunk("0").is_err());
+        assert!(decode_lob_hex_chunk("zz").is_err());
+        assert!(decode_lob_hex_chunk("00".repeat(4097).as_str()).is_err());
+    }
+
+    #[test]
+    fn lob_download_text_modes_preserve_multibyte_characters_split_across_chunks() {
+        let original = "中文😀末尾";
+        let mut utf8 = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let bytes = original.as_bytes();
+        let mut decoded = String::new();
+        for (index, byte) in bytes.iter().enumerate() {
+            decoded.push_str(&decode_lob_text_chunk(&mut utf8, &[*byte], index + 1 == bytes.len()).unwrap());
+        }
+        assert_eq!(decoded, original);
+        let (bytes, _, errors) = encoding_rs::GBK.encode("中文末尾");
+        assert!(!errors);
+        let mut gbk = encoding_rs::GBK.new_decoder_without_bom_handling();
+        let mut decoded = String::new();
+        for (index, byte) in bytes.iter().enumerate() {
+            decoded.push_str(&decode_lob_text_chunk(&mut gbk, &[*byte], index + 1 == bytes.len()).unwrap());
+        }
+        assert_eq!(decoded, "中文末尾");
     }
 
     #[test]
@@ -9414,6 +10935,7 @@ for line in sys.stdin:
                 backend_executable: Some(dir.join("plugin.sh")),
                 ..Default::default()
             },
+            provenance: None,
         };
         let session = PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
             .await
@@ -9451,6 +10973,7 @@ for line in sys.stdin:
                 row_index: 0,
                 column_index: 1,
                 original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+                value_ref: None
             }]
         );
 
@@ -9471,7 +10994,7 @@ for line in sys.stdin:
         assert_eq!(cells.len(), 1);
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 4);
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9520,13 +11043,14 @@ for line in sys.stdin:
                 backend_executable: Some(dir.join("plugin.sh")),
                 ..Default::default()
             },
+            provenance: None,
         };
         let session = Arc::new(
             PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
                 .await
                 .expect("plugin should start"),
         );
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let mut config = test_connection_config(DatabaseType::Jdbc);
         config.id = "jdbc-conn".to_string();
@@ -9562,6 +11086,7 @@ for line in sys.stdin:
         state.transaction_sessions.write().await.insert(
             "txn-test".to_string(),
             TransactionSession {
+                sqlserver: None,
                 connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::ExternalDriver {
                     session,
                     config,
@@ -9571,6 +11096,7 @@ for line in sys.stdin:
                 })),
                 pool_key: pool_key.to_string(),
                 last_activity: std::time::Instant::now(),
+                idle_timeout: std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS),
                 busy: false,
                 snapshot_rotation_safe: true,
                 connection_id: "jdbc-conn".to_string(),
@@ -9637,6 +11163,7 @@ for line in sys.stdin:
                 backend_executable: Some(dir.join("plugin.sh")),
                 ..Default::default()
             },
+            provenance: None,
         };
         let session = PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
             .await
@@ -9654,7 +11181,7 @@ for line in sys.stdin:
         assert_eq!(result.rows, vec![vec![serde_json::json!(42)]]);
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "executeQueryPage\nexecuteQuery\n");
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9701,6 +11228,7 @@ for line in sys.stdin:
                 backend_executable: Some(dir.join("plugin.sh")),
                 ..Default::default()
             },
+            provenance: None,
         };
         let session = PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
             .await
@@ -9717,7 +11245,7 @@ for line in sys.stdin:
         assert_eq!(error, "Incorrect syntax near SELECT");
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "request\n");
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9769,6 +11297,7 @@ for line in sys.stdin:
                 affected_rows: 0,
                 execution_time_ms: 0,
                 server_execute_time_us: None,
+                query_timings_ms: None,
                 truncated: false,
                 session_id: None,
                 has_more: false,
@@ -9795,6 +11324,7 @@ for line in sys.stdin:
                 affected_rows: 0,
                 execution_time_ms: 0,
                 server_execute_time_us: None,
+                query_timings_ms: None,
                 truncated: false,
                 session_id: None,
                 has_more: false,
@@ -10169,6 +11699,8 @@ for line in sys.stdin:
     #[test]
     fn external_driver_query_params_include_database_and_schema_context() {
         let config = ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "jdbc-1".to_string(),
             name: "JDBC".to_string(),
@@ -10188,6 +11720,8 @@ for line in sys.stdin:
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -10195,6 +11729,8 @@ for line in sys.stdin:
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),
@@ -10214,6 +11750,7 @@ for line in sys.stdin:
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -10230,6 +11767,7 @@ for line in sys.stdin:
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         };
 
@@ -10668,6 +12206,15 @@ for line in sys.stdin:
             classify_manual_transaction_statements(Some(DatabaseType::Postgres), 1, Some("SELECT * FROM users")),
             vec![true]
         );
+        // GaussDB/openGauss share the PostgreSQL-family proof.
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Gaussdb), 1, Some("SELECT * FROM users")),
+            vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::OpenGauss), 1, Some("UPDATE users SET x = 1")),
+            vec![false]
+        );
         // Mixed script: every statement is classified individually.
         assert_eq!(
             classify_manual_transaction_statements(Some(DatabaseType::Mysql), 2, Some("SELECT 1; DELETE FROM t")),
@@ -10684,10 +12231,25 @@ for line in sys.stdin:
         assert!(classify_manual_transaction_statements(Some(DatabaseType::Mysql), 1, None).is_empty());
         assert!(classify_manual_transaction_statements(Some(DatabaseType::Doris), 1, Some("SELECT 1")).is_empty());
         assert!(classify_manual_transaction_statements(None, 1, Some("SELECT 1")).is_empty());
-        // Oracle keeps its lexical classifier and its pairing behavior.
+        // Oracle/OceanBase-Oracle share the AST proof and keep the pairing
+        // behavior; built-in functions are now provable (#11788) while the
+        // Oracle guard rails (dblink, sequence pseudocolumns, set operators)
+        // still fail the proof.
         assert_eq!(
             classify_manual_transaction_statements(Some(DatabaseType::Oracle), 1, Some("SELECT * FROM EMP")),
             vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Oracle), 1, Some("SELECT LENGTH(1) FROM dual")),
+            vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(
+                Some(DatabaseType::OceanbaseOracle),
+                2,
+                Some("SELECT COUNT(*) FROM EMP; SELECT * FROM EMP@LINK")
+            ),
+            vec![true, false]
         );
         assert_eq!(
             classify_manual_transaction_statements(Some(DatabaseType::OceanbaseOracle), 1, Some("DELETE FROM EMP")),
@@ -10712,7 +12274,11 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     if method == "execute_query":
-        sql = request.get("params", {{}}).get("sql", "")
+        params = request.get("params", {{}})
+        sql = params.get("sql", "")
+        if "REQUIRE_APP_SCHEMA" in sql and params.get("schema") != "APP":
+            print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "error": {{"code": -32000, "message": "schema was not forwarded"}}}}), flush=True)
+            continue
         if "RAISE_FILE_ERROR" in sql:
             print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "error": {{"code": -32000, "message": "file statement rejected"}}}}), flush=True)
             continue
@@ -10746,7 +12312,7 @@ for line in sys.stdin:
 
         let dir = std::env::temp_dir().join(format!("dbx-manual-txn-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let mut config = test_connection_config(db_type);
         config.id = "agent-conn".to_string();
@@ -10764,6 +12330,7 @@ for line in sys.stdin:
         state.transaction_sessions.write().await.insert(
             txn_session_id.clone(),
             TransactionSession {
+                sqlserver: None,
                 connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::Agent {
                     client: Arc::new(crate::db::agent_driver::PooledAgentClient::new(client)),
                     client_session_id,
@@ -10772,11 +12339,12 @@ for line in sys.stdin:
                 })),
                 pool_key: "agent-conn".to_string(),
                 last_activity: std::time::Instant::now(),
+                idle_timeout: std::time::Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS),
                 busy: false,
                 snapshot_rotation_safe: true,
                 connection_id: "agent-conn".to_string(),
                 database: "ORCL".to_string(),
-                schema: None,
+                schema: Some("APP".to_string()),
             },
         );
         (state, txn_session_id, dir)
@@ -10788,11 +12356,14 @@ for line in sys.stdin:
             execution_id: "manual-file-test".to_string(),
             connection_id: "agent-conn".to_string(),
             database: "ORCL".to_string(),
+            schema: Some("APP".to_string()),
             file_path: String::new(),
             continue_on_error: false,
             selected_tables: None,
             part_cooldown_ms: 0,
             skip_relational_constraints: false,
+            failure_log_enabled: true,
+            encoding: Default::default(),
         }
     }
 
@@ -10806,7 +12377,7 @@ for line in sys.stdin:
         crate::data::sql_file_import::execute_sql_file_content(
             &state,
             &request,
-            "UPDATE T SET V = 1; UPDATE T SET V = 2;",
+            "SELECT REQUIRE_APP_SCHEMA; UPDATE T SET V = 2;",
             CancellationToken::new(),
             std::time::Instant::now(),
             |event| events.push(event),
@@ -10922,6 +12493,23 @@ for line in sys.stdin:
             assert!(events.is_empty());
             assert!(state.transaction_sessions.read().await.contains_key(&session_id));
         }
+        let mut request = manual_sql_file_request(&session_id);
+        request.schema = Some("OTHER".to_string());
+        let mut events = Vec::new();
+        let error = crate::data::sql_file_import::execute_sql_file_content(
+            &state,
+            &request,
+            "UPDATE T SET V = 1;",
+            CancellationToken::new(),
+            std::time::Instant::now(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("target does not match"));
+        assert!(events.is_empty());
+        assert!(state.transaction_sessions.read().await.contains_key(&session_id));
+
         rollback_manual_transaction(&state, &session_id).await.unwrap();
         let error = crate::data::sql_file_import::execute_sql_file_content(
             &state,
@@ -10964,6 +12552,103 @@ for line in sys.stdin:
         // Both statements ran on the plain execute path — no cursor session was
         // opened, so nothing leaks a query cursor on the agent.
         assert!(results.iter().all(|result| result.result.session_id.is_none()));
+
+        assert!(rollback_manual_transaction(&state, &txn_session_id).await.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #11788: the Oracle manual-transaction marker must follow the user's SQL
+    /// through the real execution path — `execute_in_manual_transaction_with_options`
+    /// → statement/classification pairing → per-statement marker — because that
+    /// marker is what the frontend aggregates into `tab.txnPossiblyDirty` and the
+    /// toolbar's Commit/Rollback visibility. The fake agent echoes each statement,
+    /// so this needs no live database. It does NOT cover the Java driver or a real
+    /// Oracle server, and it does not render the toolbar; the two-way real-Oracle
+    /// acceptance run is still outstanding.
+    #[tokio::test]
+    async fn oracle_manual_transaction_marks_only_proven_read_only_statements() {
+        async fn markers(state: &AppState, txn_session_id: &str, sql: &str) -> Vec<bool> {
+            execute_in_manual_transaction_with_options(
+                state,
+                txn_session_id,
+                sql,
+                "ORCL",
+                None,
+                ManualTransactionExecutionOptions { classification_sql: Some(sql.to_string()), ..Default::default() },
+            )
+            .await
+            .expect("statement executes through the manual transaction session")
+            .into_iter()
+            .map(|result| result.manual_transaction_proven_read_only)
+            .collect()
+        }
+
+        let (state, txn_session_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+
+        // Proven reads: the toolbar must stay clean, including the built-in
+        // functions and non-call parentheses the old blanket `(` rule rejected.
+        for sql in [
+            "SELECT LENGTH(1) FROM dual",
+            "SELECT COUNT(*) FROM EMP",
+            "SELECT UPPER(name) FROM EMP",
+            "SELECT NVL(name, 'x') FROM EMP",
+            "SELECT * FROM EMP WHERE id IN (1, 2, 3)",
+            "SELECT CURRENT_TIME FROM dual",
+        ] {
+            assert_eq!(markers(&state, &txn_session_id, sql).await, vec![true], "expected proven: {sql}");
+        }
+
+        // Unproven statements must still dirty the session.
+        for sql in [
+            "SELECT my_udf(id) FROM EMP",
+            "SELECT DBMS_LOCK.SLEEP(1) FROM dual",
+            "SELECT * FROM EMP@LINK",
+            "SELECT seq.NEXTVAL FROM dual",
+            "SELECT * FROM EMP FOR UPDATE",
+            "UPDATE EMP SET name = 'x'",
+        ] {
+            assert_eq!(markers(&state, &txn_session_id, sql).await, vec![false], "expected unproven: {sql}");
+        }
+
+        // A mixed script is classified per statement and paired by position, so
+        // one unproven statement keeps the session dirty.
+        assert_eq!(
+            markers(&state, &txn_session_id, "SELECT COUNT(*) FROM EMP; SELECT * FROM EMP@LINK").await,
+            vec![true, false]
+        );
+
+        // The marker is the frontend contract: present in JSON only when proven.
+        let proven = execute_in_manual_transaction_with_options(
+            &state,
+            &txn_session_id,
+            "SELECT UPPER(name) FROM EMP",
+            "ORCL",
+            None,
+            ManualTransactionExecutionOptions {
+                classification_sql: Some("SELECT UPPER(name) FROM EMP".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("proven statement executes");
+        assert_eq!(
+            serde_json::to_value(&proven[0]).unwrap()["manual_transaction_proven_read_only"],
+            serde_json::json!(true)
+        );
+        let unproven = execute_in_manual_transaction_with_options(
+            &state,
+            &txn_session_id,
+            "SELECT my_udf(id) FROM EMP",
+            "ORCL",
+            None,
+            ManualTransactionExecutionOptions {
+                classification_sql: Some("SELECT my_udf(id) FROM EMP".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("unproven statement executes");
+        assert!(serde_json::to_value(&unproven[0]).unwrap().get("manual_transaction_proven_read_only").is_none());
 
         assert!(rollback_manual_transaction(&state, &txn_session_id).await.is_ok());
         let _ = std::fs::remove_dir_all(dir);
@@ -11091,6 +12776,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11129,6 +12815,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11151,6 +12838,7 @@ for line in sys.stdin:
                 row_index: 0,
                 column_index: 1,
                 original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+                value_ref: None
             }]
         );
     }
@@ -11197,6 +12885,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11216,8 +12905,18 @@ for line in sys.stdin:
         assert_eq!(
             cells,
             vec![
-                db::LargeValueCell { row_index: 0, column_index: 1, original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES },
-                db::LargeValueCell { row_index: 0, column_index: 2, original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES },
+                db::LargeValueCell {
+                    row_index: 0,
+                    column_index: 1,
+                    original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+                    value_ref: None
+                },
+                db::LargeValueCell {
+                    row_index: 0,
+                    column_index: 2,
+                    original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+                    value_ref: None
+                },
             ]
         );
     }
@@ -11233,10 +12932,22 @@ for line in sys.stdin:
             column_sortables: vec![true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
-            rows: vec![vec![serde_json::json!("0x0102030405"), serde_json::json!("B:4:5")]],
+            rows: ["0x", "0X", "\\x"]
+                .into_iter()
+                .flat_map(|prefix| {
+                    [0, 1, 4, 5].into_iter().map(move |bytes| {
+                        vec![
+                            serde_json::json!(format!("{prefix}{}", "ab".repeat(bytes))),
+                            serde_json::json!(format!("B:4:{bytes}")),
+                        ]
+                    })
+                })
+                .chain([vec![serde_json::Value::Null, serde_json::Value::Null]])
+                .collect(),
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11246,8 +12957,129 @@ for line in sys.stdin:
 
         let cells = extract_server_large_value_markers(&mut result);
 
-        assert_eq!(result.rows, vec![vec![serde_json::json!("0x01020304...")]]);
-        assert_eq!(cells, vec![db::LargeValueCell { row_index: 0, column_index: 0, original_bytes: 5 }]);
+        assert_eq!(result.columns, vec!["raw_value"]);
+        assert_eq!(result.column_types, vec!["bytea"]);
+        for (prefix_index, prefix) in ["0x", "0X", "\\x"].into_iter().enumerate() {
+            for (size_index, bytes) in [0, 1, 4, 5].into_iter().enumerate() {
+                let suffix = if bytes > 4 { "..." } else { "" };
+                assert_eq!(
+                    result.rows[prefix_index * 4 + size_index],
+                    vec![serde_json::json!(format!("{prefix}{}{suffix}", "ab".repeat(bytes.min(4))))]
+                );
+            }
+        }
+        assert_eq!(result.rows[12], vec![serde_json::Value::Null]);
+        assert_eq!(
+            cells,
+            [3, 7, 11]
+                .into_iter()
+                .map(|row_index| db::LargeValueCell { row_index, column_index: 0, original_bytes: 5, value_ref: None })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at PostgreSQL (read-only queries)"]
+    async fn live_postgres_bytea_preview_preserves_size_and_full_value() {
+        use crate::sql_dialect::{build_table_data_select_sql, TableDataSelectSqlOptions};
+        use sha2::{Digest, Sha256};
+
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = db::postgres::connect(&url, Duration::from_secs(5)).await.expect("connect PostgreSQL");
+        let preview_size = 3276;
+        let sizes = [None, Some(0), Some(1), Some(3275), Some(3276), Some(3277), Some(9645), Some(261007)];
+        let pattern = db::hex_encode(&(0..=255).collect::<Vec<u8>>());
+        let inputs = sizes
+            .iter()
+            .enumerate()
+            .map(|(id, size)| {
+                format!("({id}, {})", size.map_or_else(|| "NULL::integer".to_string(), |n| n.to_string()))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A CTE supplies repeatable bytea data without creating database objects.
+        let fixture = format!(
+            "WITH payloads AS (SELECT id, substring(decode(repeat('{pattern}', (size + 255) / 256), 'hex') \
+             from 1 for size) AS content FROM (VALUES {inputs}) AS inputs(id, size)), \
+             bytea_preview AS (SELECT id, content, now() AS created_at, octet_length(content) AS bytes, \
+             encode(sha256(content), 'hex') AS checksum FROM payloads) "
+        );
+
+        for text_protocol in [false, true] {
+            let mut columns = vec!["id".to_string(), "content".to_string()];
+            let mut column_types = vec!["int4".to_string(), "bytea".to_string()];
+            if text_protocol {
+                // A temporal column makes the driver choose PostgreSQL's text protocol.
+                columns.push("created_at".to_string());
+                column_types.push("timestamptz".to_string());
+            }
+            let select = build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                table_name: "bytea_preview".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: columns.clone(),
+                column_types: column_types.clone(),
+                large_value_preview_size: Some(preview_size),
+                limit: Some(sizes.len()),
+                order_by: Some("id".to_string()),
+                ..Default::default()
+            });
+            let raw = db::postgres::execute_query(&pool, &format!("{fixture}{select}")).await.unwrap();
+            let result = ExecuteMultiResult::success_with_optional_server_large_values(raw, true);
+            assert_eq!(result.result.columns, columns);
+            assert_eq!(result.result.column_types, column_types);
+            assert_eq!(result.result.rows.len(), sizes.len());
+            let prefix = if text_protocol { "\\x" } else { "0x" };
+
+            for (row_index, size) in sizes.into_iter().enumerate() {
+                let Some(size) = size else {
+                    assert!(result.result.rows[row_index][1].is_null());
+                    continue;
+                };
+                let bytes = (0..size).map(|index| (index % 256) as u8).collect::<Vec<_>>();
+                let suffix = if size > preview_size { "..." } else { "" };
+                assert_eq!(
+                    result.result.rows[row_index][1],
+                    serde_json::json!(format!("{prefix}{}{suffix}", db::hex_encode(&bytes[..size.min(preview_size)])))
+                );
+                if size <= preview_size {
+                    continue;
+                }
+                // The download path fetches by primary key without preview options.
+                let full_select = build_table_data_select_sql(TableDataSelectSqlOptions {
+                    database_type: Some(DatabaseType::Postgres),
+                    table_name: "bytea_preview".to_string(),
+                    primary_keys: vec!["id".to_string()],
+                    columns: ["id", "content", "bytes", "checksum"].map(str::to_string).to_vec(),
+                    where_input: Some(format!("id = {row_index}")),
+                    limit: Some(1),
+                    ..Default::default()
+                });
+                let full = db::postgres::execute_query(&pool, &format!("{fixture}{full_select}")).await.unwrap();
+                assert_eq!(full.rows.len(), 1);
+                // The table-data builder can select *, so map columns by name like
+                // the grid does. A returned timestamp also makes this fetch use text.
+                let column = |name: &str| &full.rows[0][full.columns.iter().position(|c| c == name).unwrap()];
+                let value = column("content").as_str().unwrap();
+                let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("\\x")).unwrap();
+                assert_eq!(hex.len(), size * 2);
+                assert!(hex == db::hex_encode(&bytes), "full bytea differs for row {row_index}");
+                let actual_size =
+                    column("bytes").as_u64().or_else(|| column("bytes").as_str().and_then(|value| value.parse().ok()));
+                assert_eq!(actual_size, Some(size as u64));
+                assert_eq!(column("checksum"), &serde_json::json!(db::hex_encode(&Sha256::digest(&bytes))));
+            }
+            assert_eq!(
+                result.large_value_cells,
+                sizes
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(row_index, size)| size.filter(|size| *size > preview_size).map(|original_bytes| {
+                        db::LargeValueCell { row_index, column_index: 1, original_bytes, value_ref: None }
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -11269,6 +13101,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11288,6 +13121,7 @@ for line in sys.stdin:
                 row_index: 0,
                 column_index: 1,
                 original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+                value_ref: None
             }]
         );
     }
@@ -11308,6 +13142,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11341,6 +13176,7 @@ for line in sys.stdin:
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -11373,7 +13209,7 @@ for line in sys.stdin:
 
     #[test]
     fn single_statement_preview_preserves_absent_statement_index() {
-        let result = single_statement_multi_result(Ok(empty_query_result(1)), true).unwrap();
+        let result = single_statement_multi_result(Ok(empty_query_result(1)), true, None).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].statement_index, None);
@@ -11395,6 +13231,132 @@ for line in sys.stdin:
     fn query_execution_options_use_transaction_some_false_is_preserved() {
         let opts = QueryExecutionOptions { use_transaction: Some(false), ..Default::default() };
         assert_eq!(opts.use_transaction, Some(false));
+    }
+
+    fn mysql_status(in_transaction: bool, autocommit: bool) -> db::mysql::MySqlSessionStatus {
+        db::mysql::MySqlSessionStatus { in_transaction, autocommit }
+    }
+
+    #[test]
+    fn mysql_auto_commit_default_rolls_back_an_explicitly_opened_transaction() {
+        // The historical behavior for the default setting: a `BEGIN` a user
+        // left open is rolled back, but the cleanup is now reported so the tab
+        // can tell the user instead of discarding the transaction silently.
+        let decision = decide_mysql_auto_commit_transaction(false, false, true, Some(mysql_status(true, true)));
+        assert!(!decision.preserve);
+        assert_eq!(decision.rollback, MysqlAutoCommitRollback::Explicit);
+    }
+
+    #[test]
+    fn mysql_auto_commit_opt_in_keeps_an_explicitly_opened_transaction() {
+        // The opt-in decision is made from the *submitted* statement list, not
+        // from how much of the batch actually ran. A batch that opens a
+        // transaction and is then cancelled (or aborted by an error) has only
+        // executed a prefix of its statements, yet the opener is still part of
+        // the batch, so the connection keeps whatever the prefix did and stays
+        // in the transaction. Preserving is what makes the abandoned work
+        // visible — the tab shows the open-transaction badge and the manual
+        // rollback action — instead of silently rolling back a transaction the
+        // user asked for. `decide(true, false, true, ..)` below is exactly that
+        // cancelled-batch case: the caller still passes the opener it was
+        // about to run, so the decision must be preserve, not roll back.
+        let decision = decide_mysql_auto_commit_transaction(true, false, true, Some(mysql_status(true, true)));
+        assert!(decision.preserve);
+        assert_eq!(decision.rollback, MysqlAutoCommitRollback::None);
+    }
+
+    #[test]
+    fn mysql_auto_commit_opt_in_keeps_the_transaction_of_a_later_execution() {
+        // `START TRANSACTION` ran first, this execution only ran an UPDATE, so
+        // the batch itself carries no opener: the kept state is the only signal.
+        let decision = decide_mysql_auto_commit_transaction(true, true, false, Some(mysql_status(true, true)));
+        assert!(decision.preserve);
+        assert_eq!(decision.rollback, MysqlAutoCommitRollback::None);
+
+        // The kept state survives even when the caller does not pass the option
+        // (auxiliary queries, result paging): an open user transaction is never
+        // destroyed from another code path.
+        let no_option = decide_mysql_auto_commit_transaction(false, true, false, Some(mysql_status(true, true)));
+        assert!(no_option.preserve);
+        assert_eq!(no_option.rollback, MysqlAutoCommitRollback::None);
+    }
+
+    #[test]
+    fn mysql_auto_commit_opt_in_keeps_a_transaction_opened_by_auto_commit_off() {
+        let decision = decide_mysql_auto_commit_transaction(true, false, false, Some(mysql_status(true, false)));
+        assert!(decision.preserve);
+
+        // Without the opt-in the same connection is cleaned up as before, but
+        // reported as a session-level implicit transaction: nobody typed
+        // `BEGIN`, the connection simply runs with auto-commit off.
+        let default = decide_mysql_auto_commit_transaction(false, false, false, Some(mysql_status(true, false)));
+        assert!(!default.preserve);
+        assert_eq!(default.rollback, MysqlAutoCommitRollback::SessionAutocommit);
+    }
+
+    #[test]
+    fn mysql_auto_commit_reports_a_batch_opener_ahead_of_autocommit_off() {
+        // Both signals at once: a `BEGIN` in the batch wins, so the notice is
+        // the explicit-transaction one.
+        let decision = decide_mysql_auto_commit_transaction(false, false, true, Some(mysql_status(true, false)));
+        assert!(!decision.preserve);
+        assert_eq!(decision.rollback, MysqlAutoCommitRollback::Explicit);
+    }
+
+    #[test]
+    fn mysql_auto_commit_rolls_back_a_leftover_transaction_without_reporting_it() {
+        // No opener in the batch and auto-commit still on: this is a leftover
+        // transaction (cancelled or aborted batch), not a user transaction.
+        let decision = decide_mysql_auto_commit_transaction(true, false, false, Some(mysql_status(true, true)));
+        assert!(!decision.preserve);
+        assert_eq!(decision.rollback, MysqlAutoCommitRollback::None);
+    }
+
+    #[test]
+    fn mysql_auto_commit_leaves_a_clean_connection_alone() {
+        // `BEGIN; ...; COMMIT;` in one batch ends with nothing open.
+        let decision = decide_mysql_auto_commit_transaction(true, false, true, Some(mysql_status(false, true)));
+        assert!(!decision.preserve);
+        assert_eq!(decision.rollback, MysqlAutoCommitRollback::None);
+
+        // A kept transaction that the user committed in this batch must be
+        // forgotten, so later executions are auto-commit again.
+        let after_commit = decide_mysql_auto_commit_transaction(true, true, false, Some(mysql_status(false, true)));
+        assert!(!after_commit.preserve);
+        assert_eq!(after_commit.rollback, MysqlAutoCommitRollback::None);
+    }
+
+    #[test]
+    fn mysql_auto_commit_uses_the_batch_opener_when_the_status_packet_is_missing() {
+        // The last statement ended with an ERR packet, so no status is cached
+        // and the COM_PING refresh failed.
+        let kept = decide_mysql_auto_commit_transaction(true, false, true, None);
+        assert!(kept.preserve);
+        assert_eq!(kept.rollback, MysqlAutoCommitRollback::None);
+
+        let cleaned = decide_mysql_auto_commit_transaction(false, false, true, None);
+        assert!(!cleaned.preserve);
+        assert_eq!(cleaned.rollback, MysqlAutoCommitRollback::Explicit);
+
+        let unknown_without_opener = decide_mysql_auto_commit_transaction(true, false, false, None);
+        assert!(!unknown_without_opener.preserve);
+        assert_eq!(unknown_without_opener.rollback, MysqlAutoCommitRollback::None);
+    }
+
+    #[test]
+    fn mysql_cleanup_rollback_is_skipped_only_when_the_final_status_proves_nothing_is_open() {
+        assert!(mysql_cleanup_rollback_is_noop(true, false, Some(mysql_status(false, true))));
+
+        // A transaction is open, or auto-commit is off: the cleanup must run.
+        assert!(!mysql_cleanup_rollback_is_noop(true, false, Some(mysql_status(true, true))));
+        assert!(!mysql_cleanup_rollback_is_noop(true, false, Some(mysql_status(false, false))));
+        // The last statement failed, so no status packet is cached.
+        assert!(!mysql_cleanup_rollback_is_noop(true, false, None));
+        // A truncated or failed result may leave an earlier command's packet.
+        assert!(!mysql_cleanup_rollback_is_noop(false, false, Some(mysql_status(false, true))));
+        // A batch that opened a transaction keeps the cleanup even when the
+        // server reports nothing open, in case it never sets the flag.
+        assert!(!mysql_cleanup_rollback_is_noop(true, true, Some(mysql_status(false, true))));
     }
 
     #[test]
@@ -11445,5 +13407,27 @@ for line in sys.stdin:
 
         assert!(mysql_error_is_syntax_error(&doris_syntax_error));
         assert!(!mysql_error_is_syntax_error(&generic_unknown_error));
+    }
+
+    #[test]
+    fn mysql_backup_transaction_falls_back_for_polardbx_parser_errors() {
+        for message in [
+            "[PXC-4500][ERR_PARSER] syntax error, expect EOF, actual COMMA after WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY 语法错误",
+        ] {
+            let polardbx_parser_error = mysql_async::Error::Server(mysql_async::ServerError {
+                code: 3009,
+                message: message.to_string(),
+                state: "HY000".to_string(),
+            });
+            assert!(mysql_error_is_syntax_error(&polardbx_parser_error));
+        }
+        let polardbx_non_parser_error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 3009,
+            message: "Failed to handle data".to_string(),
+            state: "HY000".to_string(),
+        });
+
+        assert!(!mysql_error_is_syntax_error(&polardbx_non_parser_error));
     }
 }

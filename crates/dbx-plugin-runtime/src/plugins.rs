@@ -10,7 +10,10 @@ mod assets;
 mod filesystem;
 mod host;
 mod installer;
+mod jdbc_sessions;
 mod lifecycle;
+#[cfg(all(test, any(windows, unix)))]
+mod lifecycle_tests;
 mod manifest;
 mod marketplace;
 mod runtime;
@@ -27,9 +30,9 @@ pub use host::{
     ActivePluginSession, PluginConnectionActionResult, PluginConnectionHandle, PluginHost, PluginRuntimeProxy,
 };
 pub use installer::{
-    PluginInstallPolicy, PluginInstallResponse, PluginInstallResult, PluginPackageInstaller, PluginRollbackResponse,
-    PluginRollbackResult, PluginSignatureStatus, PluginTrustStore, PluginTrustedKey, DBXP_EXTENSION,
-    MAX_PLUGIN_PACKAGE_BYTES, PLUGIN_CHECKSUMS_FILE, PLUGIN_SIGNATURE_FILE,
+    PluginInstallPolicy, PluginInstallProvenance, PluginInstallResponse, PluginInstallResult, PluginInstallSource,
+    PluginPackageInstaller, PluginRollbackResponse, PluginRollbackResult, PluginSignatureStatus, PluginTrustStore,
+    PluginTrustedKey, DBXP_EXTENSION, MAX_PLUGIN_PACKAGE_BYTES, PLUGIN_CHECKSUMS_FILE, PLUGIN_SIGNATURE_FILE,
 };
 pub use lifecycle::PluginLifecycle;
 pub use marketplace::{
@@ -42,12 +45,12 @@ pub use marketplace::{
 
 pub use manifest::{
     current_plugin_target, resolve_safe_plugin_path, PluginBackendEntrypoint, PluginBackendTransport,
-    PluginCompatibility, PluginConnectionActionContribution, PluginConnectionActionVariant, PluginConnectionActionWhen,
-    PluginConnectionCapability, PluginConnectionProviderContribution, PluginContribution, PluginDriverManifest,
-    PluginEngines, PluginEntrypoints, PluginFieldCondition, PluginFieldConditionClause, PluginFieldConditionLiteral,
-    PluginFilesystemCapability, PluginFilesystemProviderContribution, PluginFormFieldBinding,
-    PluginFormFieldDefinition, PluginFormFieldOption, PluginFormFieldPicker, PluginFormFieldPickerKind,
-    PluginFormFieldType, PluginManifest, PluginUiEntrypoint, PluginWorkbenchContribution,
+    PluginCapabilityManifest, PluginCompatibility, PluginConnectionActionContribution, PluginConnectionActionVariant,
+    PluginConnectionActionWhen, PluginConnectionCapability, PluginConnectionProviderContribution, PluginContribution,
+    PluginDriverManifest, PluginEngines, PluginEntrypoints, PluginFieldCondition, PluginFieldConditionClause,
+    PluginFieldConditionLiteral, PluginFilesystemCapability, PluginFilesystemProviderContribution,
+    PluginFormFieldBinding, PluginFormFieldDefinition, PluginFormFieldOption, PluginFormFieldPicker,
+    PluginFormFieldPickerKind, PluginFormFieldType, PluginManifest, PluginUiEntrypoint, PluginWorkbenchContribution,
     PLUGIN_CONNECTION_ACTION_METHOD, PLUGIN_CONNECTION_CONNECT_METHOD, PLUGIN_CONNECTION_DISCONNECT_METHOD,
     PLUGIN_CONNECTION_TEST_METHOD, SUPPORTED_PLUGIN_HOST_API_VERSION, SUPPORTED_PLUGIN_HOST_FEATURES,
     SUPPORTED_PLUGIN_MANIFEST_VERSION, SUPPORTED_PLUGIN_PERMISSIONS, SUPPORTED_PLUGIN_PROTOCOL_VERSION,
@@ -62,6 +65,10 @@ pub struct InstalledPlugin {
     pub manifest: PluginManifest,
     pub path: PathBuf,
     pub compatibility: PluginCompatibility,
+    /// Where the active installation came from (repository / publisher / signing key / source).
+    /// `None` for installs recorded before provenance existed; those stay unconstrained until the
+    /// next install records fresh provenance.
+    pub provenance: Option<PluginInstallProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +76,8 @@ pub struct InstalledPlugin {
 pub struct InstalledPluginInfo {
     pub manifest: PluginManifest,
     pub compatibility: PluginCompatibilityInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PluginInstallProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,7 +95,13 @@ pub struct PluginCompatibilityInfo {
 impl InstalledPlugin {
     pub fn new(manifest: PluginManifest, path: PathBuf, app_version: &str) -> Self {
         let compatibility = manifest.compatibility(&path, app_version);
-        Self { manifest, path, compatibility }
+        Self { manifest, path, compatibility, provenance: None }
+    }
+
+    /// Attaches the recorded install provenance (see `installer::read_container_provenance`).
+    pub fn with_provenance(mut self, provenance: Option<PluginInstallProvenance>) -> Self {
+        self.provenance = provenance;
+        self
     }
 
     pub fn info(&self) -> InstalledPluginInfo {
@@ -98,6 +113,7 @@ impl InstalledPlugin {
                 warnings: self.compatibility.warnings.clone(),
                 target: self.compatibility.target.clone(),
             },
+            provenance: self.provenance.clone(),
         }
     }
 }
@@ -144,6 +160,7 @@ pub struct PluginRegistry {
     root_dir: PathBuf,
     app_version: String,
     lifecycle: PluginLifecycle,
+    jdbc_runtimes: jdbc_sessions::JdbcRuntimeCache,
 }
 
 impl PluginRegistry {
@@ -152,7 +169,8 @@ impl PluginRegistry {
     }
 
     pub fn new_with_app_version(root_dir: PathBuf, app_version: impl Into<String>) -> Self {
-        Self { root_dir, app_version: app_version.into(), lifecycle: PluginLifecycle::default() }
+        let lifecycle = PluginLifecycle::for_store(&root_dir);
+        Self { root_dir, app_version: app_version.into(), lifecycle, jdbc_runtimes: Default::default() }
     }
 
     pub fn lifecycle(&self) -> PluginLifecycle {
@@ -185,6 +203,11 @@ impl PluginRegistry {
         let mut plugins = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|err| err.to_string())?;
+            if entry.file_name() == std::ffi::OsStr::new(installer::PLUGIN_TRASH_DIR) {
+                // Logical uninstall tombstones are not plugin containers: never discover one, not
+                // even while its physical delete is still pending.
+                continue;
+            }
             let container_path = entry.path();
             if !container_path.is_dir() {
                 continue;
@@ -221,7 +244,10 @@ impl PluginRegistry {
                     continue;
                 }
             };
-            plugins.push(InstalledPlugin::new(manifest, path, &self.app_version));
+            plugins.push(
+                InstalledPlugin::new(manifest, path, &self.app_version)
+                    .with_provenance(PluginPackageInstaller::read_container_provenance(&container_path)?),
+            );
         }
         plugins.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
         Ok(plugins)
@@ -240,6 +266,89 @@ impl PluginRegistry {
 
     pub fn find_plugin(&self, plugin_id: &str) -> Result<Option<InstalledPlugin>, String> {
         Ok(self.list_installed()?.into_iter().find(|plugin| plugin.manifest.id == plugin_id))
+    }
+
+    pub fn find_capability(&self, capability_id: &str) -> Result<Option<InstalledPlugin>, String> {
+        Ok(self.list_installed()?.into_iter().find(|plugin| {
+            plugin.compatibility.compatible
+                && plugin.manifest.capabilities.iter().any(|capability| capability.id == capability_id)
+        }))
+    }
+
+    pub fn find_capability_for_plugin(
+        &self,
+        plugin_id: &str,
+        capability_id: &str,
+    ) -> Result<Option<InstalledPlugin>, String> {
+        Ok(self.find_plugin(plugin_id)?.filter(|plugin| {
+            plugin.compatibility.compatible
+                && plugin.manifest.capabilities.iter().any(|capability| capability.id == capability_id)
+        }))
+    }
+
+    pub async fn invoke_capability<T>(
+        &self,
+        capability_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, String>
+    where
+        T: DeserializeOwned,
+    {
+        let plugin = self
+            .find_capability(capability_id)?
+            .ok_or_else(|| format!("Plugin capability '{capability_id}' is not installed"))?;
+        self.invoke_capability_on_plugin(plugin, capability_id, method, params).await
+    }
+
+    pub async fn invoke_capability_for_plugin<T>(
+        &self,
+        plugin_id: &str,
+        capability_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, String>
+    where
+        T: DeserializeOwned,
+    {
+        let plugin = self
+            .find_capability_for_plugin(plugin_id, capability_id)?
+            .ok_or_else(|| format!("Plugin '{plugin_id}' capability '{capability_id}' is not installed"))?;
+        self.invoke_capability_on_plugin(plugin, capability_id, method, params).await
+    }
+
+    async fn invoke_capability_on_plugin<T>(
+        &self,
+        plugin: InstalledPlugin,
+        capability_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, String>
+    where
+        T: DeserializeOwned,
+    {
+        let _operation = self.lifecycle.begin_operation(&plugin.manifest.id)?;
+        // A rollback in another host may have completed between discovery and admission.
+        let plugin = self.find_plugin(&plugin.manifest.id)?.ok_or("Plugin is no longer installed")?;
+        ensure_plugin_compatible(&plugin)?;
+        let env = PluginRuntimeEnv::default().with_plugin_data_dir(&self.plugin_data_dir(&plugin.manifest.id));
+        let runtime_lease = self.lifecycle.runtime_lease(&plugin.manifest.id)?;
+        let session =
+            PluginSidecarSession::start_with_runtime_lease(plugin, self.app_version.clone(), env, runtime_lease)
+                .await?;
+        let _cleanup = runtime::ShutdownOnDrop::new(session.clone());
+        let result =
+            session.invoke_with_timeout(method, params, Some(capability_id), Some(PLUGIN_REQUEST_TIMEOUT)).await;
+        match (result, session.shutdown().await) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(invoke_error), Ok(())) => Err(invoke_error),
+            (Ok(_), Err(shutdown_error)) => {
+                Err(format!("Plugin capability invocation completed but shutdown failed: {shutdown_error}"))
+            }
+            (Err(invoke_error), Err(shutdown_error)) => {
+                Err(format!("{invoke_error}; additionally failed to stop plugin: {shutdown_error}"))
+            }
+        }
     }
 
     pub async fn invoke_driver<T>(&self, driver_id: &str, method: &str, params: serde_json::Value) -> Result<T, String>
@@ -276,11 +385,35 @@ impl PluginRegistry {
         let plugin =
             self.find_driver(driver_id)?.ok_or_else(|| format!("Plugin driver '{driver_id}' is not installed"))?;
         ensure_plugin_compatible(&plugin)?;
+        // This is a short-lived, one-shot driver invocation: it starts its own sidecar instead of
+        // going through `PluginHost`, so it is not in `PluginHost::sessions` and needs its own
+        // lease. `begin_operation` matches those semantics (not a connection the user keeps open)
+        // and makes the whole start -> invoke -> shutdown sequence mutually exclusive with an
+        // install, rollback, or uninstall of the same plugin.
+        let _operation = self.lifecycle.begin_operation(&plugin.manifest.id)?;
+        let current = self.find_driver(driver_id)?.ok_or("Plugin driver is no longer installed")?;
+        if current.manifest.id != plugin.manifest.id {
+            return Err(format!("Plugin driver '{driver_id}' changed. Please reconnect."));
+        }
+        let plugin = current;
+        ensure_plugin_compatible(&plugin)?;
         let env = env.with_plugin_data_dir(&self.plugin_data_dir(&plugin.manifest.id));
-        let session = PluginSidecarSession::start(plugin, self.app_version.clone(), env).await?;
+        let runtime_lease = self.lifecycle.runtime_lease(&plugin.manifest.id)?;
+        let session =
+            PluginSidecarSession::start_with_runtime_lease(plugin, self.app_version.clone(), env, runtime_lease)
+                .await?;
+        let _cleanup = runtime::ShutdownOnDrop::new(session.clone());
         let result = session.invoke_with_timeout(method, params, Some(driver_id), timeout_duration).await;
-        session.shutdown().await;
-        result
+        match (result, session.shutdown().await) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(invoke_error), Ok(())) => Err(invoke_error),
+            (Ok(_), Err(shutdown_error)) => {
+                Err(format!("Plugin invocation completed but shutdown failed: {shutdown_error}"))
+            }
+            (Err(invoke_error), Err(shutdown_error)) => {
+                Err(format!("{invoke_error}; additionally failed to stop plugin: {shutdown_error}"))
+            }
+        }
     }
 
     pub async fn start_driver_session(&self, driver_id: &str) -> Result<Arc<PluginDriverSession>, String> {
@@ -340,6 +473,7 @@ fn unavailable_plugin(path: PathBuf, error: String) -> InstalledPlugin {
             target: Some(current_plugin_target()),
             ..PluginCompatibility::default()
         },
+        provenance: None,
     }
 }
 
@@ -353,7 +487,8 @@ fn ensure_plugin_compatible(plugin: &InstalledPlugin) -> Result<(), String> {
 pub struct PluginDriverSession {
     sidecar: Arc<PluginSidecarSession>,
     driver_id: String,
-    _activity: lifecycle::PluginUsageGuard,
+    _activity: Option<lifecycle::PluginUsageGuard>,
+    logical: Option<Arc<jdbc_sessions::JdbcLogicalSession>>,
 }
 
 impl PluginDriverSession {
@@ -364,8 +499,9 @@ impl PluginDriverSession {
         env: PluginRuntimeEnv,
         activity: lifecycle::PluginUsageGuard,
     ) -> Result<Self, String> {
-        let sidecar = PluginSidecarSession::start(plugin, app_version, env).await?;
-        Ok(Self { sidecar, driver_id, _activity: activity })
+        let runtime_lease = activity.runtime_lease()?;
+        let sidecar = PluginSidecarSession::start_with_runtime_lease(plugin, app_version, env, runtime_lease).await?;
+        Ok(Self { sidecar, driver_id, _activity: Some(activity), logical: None })
     }
 
     pub async fn invoke<T>(&self, method: &str, params: serde_json::Value) -> Result<T, String>
@@ -384,11 +520,44 @@ impl PluginDriverSession {
     where
         T: DeserializeOwned,
     {
-        self.sidecar.invoke_with_timeout(method, params, Some(&self.driver_id), timeout_duration).await
+        if let Some(logical) = &self.logical {
+            return logical.invoke(method, params, timeout_duration).await;
+        }
+        let mut params = params;
+        let mut cancel = self.cancel_statement_on_drop(&mut params);
+        let result = self.sidecar.invoke_with_timeout(method, params, Some(&self.driver_id), timeout_duration).await;
+        if let Some(cancel) = cancel.as_mut() {
+            cancel.token = None;
+        }
+        result
     }
 
-    pub async fn shutdown(&self) {
-        self.sidecar.shutdown().await;
+    /// The JDBC plugin runs one statement at a time on its shared connection, so a request the host
+    /// abandons (the user pressed stop) would otherwise keep the next request waiting until the
+    /// database finishes it. Tagging the request lets the plugin cancel exactly that statement.
+    fn cancel_statement_on_drop(&self, params: &mut serde_json::Value) -> Option<CancelStatementOnDrop> {
+        if self.driver_id != "jdbc" {
+            return None;
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        params.as_object_mut()?.insert(JDBC_CANCEL_TOKEN_PARAM.into(), token.clone().into());
+        Some(CancelStatementOnDrop {
+            sidecar: self.sidecar.clone(),
+            driver_id: self.driver_id.clone(),
+            token: Some(token),
+        })
+    }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        if let Some(logical) = &self.logical {
+            logical.close().await;
+            return Ok(());
+        }
+        self.sidecar.shutdown().await
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.logical.as_ref().is_none_or(|logical| logical.is_available())
     }
 
     pub async fn pid(&self) -> Option<u32> {
@@ -415,6 +584,50 @@ impl PluginDriverSession {
     ) -> Result<Self, String> {
         let activity = PluginLifecycle::default().begin_connection(&plugin.manifest.id, &driver_id)?;
         Self::start(plugin, driver_id, env!("CARGO_PKG_VERSION").to_string(), env, activity).await
+    }
+}
+
+const JDBC_CANCEL_STATEMENT_METHOD: &str = "cancelStatement";
+const JDBC_CANCEL_TOKEN_PARAM: &str = "cancelToken";
+const JDBC_CANCEL_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct CancelStatementOnDrop {
+    sidecar: Arc<PluginSidecarSession>,
+    driver_id: String,
+    token: Option<String>,
+}
+
+impl Drop for CancelStatementOnDrop {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let sidecar = self.sidecar.clone();
+        let driver_id = std::mem::take(&mut self.driver_id);
+        handle.spawn(async move {
+            // Plugins without `cancelStatement` reply with an error once the abandoned statement ends.
+            let _: Result<serde_json::Value, _> = sidecar
+                .invoke_with_timeout(
+                    JDBC_CANCEL_STATEMENT_METHOD,
+                    serde_json::json!({ JDBC_CANCEL_TOKEN_PARAM: token }),
+                    Some(&driver_id),
+                    Some(JDBC_CANCEL_STATEMENT_TIMEOUT),
+                )
+                .await;
+        });
+    }
+}
+
+impl Drop for PluginDriverSession {
+    fn drop(&mut self) {
+        if let Some(logical) = &self.logical {
+            logical.close_in_background();
+        } else {
+            drop(runtime::ShutdownOnDrop::new(self.sidecar.clone()));
+        }
     }
 }
 
@@ -529,7 +742,7 @@ sleep 30
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
         assert!(lifecycle.begin_update("sample.sidecar").is_ok());
-        host.stop_all().await;
+        host.stop_all().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -572,11 +785,96 @@ sleep 30
             .expect("session should start");
         let pid = session.pid().await.expect("child should have a pid");
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(!process_exists(pid));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_jdbc_request_cancels_its_statement_by_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("plugin.py");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import json, os, sys
+root = os.path.dirname(__file__)
+for line in sys.stdin:
+    request = json.loads(line)
+    params = request.get('params', {})
+    if request['method'] == 'cancelStatement':
+        with open(os.path.join(root, 'cancelled.tmp'), 'w') as out:
+            out.write(params.get('cancelToken', ''))
+        os.replace(os.path.join(root, 'cancelled.tmp'), os.path.join(root, 'cancelled'))
+        print(json.dumps({'id': request['id'], 'result': {'cancelled': True}}), flush=True)
+    elif request['method'] == 'executeQuery' and params.get('sql') == 'slow':
+        with open(os.path.join(root, 'running.tmp'), 'w') as out:
+            out.write(params.get('cancelToken', ''))
+        os.replace(os.path.join(root, 'running.tmp'), os.path.join(root, 'running'))
+    else:
+        print(json.dumps({'id': request['id'], 'result': {'token': params.get('cancelToken')}}), flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plugin = InstalledPlugin::new(
+            PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "test".to_string(),
+                protocol_version: 1,
+                executable: Some("plugin.py".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+                ..PluginManifest::default()
+            },
+            dir.path().to_path_buf(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let session = std::sync::Arc::new(
+            PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default()).await.unwrap(),
+        );
+
+        let completed: serde_json::Value = session.invoke("listTables", serde_json::json!({})).await.unwrap();
+        assert!(completed["token"].is_string(), "every JDBC request carries a cancel token");
+
+        let running = dir.path().join("running");
+        let slow_session = session.clone();
+        let slow = tokio::spawn(async move {
+            slow_session.invoke::<serde_json::Value>("executeQuery", serde_json::json!({ "sql": "slow" })).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !running.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+
+        let cancelled = dir.path().join("cancelled");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cancelled.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping the request must send cancelStatement");
+        let slow_token = std::fs::read_to_string(&running).unwrap();
+        assert!(!slow_token.is_empty());
+        assert_eq!(std::fs::read_to_string(&cancelled).unwrap(), slow_token);
+        assert_ne!(completed["token"], slow_token.as_str(), "completed requests are never cancelled");
+        session.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -674,6 +972,65 @@ sleep 30
                 && !plugin.compatibility.compatible
                 && plugin.compatibility.errors.iter().any(|error| error.contains("Failed to parse"))
         }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn driver_invocations_are_gated_by_the_update_lease_for_their_whole_session() {
+        let root = std::env::temp_dir().join(format!("dbx-plugin-driver-lease-test-{}", uuid::Uuid::new_v4()));
+        let plugin_dir = root.join("sample");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            // External drivers only exist on the legacy manifest shape, which is what
+            // `PluginRegistry::find_driver` resolves.
+            serde_json::json!({
+                "id": "sample",
+                "name": "Sample",
+                "version": "1.0.0",
+                "publisher": "example",
+                "protocol_version": 1,
+                "executable": "plugin.sh",
+                "drivers": [{ "id": "sample-driver", "label": "Sample", "kind": "external", "database_type": "sample" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Present but never executable: the manifest stays compatible so the invocation gets past
+        // the lease, while starting the sidecar fails immediately and deterministically on every
+        // platform (no exec bit on unix, not a valid image on Windows).
+        std::fs::write(plugin_dir.join("plugin.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        let registry = PluginRegistry::new_with_app_version(root.clone(), "0.5.67");
+
+        let update = registry.lifecycle().begin_update("sample").unwrap();
+        let refused = registry
+            .invoke_driver_with_env_and_timeout::<serde_json::Value>(
+                "sample-driver",
+                "testConnection",
+                serde_json::json!({}),
+                PluginRuntimeEnv::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("Plugin update is in progress"), "{refused}");
+        drop(update);
+
+        // Once the update released the lease the invocation runs, and because the sidecar cannot
+        // start it must report that instead of the update error: the guard covered the start
+        // attempt and was released on the way out.
+        let failed_start = registry
+            .invoke_driver_with_env_and_timeout::<serde_json::Value>(
+                "sample-driver",
+                "testConnection",
+                serde_json::json!({}),
+                PluginRuntimeEnv::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(!failed_start.contains("Plugin update is in progress"), "{failed_start}");
+        assert!(registry.lifecycle().begin_update("sample").is_ok(), "a failed invocation must not leak its lease");
         let _ = std::fs::remove_dir_all(root);
     }
 

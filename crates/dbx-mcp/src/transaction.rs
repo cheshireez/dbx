@@ -188,10 +188,16 @@ pub struct TransactionOwnerConfig {
 impl Default for TransactionOwnerConfig {
     fn default() -> Self {
         Self {
-            idle_ttl: Duration::from_secs(30 * 60),
+            idle_ttl: crate::session::SESSION_IDLE_TTL,
             operation_timeout: Duration::from_secs(300),
             cleanup_timeout: Duration::from_secs(5),
         }
+    }
+}
+
+impl TransactionOwnerConfig {
+    pub(crate) fn from_env() -> Self {
+        Self { idle_ttl: crate::session::session_idle_ttl_from_env(), ..Self::default() }
     }
 }
 
@@ -800,6 +806,7 @@ mod tests {
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,

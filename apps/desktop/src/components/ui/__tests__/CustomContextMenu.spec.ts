@@ -20,6 +20,91 @@ afterEach(() => {
 });
 
 describe("CustomContextMenu lifecycle", () => {
+  it("ignores a pending refresh after the menu has been closed", async () => {
+    let complete!: () => void;
+    const refresh = vi.fn(() => [{ label: "Updated" }]);
+    const close = vi.fn();
+    const root = defineComponent({
+      setup: () => () =>
+        h(
+          CustomContextMenu,
+          {
+            onClose: close,
+            items: [
+              {
+                label: "Switch",
+                sidebarActionId: "menu.layout",
+                closeOnSelect: false,
+                refreshItems: refresh,
+                action: () =>
+                  new Promise<void>((resolve) => {
+                    complete = resolve;
+                  }),
+              },
+            ],
+          },
+          { default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "pending-refresh", onContextmenu: onContextMenu }) },
+        ),
+    });
+    const host = document.createElement("div");
+    document.body.append(host);
+    mountedContainers.push(host);
+    const app = createApp(root);
+    app.mount(host);
+    host.querySelector("#pending-refresh")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    document.querySelector<HTMLButtonElement>('[data-menu-action="menu.layout"]')?.click();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await nextTick();
+    complete();
+    await Promise.resolve();
+    await nextTick();
+    expect(close).toHaveBeenCalledOnce();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(document.querySelector("[data-dbx-context-menu]")).toBeNull();
+    app.unmount();
+  });
+
+  it("keeps a height-constrained main menu open on its own scroll events", async () => {
+    const close = vi.fn();
+    const items = Array.from({ length: 50 }, (_, i) => ({ label: `Action ${i}` }));
+    const root = defineComponent({ setup: () => () => h(CustomContextMenu, { items, onClose: close }, { default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "tall-menu", onContextmenu: onContextMenu }) }) });
+    const host = document.createElement("div");
+    document.body.append(host);
+    mountedContainers.push(host);
+    const app = createApp(root);
+    app.mount(host);
+    host.querySelector("#tall-menu")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    const menu = document.querySelector<HTMLElement>("[data-dbx-context-menu]")!;
+    expect(menu.style.maxHeight).toBe("calc(100vh - 16px)");
+    menu.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await nextTick();
+    expect(close).not.toHaveBeenCalled();
+    expect(menu.querySelectorAll("button")).toHaveLength(50);
+    app.unmount();
+  });
+  it("opens submenus on click without requiring a hover", async () => {
+    const action = vi.fn();
+    const root = defineComponent({
+      setup: () => () => h(CustomContextMenu, { items: [{ label: "Data tools", children: [{ label: "Export", action }] }] }, { default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "click-submenu", onContextmenu: onContextMenu }) }),
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+    container.querySelector("#click-submenu")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    const trigger = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent === "Data tools");
+    trigger?.click();
+    await nextTick();
+    const child = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent === "Export");
+    expect(child).toBeTruthy();
+    child?.click();
+    expect(action).toHaveBeenCalledOnce();
+    app.unmount();
+  });
   it("exposes the open state and closes only the active target", async () => {
     const firstOpen = vi.fn();
     const firstClose = vi.fn();
@@ -403,5 +488,101 @@ describe("CustomContextMenu lifecycle", () => {
     expect(document.body.textContent).not.toContain("Copy option 0");
 
     app.unmount();
+  });
+});
+
+describe("submenu pointer grace area", () => {
+  // The panel sits to the right of the trigger row between these bounds.
+  // happy-dom performs no layout, so the rectangles the component measures are
+  // stubbed on the submenu element directly.
+  const SUBMENU_RECT = { left: 200, right: 300, top: 100, bottom: 200, width: 100, height: 100 } as DOMRect;
+
+  async function mountSubmenuMenu() {
+    const root = defineComponent({
+      setup: () => () => h(CustomContextMenu, { items: [{ label: "Data tools", children: [{ label: "Export" }] }] }, { default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "grace-target", onContextmenu: onContextMenu }) }),
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+    container.querySelector("#grace-target")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    const trigger = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent === "Data tools")!;
+    trigger.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, clientX: 150, clientY: 150 }));
+    await nextTick();
+    const submenu = Array.from(document.body.querySelectorAll("[data-dbx-context-menu]")).at(-1) as HTMLElement;
+    submenu.getBoundingClientRect = () => SUBMENU_RECT;
+    return { app, trigger };
+  }
+
+  function submenuIsOpen(): boolean {
+    return document.body.textContent?.includes("Export") ?? false;
+  }
+
+  function movePointerTo(x: number, y: number) {
+    document.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: x, clientY: y }));
+  }
+
+  it("keeps the submenu open while the pointer travels diagonally towards it", async () => {
+    vi.useFakeTimers();
+    try {
+      const { app, trigger } = await mountSubmenuMenu();
+      expect(submenuIsOpen()).toBe(true);
+
+      // Leaving the trigger row and crossing the gap between the two panels puts
+      // the pointer inside neither rectangle, which is the movement that used to
+      // close the submenu before it could be reached.
+      trigger.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true, clientX: 150, clientY: 150 }));
+      movePointerTo(190, 150);
+      await nextTick();
+      vi.advanceTimersByTime(400);
+      await nextTick();
+
+      expect(submenuIsOpen()).toBe(true);
+      app.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the submenu open when the pointer wobbles mid-travel", async () => {
+    vi.useFakeTimers();
+    try {
+      const { app, trigger } = await mountSubmenuMenu();
+
+      trigger.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true, clientX: 150, clientY: 150 }));
+      movePointerTo(190, 150);
+      await nextTick();
+      vi.advanceTimersByTime(400);
+      // A second move that is still inside the wedge must not re-arm the close.
+      movePointerTo(195, 165);
+      await nextTick();
+      vi.advanceTimersByTime(400);
+      await nextTick();
+
+      expect(submenuIsOpen()).toBe(true);
+      app.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still closes the submenu when the pointer moves away from it", async () => {
+    vi.useFakeTimers();
+    try {
+      const { app, trigger } = await mountSubmenuMenu();
+
+      trigger.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true, clientX: 150, clientY: 150 }));
+      movePointerTo(120, 300);
+      await nextTick();
+      vi.advanceTimersByTime(400);
+      await nextTick();
+
+      expect(submenuIsOpen()).toBe(false);
+      app.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

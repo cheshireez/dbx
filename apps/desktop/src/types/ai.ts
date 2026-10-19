@@ -75,6 +75,7 @@ export interface AiConfig {
   piAgentCliEnv?: Record<string, string>;
   opencodeCliPath?: string | null;
   opencodeCliEnv?: Record<string, string>;
+  opencodeCliVersion?: string | null;
   cursorCliPath?: string | null;
   cursorCliEnv?: Record<string, string>;
   grokCliPath?: string | null;
@@ -98,6 +99,17 @@ export interface AiConfigItem extends AiConfig {
   id: string;
   name: string;
   isDefault?: boolean;
+}
+
+export interface CcSwitchImportSkipped {
+  appType: string;
+  name: string;
+  reason: string;
+}
+
+export interface CcSwitchImportResult {
+  configs: AiConfigItem[];
+  skipped: CcSwitchImportSkipped[];
 }
 
 export interface AiActiveModelSelection {

@@ -50,6 +50,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -68,6 +69,10 @@ public final class DamengAgent extends AbstractJdbcAgent {
     private static final int DBMS_OUTPUT_ENABLE_TIMEOUT_SECS = 5;
     private static final int DBMS_OUTPUT_ENABLE_NETWORK_TIMEOUT_MILLIS = 5_000;
     private static final int VIEW_VALIDITY_BATCH_SIZE = 500;
+    // Dameng encodes the declared length unit of a character column in SCALE: see
+    // declaredWithCharacterLength.
+    private static final int CHARACTER_SCALE_VARIABLE = 7;
+    private static final int CHARACTER_SCALE_FIXED = 8;
     private static final Pattern DATABASE_VERSION_MAJOR_PATTERN = Pattern.compile("(\\d+)\\.");
     // Word-boundary match so a type or default merely containing the letters is not mistaken
     // for the IDENTITY keyword.
@@ -407,7 +412,17 @@ public final class DamengAgent extends AbstractJdbcAgent {
                     String sqlState = candidate.getSQLState();
                     if ("0A000".equalsIgnoreCase(sqlState)
                         || "42000".equalsIgnoreCase(sqlState)
-                        || "42501".equalsIgnoreCase(sqlState)) {
+                        || "42501".equalsIgnoreCase(sqlState)
+                        // DM 在无 DBMS_OUTPUT 权限时用 28000（invalid authorization
+                        // specification），与 Oracle 的 42000/42501 对应。
+                        || "28000".equalsIgnoreCase(sqlState)) {
+                        return true;
+                    }
+                    // 达梦中文环境只回「权限不足」（vendorCode -5669，SQLState 28000），消息里
+                    // 不含 `dbms_output` 字样，无法走 isDbmsOutputUnavailableMessage 的匹配。
+                    // DBMS_OUTPUT.ENABLE 是可选步骤，这里执行的也只可能是这一句，因此权限类失败
+                    // 一律只让该功能降级，不能阻断用户自己的 SQL（#11875）。
+                    if (isDamengPermissionError(candidate)) {
                         return true;
                     }
                     String message = candidate.getMessage();
@@ -569,7 +584,8 @@ public final class DamengAgent extends AbstractJdbcAgent {
         return queryConstrainedTables(schema, MetadataListConstraints.orNone(constraints));
     }
 
-    private List<TableInfo> queryConstrainedTables(String schema, MetadataListConstraints constraints) {
+    private List<TableInfo> queryConstrainedTables(String rawSchema, MetadataListConstraints constraints) {
+        final String schema = normalizeSchema(rawSchema);
         if (legacyJdbcMetadata) {
             return withViewValidity(executeJdbcMetadataTables(schema, constraints), schema);
         }
@@ -738,6 +754,9 @@ public final class DamengAgent extends AbstractJdbcAgent {
                 if (errorCode == -3325 || errorCode == -2207) {
                     return true;
                 }
+                if (isDamengPermissionError(candidate)) {
+                    return true;
+                }
                 String message = candidate.getMessage();
                 if (message == null) {
                     continue;
@@ -778,6 +797,27 @@ public final class DamengAgent extends AbstractJdbcAgent {
             }
         }
         return false;
+    }
+
+    /**
+     * 达梦中文环境在无权限时只返回「权限不足」（vendorCode -5669），消息里不带对象名，
+     * 无法通过 {@link #isDamengMetadataUnavailableError} 的对象名匹配识别。
+     * 这类错误同样应按「元数据不可用」处理：走字典视图降级，而不是让查看对象直接报错。
+     */
+    private static boolean isDamengPermissionError(SQLException error) {
+        if (error.getErrorCode() == -5669) {
+            return true;
+        }
+        String message = error.getMessage();
+        if (message == null) {
+            return false;
+        }
+        String normalized = message.toLowerCase(Locale.ROOT);
+        return normalized.contains("权限")
+            || normalized.contains("privilege")
+            || normalized.contains("permission")
+            || normalized.contains("access denied")
+            || normalized.contains("not authorized");
     }
 
     /** 连接类错误（断连/超时等）不属于元数据不可用，必须继续上抛。 */
@@ -903,6 +943,45 @@ public final class DamengAgent extends AbstractJdbcAgent {
             && schema != null
             && !connectedUsername.isBlank()
             && schema.equalsIgnoreCase(connectedUsername);
+    }
+
+    /**
+     * DM resolves an unqualified object name in the session's current schema, and dbx sends an
+     * unqualified metadata request whenever the editor's source table has no schema selected
+     * (the same Oracle-like contract `oracle` and `oceanbase-oracle` follow). Looking up
+     * `OWNER = ''` instead reported "no columns" for tables that exist, so column comments never
+     * reached the result-column tooltip (issue #10221).
+     */
+    private String normalizeSchema(String schema) {
+        if (schema != null && !schema.isBlank()) {
+            return schema;
+        }
+        return effectiveMetadataSchema(currentSchemaOrBlank(), connectedUsername);
+    }
+
+    static String effectiveMetadataSchema(String currentSchema, String connectedUsername) {
+        if (currentSchema != null && !currentSchema.isBlank()) {
+            return currentSchema;
+        }
+        return connectedUsername == null ? "" : connectedUsername;
+    }
+
+    private String currentSchemaOrBlank() {
+        try (Statement stmt = requireConnected().createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL")) {
+            if (rs.next()) {
+                String current = rs.getString(1);
+                if (current != null && !current.isBlank()) {
+                    return current;
+                }
+            }
+        } catch (Exception error) {
+            // Current schema resolution is best-effort: any failure (including environments without
+            // SYS_CONTEXT support, query execution errors, or pathological drivers returning a null
+            // Statement) falls back to an empty string, allowing the caller to fall back to the
+            // connected username.
+        }
+        return "";
     }
 
     private static boolean includesSupportedObjectTypes(MetadataListConstraints constraints) {
@@ -1095,7 +1174,8 @@ public final class DamengAgent extends AbstractJdbcAgent {
         return queryConstrainedObjects(schema, MetadataListConstraints.orNone(constraints));
     }
 
-    private List<ObjectInfo> queryConstrainedObjects(String schema, MetadataListConstraints constraints) {
+    private List<ObjectInfo> queryConstrainedObjects(String rawSchema, MetadataListConstraints constraints) {
+        final String schema = normalizeSchema(rawSchema);
         List<ObjectInfo> objects = queryConstrainedObjectsWithoutValidity(schema, constraints);
         applyViewValidity(objects, schema);
         return objects;
@@ -1349,7 +1429,8 @@ public final class DamengAgent extends AbstractJdbcAgent {
     }
 
     @Override
-    public ObjectSource getObjectSource(String schema, String name, String objectType) {
+    public ObjectSource getObjectSource(String rawSchema, String name, String objectType) {
+        final String schema = normalizeSchema(rawSchema);
         return unchecked(() -> {
             String dbmsType = damengDdlObjectType(objectType);
             RuntimeException dbmsError;
@@ -1775,7 +1856,26 @@ public final class DamengAgent extends AbstractJdbcAgent {
     }
 
     @Override
-    public String getTableDdl(String schema, String table) {
+    protected boolean includeColumnCommentsInTableDdl() {
+        return true;
+    }
+
+    @Override
+    public String getTableComment(String rawSchema, String table) {
+        final String schema = normalizeSchema(rawSchema);
+        try {
+            String comment = tableComment(schema, table);
+            if (notBlank(comment)) {
+                return comment;
+            }
+        } catch (Exception ignored) {
+        }
+        return super.getTableComment(schema, table);
+    }
+
+    @Override
+    public String getTableDdl(String rawSchema, String table) {
+        final String schema = normalizeSchema(rawSchema);
         if (legacyJdbcMetadata) {
             return super.getTableDdl(schema, table);
         }
@@ -1869,7 +1969,8 @@ public final class DamengAgent extends AbstractJdbcAgent {
     }
 
     @Override
-    public List<ColumnInfo> getColumns(String schema, String table) {
+    public List<ColumnInfo> getColumns(String rawSchema, String table) {
+        final String schema = normalizeSchema(rawSchema);
         if (legacyJdbcMetadata) {
             return StandardJdbcMetadata.INSTANCE.getColumns(
                 requireConnected(),
@@ -1904,6 +2005,9 @@ public final class DamengAgent extends AbstractJdbcAgent {
             }
 
             Set<String> identityColumns = identityColumns(schema, table);
+            // Lazily filled in only when a column's declared length is not visible in
+            // ALL_TAB_COLUMNS; the dictionary lookup costs an extra round trip.
+            Map<String, Integer> declaredColumnLengths = null;
             List<ColumnInfo> result = new ArrayList<>();
             // DATA_DEFAULT is a LONG column — it must be selected first and read first
             // in JDBC, otherwise the data is truncated.
@@ -1940,7 +2044,15 @@ public final class DamengAgent extends AbstractJdbcAgent {
                         Integer dataLen = intObject(rs, "DATA_LENGTH");
                         Integer charLen = intObject(rs, "CHAR_LENGTH");
                         String charUsed = rs.getString("CHAR_USED");
-                        String dataType = formatDataType(baseType, numPrec, numScale, dataLen, charLen, charUsed);
+                        Integer declaredCharLen = null;
+                        if (needsDeclaredCharacterLength(baseType, numScale, charLen)) {
+                            if (declaredColumnLengths == null) {
+                                declaredColumnLengths = declaredColumnLengths(schema, table);
+                            }
+                            declaredCharLen = declaredColumnLengths.get(name);
+                        }
+                        String dataType =
+                            formatDataType(baseType, numPrec, numScale, dataLen, charLen, charUsed, declaredCharLen);
 
                         result.add(new ColumnInfo(
                             name,
@@ -2175,7 +2287,8 @@ public final class DamengAgent extends AbstractJdbcAgent {
     }
 
     @Override
-    public List<IndexInfo> listIndexes(String schema, String table) {
+    public List<IndexInfo> listIndexes(String rawSchema, String table) {
+        final String schema = normalizeSchema(rawSchema);
         if (legacyJdbcMetadata) {
             return StandardJdbcMetadata.INSTANCE.listIndexes(
                 requireConnected(),
@@ -2185,112 +2298,335 @@ public final class DamengAgent extends AbstractJdbcAgent {
                 table
             );
         }
-        return unchecked(() -> {
-            List<IndexInfo> result = new ArrayList<>();
-            // The LEFT JOIN also matches 'U': a UNIQUE constraint owns its backing index the same
-            // way a primary key does, and neither can be altered with index-level DDL (#7959).
-            // The constraint type therefore drives two flags — IS_PK (only 'P') and
-            // CONSTRAINT_BACKED ('P' or 'U'), the same split `independentIndexes` already uses to
-            // keep constraint-backed indexes out of the generated table DDL. A unique index
-            // created with CREATE UNIQUE INDEX has no ALL_CONSTRAINTS row, so it stays false and
-            // keeps the index-level DDL path.
-            String sql = """
-                SELECT /*+ PARALLEL(1) */ i.INDEX_NAME,
-                    LISTAGG(ic.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY ic.COLUMN_POSITION) AS COLUMNS,
-                    i.UNIQUENESS,
-                    CASE WHEN c.CONSTRAINT_TYPE = 'P' THEN 1 ELSE 0 END AS IS_PK,
-                    i.INDEX_TYPE,
-                    CASE WHEN c.CONSTRAINT_TYPE IN ('P', 'U') THEN 1 ELSE 0 END AS CONSTRAINT_BACKED
-                FROM ALL_INDEXES i
-                JOIN ALL_IND_COLUMNS ic ON i.INDEX_NAME = ic.INDEX_NAME AND i.OWNER = ic.INDEX_OWNER AND i.TABLE_OWNER = ic.TABLE_OWNER
-                LEFT JOIN ALL_CONSTRAINTS c ON i.INDEX_NAME = c.INDEX_NAME AND i.TABLE_OWNER = c.OWNER
-                    AND c.CONSTRAINT_TYPE IN ('P', 'U')
-                WHERE i.TABLE_OWNER = ? AND i.TABLE_NAME = ?
-                GROUP BY i.INDEX_NAME, i.UNIQUENESS, c.CONSTRAINT_TYPE, i.INDEX_TYPE
-                ORDER BY i.INDEX_NAME
-                """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        IndexInfo index = new IndexInfo(
-                            rs.getString(1),
-                            splitNonEmpty(coalesce(rs.getString(2)), ","),
-                            "UNIQUE".equals(rs.getString(3)),
-                            "1".equals(rs.getString(4)),
-                            null,
-                            rs.getString(5),
-                            null,
-                            null
-                        );
-                        index.setConstraint_backed("1".equals(rs.getString(6)));
-                        result.add(index);
-                    }
+        return unchecked(() -> tableIndexes(schema, table));
+    }
+
+    private List<IndexInfo> tableIndexes(String schema, String table) throws Exception {
+        try {
+            return indexesFromSystemCatalog(schema, table);
+        } catch (Exception systemCatalogError) {
+            if (isDamengConnectionError(systemCatalogError)) {
+                throw systemCatalogError;
+            }
+            try {
+                return indexesFromDictionaryViews(schema, table);
+            } catch (Exception dictionaryViewError) {
+                dictionaryViewError.addSuppressed(systemCatalogError);
+                throw dictionaryViewError;
+            }
+        }
+    }
+
+    private List<IndexInfo> indexesFromSystemCatalog(String schema, String table) throws Exception {
+        List<IndexInfo> result = new ArrayList<>();
+        // ALL_INDEXES applies visibility checks across the complete catalog. Resolve the one table
+        // first, then inspect only its index children; the official catalog exposes key order via
+        // SF_GET_INDEX_KEY_SEQ and constraint ownership through SYSCONS.
+        String sql = """
+            SELECT /*+ PARALLEL(1) */ index_object.NAME,
+                LISTAGG(column_object.NAME, ',') WITHIN GROUP (
+                    ORDER BY SF_GET_INDEX_KEY_SEQ(index_metadata.KEYNUM, index_metadata.KEYINFO, column_object.COLID)
+                ) AS COLUMNS,
+                index_metadata.ISUNIQUE,
+                MAX(CASE WHEN constraint_metadata.TYPE$ = 'P' THEN 1 ELSE 0 END) AS IS_PK,
+                index_metadata.TYPE$,
+                MAX(CASE WHEN constraint_metadata.TYPE$ IN ('P', 'U') THEN 1 ELSE 0 END) AS CONSTRAINT_BACKED,
+                index_metadata.FLAG
+            FROM SYS.SYSOBJECTS schema_object
+            JOIN SYS.SYSOBJECTS table_object ON table_object.SCHID = schema_object.ID
+                AND table_object.TYPE$ = 'SCHOBJ' AND table_object.SUBTYPE$ = 'UTAB'
+            JOIN SYS.SYSOBJECTS index_object ON index_object.PID = table_object.ID
+                AND index_object.SUBTYPE$ = 'INDEX'
+            JOIN SYS.SYSINDEXES index_metadata ON index_metadata.ID = index_object.ID
+            JOIN SYS.SYSCOLUMNS column_object ON column_object.ID = table_object.ID
+                AND SF_COL_IS_IDX_KEY(
+                    index_metadata.KEYNUM,
+                    index_metadata.KEYINFO,
+                    column_object.COLID
+                ) = 1
+            LEFT JOIN SYS.SYSCONS constraint_metadata ON constraint_metadata.TABLEID = table_object.ID
+                AND constraint_metadata.INDEXID = index_metadata.ID
+                AND constraint_metadata.TYPE$ IN ('P', 'U')
+            WHERE schema_object.TYPE$ = 'SCH' AND schema_object.NAME = ? AND table_object.NAME = ?
+            GROUP BY index_object.NAME, index_metadata.ISUNIQUE, index_metadata.TYPE$, index_metadata.FLAG
+            ORDER BY index_object.NAME
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    boolean isPrimary = "1".equals(rs.getString(4));
+                    boolean constraintBacked = "1".equals(rs.getString(6));
+                    IndexInfo index = new IndexInfo(
+                        rs.getString(1),
+                        splitNonEmpty(coalesce(rs.getString(2)), ","),
+                        "Y".equalsIgnoreCase(rs.getString(3)),
+                        isPrimary,
+                        null,
+                        damengSystemIndexType(rs.getString(5), rs.getInt(7), constraintBacked),
+                        null,
+                        null
+                    );
+                    index.setConstraint_backed(constraintBacked);
+                    result.add(index);
                 }
             }
-            return result;
-        });
+        }
+        return result;
+    }
+
+    private List<IndexInfo> indexesFromDictionaryViews(String schema, String table) throws Exception {
+        List<IndexInfo> result = new ArrayList<>();
+        // The LEFT JOIN also matches 'U': a UNIQUE constraint owns its backing index the same
+        // way a primary key does, and neither can be altered with index-level DDL (#7959).
+        String sql = """
+            SELECT /*+ PARALLEL(1) */ i.INDEX_NAME,
+                LISTAGG(ic.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY ic.COLUMN_POSITION) AS COLUMNS,
+                i.UNIQUENESS,
+                CASE WHEN c.CONSTRAINT_TYPE = 'P' THEN 1 ELSE 0 END AS IS_PK,
+                i.INDEX_TYPE,
+                CASE WHEN c.CONSTRAINT_TYPE IN ('P', 'U') THEN 1 ELSE 0 END AS CONSTRAINT_BACKED
+            FROM ALL_INDEXES i
+            JOIN ALL_IND_COLUMNS ic ON i.INDEX_NAME = ic.INDEX_NAME AND i.OWNER = ic.INDEX_OWNER AND i.TABLE_OWNER = ic.TABLE_OWNER
+            LEFT JOIN ALL_CONSTRAINTS c ON i.INDEX_NAME = c.INDEX_NAME AND i.TABLE_OWNER = c.OWNER
+                AND c.CONSTRAINT_TYPE IN ('P', 'U')
+            WHERE i.TABLE_OWNER = ? AND i.TABLE_NAME = ?
+            GROUP BY i.INDEX_NAME, i.UNIQUENESS, c.CONSTRAINT_TYPE, i.INDEX_TYPE
+            ORDER BY i.INDEX_NAME
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    IndexInfo index = new IndexInfo(
+                        rs.getString(1),
+                        splitNonEmpty(coalesce(rs.getString(2)), ","),
+                        "UNIQUE".equals(rs.getString(3)),
+                        "1".equals(rs.getString(4)),
+                        null,
+                        rs.getString(5),
+                        null,
+                        null
+                    );
+                    index.setConstraint_backed("1".equals(rs.getString(6)));
+                    result.add(index);
+                }
+            }
+        }
+        return result;
     }
 
     @Override
-    public List<ForeignKeyInfo> listForeignKeys(String schema, String table) {
+    public List<ForeignKeyInfo> listForeignKeys(String rawSchema, String table) {
+        final String schema = normalizeSchema(rawSchema);
         if (legacyJdbcMetadata) {
             return StandardJdbcMetadata.INSTANCE.listForeignKeys(requireConnected(), schema, table);
         }
-        return unchecked(() -> {
-            List<ForeignKeyInfo> result = new ArrayList<>();
-            String sql = """
-                SELECT c.CONSTRAINT_NAME, cc.COLUMN_NAME, rc.TABLE_NAME, rcc.COLUMN_NAME
-                FROM ALL_CONSTRAINTS c
-                JOIN ALL_CONS_COLUMNS cc ON c.CONSTRAINT_NAME = cc.CONSTRAINT_NAME AND c.OWNER = cc.OWNER
-                JOIN ALL_CONSTRAINTS rc ON c.R_CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND c.R_OWNER = rc.OWNER
-                JOIN ALL_CONS_COLUMNS rcc ON rc.CONSTRAINT_NAME = rcc.CONSTRAINT_NAME AND rc.OWNER = rcc.OWNER
-                WHERE c.CONSTRAINT_TYPE = 'R' AND c.OWNER = ? AND c.TABLE_NAME = ?
-                ORDER BY c.CONSTRAINT_NAME
-                """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new ForeignKeyInfo(
-                            rs.getString(1),
-                            rs.getString(2),
-                            rs.getString(3),
-                            rs.getString(4)
-                        ));
-                    }
+        return unchecked(() -> foreignKeys(schema, table));
+    }
+
+    private List<ForeignKeyInfo> foreignKeys(String schema, String table) throws Exception {
+        try {
+            return foreignKeysFromSystemCatalog(schema, table);
+        } catch (Exception systemCatalogError) {
+            if (isDamengConnectionError(systemCatalogError)) {
+                throw systemCatalogError;
+            }
+            try {
+                return foreignKeysFromDictionaryViews(schema, table);
+            } catch (Exception dictionaryViewError) {
+                dictionaryViewError.addSuppressed(systemCatalogError);
+                throw dictionaryViewError;
+            }
+        }
+    }
+
+    private List<ForeignKeyInfo> foreignKeysFromSystemCatalog(String schema, String table) throws Exception {
+        List<ForeignKeyInfo> result = new ArrayList<>();
+        String sql = """
+            SELECT /*+ MAX_OPT_N_TABLES(5) PARALLEL(1) */ constraint_object.NAME,
+                local_column.NAME,
+                referenced_table.NAME,
+                referenced_column.NAME
+            FROM SYS.SYSOBJECTS schema_object
+            JOIN SYS.SYSOBJECTS table_object ON table_object.SCHID = schema_object.ID
+                AND table_object.TYPE$ = 'SCHOBJ' AND table_object.SUBTYPE$ = 'UTAB'
+            JOIN SYS.SYSCONS foreign_key ON foreign_key.TABLEID = table_object.ID
+                AND foreign_key.TYPE$ = 'F'
+            JOIN SYS.SYSOBJECTS constraint_object ON constraint_object.ID = foreign_key.ID
+                AND constraint_object.PID = table_object.ID
+                AND constraint_object.SUBTYPE$ = 'CONS'
+            JOIN SYS.SYSINDEXES local_index ON local_index.ID = foreign_key.INDEXID
+            JOIN SYS.SYSCOLUMNS local_column ON local_column.ID = table_object.ID
+                AND SF_COL_IS_IDX_KEY(local_index.KEYNUM, local_index.KEYINFO, local_column.COLID) = 1
+            JOIN SYS.SYSOBJECTS referenced_index_object ON referenced_index_object.ID = foreign_key.FINDEXID
+                AND referenced_index_object.SUBTYPE$ = 'INDEX'
+            JOIN SYS.SYSINDEXES referenced_index ON referenced_index.ID = referenced_index_object.ID
+            JOIN SYS.SYSOBJECTS referenced_table ON referenced_table.ID = referenced_index_object.PID
+                AND referenced_table.TYPE$ = 'SCHOBJ' AND referenced_table.SUBTYPE$ = 'UTAB'
+            JOIN SYS.SYSCOLUMNS referenced_column ON referenced_column.ID = referenced_table.ID
+                AND SF_COL_IS_IDX_KEY(
+                    referenced_index.KEYNUM,
+                    referenced_index.KEYINFO,
+                    referenced_column.COLID
+                ) = 1
+                AND SF_GET_INDEX_KEY_SEQ(local_index.KEYNUM, local_index.KEYINFO, local_column.COLID)
+                    = SF_GET_INDEX_KEY_SEQ(
+                        referenced_index.KEYNUM,
+                        referenced_index.KEYINFO,
+                        referenced_column.COLID
+                    )
+            WHERE schema_object.TYPE$ = 'SCH' AND schema_object.NAME = ? AND table_object.NAME = ?
+            ORDER BY constraint_object.NAME,
+                SF_GET_INDEX_KEY_SEQ(local_index.KEYNUM, local_index.KEYINFO, local_column.COLID)
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new ForeignKeyInfo(
+                        rs.getString(1),
+                        rs.getString(2),
+                        rs.getString(3),
+                        rs.getString(4)
+                    ));
                 }
             }
-            return result;
-        });
+        }
+        return result;
+    }
+
+    private List<ForeignKeyInfo> foreignKeysFromDictionaryViews(String schema, String table) throws Exception {
+        List<ForeignKeyInfo> result = new ArrayList<>();
+        String sql = """
+            SELECT /*+ PARALLEL(1) */ c.CONSTRAINT_NAME, cc.COLUMN_NAME, rc.TABLE_NAME, rcc.COLUMN_NAME
+            FROM ALL_CONSTRAINTS c
+            JOIN ALL_CONS_COLUMNS cc ON c.CONSTRAINT_NAME = cc.CONSTRAINT_NAME AND c.OWNER = cc.OWNER
+            JOIN ALL_CONSTRAINTS rc ON c.R_CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND c.R_OWNER = rc.OWNER
+            JOIN ALL_CONS_COLUMNS rcc ON rc.CONSTRAINT_NAME = rcc.CONSTRAINT_NAME AND rc.OWNER = rcc.OWNER
+                AND cc.POSITION = rcc.POSITION
+            WHERE c.CONSTRAINT_TYPE = 'R' AND c.OWNER = ? AND c.TABLE_NAME = ?
+            ORDER BY c.CONSTRAINT_NAME, cc.POSITION
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new ForeignKeyInfo(
+                        rs.getString(1),
+                        rs.getString(2),
+                        rs.getString(3),
+                        rs.getString(4)
+                    ));
+                }
+            }
+        }
+        return result;
     }
 
     @Override
-    public List<TriggerInfo> listTriggers(String schema, String table) {
+    public List<TriggerInfo> listTriggers(String rawSchema, String table) {
+        final String schema = normalizeSchema(rawSchema);
         if (legacyJdbcMetadata) {
             return StandardJdbcMetadata.INSTANCE.listTriggers(schema, table);
         }
         return unchecked(() -> {
-            List<TriggerInfo> result = new ArrayList<>();
-            String sql = """
-                SELECT TRIGGER_NAME, TRIGGERING_EVENT, '' AS TRIGGER_TYPE
-                FROM ALL_TRIGGERS
-                WHERE OWNER = ? AND TABLE_NAME = ?
-                ORDER BY TRIGGER_NAME
-                """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new TriggerInfo(rs.getString(1), rs.getString(2), rs.getString(3)));
+            try {
+                return readTriggerDetails(schema, table);
+            } catch (Exception error) {
+                // 字典视图不可读（权限/旧版本视图缺失）时退回只取名字与事件的实现，
+                // 保证表结构编辑器的触发器列表不会因为新增列整体失败。
+                if (isDamengConnectionError(error)) {
+                    throw error;
+                }
+                return readTriggerNames(schema, table);
+            }
+        });
+    }
+
+    /**
+     * 读取表上触发器的完整字典信息，供表结构编辑器的触发器页签展示与编辑。
+     *
+     * <p>达梦不同版本的 ALL_TRIGGERS 列并不完全一致（部分版本没有 Oracle 的 TRIGGER_TYPE、
+     * WHEN_CLAUSE、TRIGGER_BODY 等列），所以这里用 SELECT * 后再按列名容错读取：
+     * 有列就带回正文/类型/状态，缺列只影响对应字段，不会让整个触发器列表失败。</p>
+     */
+    private List<TriggerInfo> readTriggerDetails(String schema, String table) throws Exception {
+        List<TriggerInfo> result = new ArrayList<>();
+        String sql = """
+            SELECT * FROM ALL_TRIGGERS
+            WHERE OWNER = ? AND TABLE_NAME = ?
+            ORDER BY TRIGGER_NAME
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String name = triggerColumnText(rs, "TRIGGER_NAME").trim();
+                    if (name.isEmpty()) {
+                        continue;
                     }
+                    TriggerInfo trigger = new TriggerInfo(name, triggerColumnText(rs, "TRIGGERING_EVENT"), "");
+                    trigger.setTiming(normalizeTriggerTiming(triggerColumnText(rs, "TRIGGER_TYPE")));
+                    trigger.setStatement(triggerColumnText(rs, "TRIGGER_BODY"));
+                    trigger.setCondition(triggerColumnText(rs, "WHEN_CLAUSE"));
+                    trigger.setEnabled(triggerEnabledState(triggerColumnText(rs, "STATUS")));
+                    result.add(trigger);
                 }
             }
-            return result;
-        });
+        }
+        return result;
+    }
+
+    /** 修复前的降级实现：字典视图缺列时只返回触发器名字与事件。 */
+    private List<TriggerInfo> readTriggerNames(String schema, String table) throws Exception {
+        List<TriggerInfo> result = new ArrayList<>();
+        String sql = """
+            SELECT TRIGGER_NAME, TRIGGERING_EVENT, '' AS TRIGGER_TYPE
+            FROM ALL_TRIGGERS
+            WHERE OWNER = ? AND TABLE_NAME = ?
+            ORDER BY TRIGGER_NAME
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new TriggerInfo(rs.getString(1), rs.getString(2), rs.getString(3)));
+                }
+            }
+        }
+        return result;
+    }
+
+    /** 按列名读取字典文本；当前达梦版本的视图没有该列时返回空串而不是抛错。 */
+    private static String triggerColumnText(ResultSet rs, String column) {
+        try {
+            return coalesce(readTextColumn(rs, rs.findColumn(column)));
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    /** TRIGGER_TYPE 与 Oracle 一致（BEFORE/AFTER + STATEMENT/EACH ROW），只做空白与大小写归一化。 */
+    private static String normalizeTriggerTiming(String value) {
+        return coalesce(value).trim().replaceAll("\\s+", " ").toUpperCase(Locale.ROOT);
+    }
+
+    private static Boolean triggerEnabledState(String status) {
+        String normalized = coalesce(status).trim().toUpperCase(Locale.ROOT);
+        if ("ENABLED".equals(normalized) || "ENABLE".equals(normalized) || "Y".equals(normalized)) {
+            return Boolean.TRUE;
+        }
+        if ("DISABLED".equals(normalized) || "DISABLE".equals(normalized) || "N".equals(normalized)) {
+            return Boolean.FALSE;
+        }
+        return null;
     }
 
     @Override
@@ -2558,15 +2894,17 @@ public final class DamengAgent extends AbstractJdbcAgent {
         Integer numScale,
         Integer dataLen,
         Integer charLen,
-        String charUsed
+        String charUsed,
+        Integer declaredCharLen
     ) {
         return switch (base.toUpperCase(Locale.ROOT)) {
             case "VARCHAR2", "VARCHAR", "CHAR" -> {
-                Integer length = characterLength(dataLen, charLen, charUsed);
-                yield length != null ? base + "(" + length + characterLengthUnit(charUsed) + ")" : base;
+                String unit = characterLengthUnit(base, numScale, charUsed);
+                Integer length = characterLength(dataLen, charLen, unit, declaredCharLen);
+                yield length != null ? base + "(" + length + unit + ")" : base;
             }
             case "NVARCHAR2", "NCHAR" -> {
-                Integer length = charLen != null ? charLen : dataLen;
+                Integer length = firstPositive(charLen, declaredCharLen, dataLen);
                 yield length != null ? base + "(" + length + ")" : base;
             }
             case "NUMBER", "NUMERIC", "DECIMAL" -> {
@@ -2580,16 +2918,18 @@ public final class DamengAgent extends AbstractJdbcAgent {
         };
     }
 
-    private static Integer characterLength(Integer dataLen, Integer charLen, String charUsed) {
-        String normalized = charUsed == null ? "" : charUsed.trim().toUpperCase(Locale.ROOT);
-        if ("B".equals(normalized) || "BYTE".equals(normalized)) {
-            return dataLen != null ? dataLen : charLen;
+    private static Integer characterLength(Integer dataLen, Integer charLen, String unit, Integer declaredCharLen) {
+        if (" BYTE".equals(unit)) {
+            return firstPositive(dataLen, declaredCharLen, charLen);
         }
-        return charLen != null ? charLen : dataLen;
+        return firstPositive(charLen, declaredCharLen, dataLen);
     }
 
-    private static String characterLengthUnit(String charUsed) {
-        if (charUsed == null) {
+    private static String characterLengthUnit(String base, Integer numScale, String charUsed) {
+        if (declaredWithCharacterLength(base, numScale)) {
+            return " CHAR";
+        }
+        if (charUsed == null || charUsed.isBlank()) {
             return "";
         }
         return switch (charUsed.trim().toUpperCase(Locale.ROOT)) {
@@ -2597,6 +2937,83 @@ public final class DamengAgent extends AbstractJdbcAgent {
             case "C", "CHAR" -> " CHAR";
             default -> "";
         };
+    }
+
+    private static Integer firstPositive(Integer... values) {
+        for (Integer value : values) {
+            if (value != null && value > 0) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Dameng keeps a character column's declared length unit in its SCALE field instead of in
+     * CHAR_USED, which reads 'B' for byte- and character-length columns alike: SCALE is 7 for
+     * VARCHAR/VARCHAR2/NVARCHAR2 and 8 for CHAR/NCHAR columns declared with character
+     * semantics, and 0 for byte semantics. Reading CHAR_USED alone rendered a column created as
+     * <code>VARCHAR2(100 CHAR)</code> as <code>VARCHAR2(400 BYTE)</code> on a UTF-8 server.
+     */
+    private static boolean declaredWithCharacterLength(String base, Integer numScale) {
+        if (numScale == null) {
+            return false;
+        }
+        return switch (base.toUpperCase(Locale.ROOT)) {
+            case "VARCHAR2", "VARCHAR", "NVARCHAR2" -> numScale == CHARACTER_SCALE_VARIABLE;
+            case "CHAR", "NCHAR" -> numScale == CHARACTER_SCALE_FIXED;
+            default -> false;
+        };
+    }
+
+    /**
+     * NVARCHAR2/NCHAR columns leave CHAR_LENGTH at 0 in ALL_TAB_COLUMNS, and a character-length
+     * column always reports DATA_LENGTH in bytes, so the declared length has to come from
+     * elsewhere. Only ask when the cheaper columns cannot answer.
+     */
+    private static boolean needsDeclaredCharacterLength(String base, Integer numScale, Integer charLen) {
+        if (charLen != null && charLen > 0) {
+            return false;
+        }
+        String type = base.toUpperCase(Locale.ROOT);
+        return switch (type) {
+            case "NVARCHAR2", "NCHAR" -> true;
+            case "VARCHAR2", "VARCHAR", "CHAR" -> declaredWithCharacterLength(type, numScale);
+            default -> false;
+        };
+    }
+
+    /**
+     * SYS.SYSCOLUMNS.LENGTH$ keeps the length exactly as declared, which ALL_TAB_COLUMNS cannot
+     * report for NVARCHAR2/NCHAR. The view is not granted to PUBLIC, so a permission error just
+     * means the caller keeps using the ALL_TAB_COLUMNS values instead of failing the request.
+     */
+    private Map<String, Integer> declaredColumnLengths(String schema, String table) {
+        Map<String, Integer> result = new HashMap<>();
+        String sql = """
+            SELECT /*+ PARALLEL(1) */ c.NAME, c.LENGTH$
+            FROM SYS.SYSCOLUMNS c
+            JOIN SYS.SYSOBJECTS t ON c.ID = t.ID
+            JOIN SYS.SYSOBJECTS s ON t.SCHID = s.ID
+            WHERE s.NAME = ? AND t.NAME = ?
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String name = rs.getString(1);
+                    int length = rs.getInt(2);
+                    if (notBlank(name) && length > 0) {
+                        result.put(name, length);
+                    }
+                }
+            }
+        } catch (Exception error) {
+            LOGGER.log(Level.FINE, "Unable to read declared column lengths for " + schema + "." + table, error);
+            return Map.of();
+        }
+        return result;
     }
 
     private static Integer intObject(ResultSet rs, String column) throws Exception {
@@ -2645,16 +3062,30 @@ public final class DamengAgent extends AbstractJdbcAgent {
         return value == null ? "" : value;
     }
 
+    private boolean schemaMatchesConnectedUserOrCurrent(String schema) {
+        if (schema == null || schema.isBlank()) {
+            return true;
+        }
+        if (schemaMatchesConnectedUser(schema)) {
+            return true;
+        }
+        // Short-circuit before the SYS_CONTEXT probe: when we don't know the connected username
+        // there is nothing to compare the probe result against, so skip the extra DB round-trip.
+        if (connectedUsername == null || connectedUsername.isBlank()) {
+            return true;
+        }
+        String currentSchema = currentSchemaOrBlank();
+        if (!currentSchema.isBlank()) {
+            return schema.equalsIgnoreCase(currentSchema);
+        }
+        return false;
+    }
+
     private void fillMissingColumnComments(String schema, String table, List<ColumnInfo> columns) {
         if (columns.stream().noneMatch(column -> !notBlank(column.getComment()))) {
             return;
         }
         Map<String, String> comments = new HashMap<>();
-        queryColumnComments(
-            comments,
-            "SELECT /*+ PARALLEL(1) */ COLUMN_NAME, COMMENTS FROM USER_COL_COMMENTS WHERE TABLE_NAME = ?",
-            table
-        );
         queryColumnComments(
             comments,
             "SELECT /*+ PARALLEL(1) */ COLNAME, COMMENT$ FROM SYS.SYSCOLUMNCOMMENTS WHERE SCHNAME = ? AND TVNAME = ?",
@@ -2667,6 +3098,13 @@ public final class DamengAgent extends AbstractJdbcAgent {
             schema,
             table
         );
+        if (schemaMatchesConnectedUserOrCurrent(schema)) {
+            queryColumnComments(
+                comments,
+                "SELECT /*+ PARALLEL(1) */ COLUMN_NAME, COMMENTS FROM USER_COL_COMMENTS WHERE TABLE_NAME = ?",
+                table
+            );
+        }
         for (ColumnInfo column : columns) {
             if (notBlank(column.getComment())) {
                 continue;
@@ -2704,13 +3142,90 @@ public final class DamengAgent extends AbstractJdbcAgent {
         if (notBlank(tableComment) && !containsCommentOnTable(result.toString(), schema, table)) {
             appendCommentStatement(result, "COMMENT ON TABLE " + tableRef + " IS '" + sqlStringBody(tableComment) + "';");
         }
-        for (ColumnInfo column : getColumns(schema, table)) {
-            if (!notBlank(column.getComment()) || containsCommentOnColumn(result.toString(), schema, table, column.getName())) {
+        for (Map.Entry<String, String> column : tableColumnComments(schema, table).entrySet()) {
+            if (containsCommentOnColumn(result.toString(), schema, table, column.getKey())) {
                 continue;
             }
-            appendCommentStatement(result, "COMMENT ON COLUMN " + tableRef + "." + JdbcIdentifiers.INSTANCE.doubleQuote(column.getName()) + " IS '" + sqlStringBody(column.getComment()) + "';");
+            appendCommentStatement(result, "COMMENT ON COLUMN " + tableRef + "." + JdbcIdentifiers.INSTANCE.doubleQuote(column.getKey()) + " IS '" + sqlStringBody(column.getValue()) + "';");
         }
         return result.toString();
+    }
+
+    private Map<String, String> tableColumnComments(String schema, String table) throws Exception {
+        Map<String, String> result = new LinkedHashMap<>();
+        String sql = """
+            SELECT /*+ PARALLEL(1) */ COLUMN_NAME, COMMENTS
+            FROM ALL_COL_COMMENTS
+            WHERE OWNER = ? AND TABLE_NAME = ? AND COMMENTS IS NOT NULL
+            ORDER BY COLUMN_NAME
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String column = rs.getString(1);
+                    String comment = rs.getString(2);
+                    if (notBlank(column) && notBlank(comment)) {
+                        result.put(column, comment);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        if (result.isEmpty()) {
+            queryTableColumnComments(
+                result,
+                "SELECT /*+ PARALLEL(1) */ COLNAME, COMMENT$ FROM SYS.SYSCOLUMNCOMMENTS WHERE SCHNAME = ? AND TVNAME = ?",
+                schema,
+                table
+            );
+        }
+        if (result.isEmpty()) {
+            queryTableColumnComments(
+                result,
+                "SELECT /*+ PARALLEL(1) */ COLUMN_NAME, COMMENTS FROM ALL_COL_COMMENTS WHERE UPPER(OWNER) = UPPER(?) AND UPPER(TABLE_NAME) = UPPER(?)",
+                schema,
+                table
+            );
+        }
+        if (result.isEmpty() && schemaMatchesConnectedUserOrCurrent(schema)) {
+            queryTableColumnComments(
+                result,
+                "SELECT /*+ PARALLEL(1) */ COLUMN_NAME, COMMENTS FROM USER_COL_COMMENTS WHERE TABLE_NAME = ?",
+                table
+            );
+        }
+        if (result.isEmpty()) {
+            try {
+                for (ColumnInfo column : getColumns(schema, table)) {
+                    if (notBlank(column.getName()) && notBlank(column.getComment())) {
+                        result.put(column.getName(), column.getComment());
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return result;
+    }
+
+    private void queryTableColumnComments(Map<String, String> comments, String sql, String... params) {
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            for (int i = 0; i < params.length; i++) {
+                stmt.setString(i + 1, params[i]);
+            }
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String column = rs.getString(1);
+                    String comment = rs.getString(2);
+                    if (notBlank(column) && notBlank(comment)) {
+                        comments.putIfAbsent(column, comment);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Some Dameng versions or users do not expose every comment view.
+        }
     }
 
     private String appendIndependentIndexDdl(String ddl, String schema, String table) throws Exception {
@@ -2729,49 +3244,22 @@ public final class DamengAgent extends AbstractJdbcAgent {
     }
 
     private List<IndexInfo> independentIndexes(String schema, String table) throws Exception {
-        List<IndexInfo> result = new ArrayList<>();
-        // Primary-key and unique-constraint backing indexes are already represented in table DDL.
-        String sql = """
-            SELECT /*+ PARALLEL(1) */ i.INDEX_NAME,
-                LISTAGG(ic.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY ic.COLUMN_POSITION) AS COLUMNS,
-                i.UNIQUENESS,
-                i.INDEX_TYPE
-            FROM ALL_INDEXES i
-            JOIN ALL_IND_COLUMNS ic ON i.INDEX_NAME = ic.INDEX_NAME AND i.OWNER = ic.INDEX_OWNER AND i.TABLE_OWNER = ic.TABLE_OWNER
-            WHERE i.TABLE_OWNER = ? AND i.TABLE_NAME = ?
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM ALL_CONSTRAINTS c
-                    WHERE c.OWNER = i.TABLE_OWNER
-                        AND c.TABLE_NAME = i.TABLE_NAME
-                        AND c.INDEX_NAME = i.INDEX_NAME
-                        AND c.CONSTRAINT_TYPE IN ('P', 'U')
-                )
-            GROUP BY i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE
-            ORDER BY i.INDEX_NAME
-            """.stripIndent().trim();
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            stmt.setString(1, schema);
-            stmt.setString(2, table);
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    String indexName = rs.getString(1);
-                    if (notBlank(indexName)) {
-                        result.add(new IndexInfo(
-                            indexName,
-                            splitNonEmpty(coalesce(rs.getString(2)), ","),
-                            "UNIQUE".equals(rs.getString(3)),
-                            false,
-                            null,
-                            rs.getString(4),
-                            null,
-                            null
-                        ));
-                    }
-                }
-            }
+        return tableIndexes(schema, table).stream()
+            .filter(index -> !index.getConstraint_backed())
+            .toList();
+    }
+
+    private static String damengSystemIndexType(String catalogType, int flags, boolean constraintBacked) {
+        if ((flags & 1) != 0 || ((flags & 2) != 0 && !constraintBacked)) {
+            return "INTERNAL";
         }
-        return result;
+        String normalized = coalesce(catalogType).trim().toUpperCase(Locale.ROOT);
+        return switch (normalized) {
+            case "BT" -> "NORMAL";
+            case "BM" -> "BITMAP";
+            case "ST" -> "SPATIAL";
+            default -> catalogType;
+        };
     }
 
     static String indexDdl(String schema, String table, IndexInfo index) {

@@ -80,12 +80,46 @@ describe("queryStore MongoDB execution summary", () => {
 
     const tab = store.tabs.find((item) => item.id === tabId)!;
     expect(tab.result?.rows).toHaveLength(3);
+    expect(tab.result?.client_request_wait_ms).toEqual(expect.any(Number));
+    expect(tab.result?.client_result_ms).toEqual(expect.any(Number));
+    expect(tab.result?.timing_page_count).toBe(1);
     expect(tab.batchSqlExecution).toMatchObject({
       total: 1,
       completed: 1,
       items: [{ status: "success", statementIndex: 0 }],
     });
     expect(tab.batchSqlExecution?.items[0]?.status).not.toBe("skipped");
+  });
+
+  it("skips the total count when an explicit limit fits in the first page", async () => {
+    mocks.mongoFindDocuments.mockResolvedValue({
+      documents: [{ _id: "1" }, { _id: "2" }],
+      extended_documents: [],
+      total: 2,
+      total_is_exact: false,
+    });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mongo-1", "app", "Query");
+
+    await store.executeTabSql(tabId, "db.events.find({ type: 0 }).sort({ eventTime: -1 }).limit(50)");
+
+    expect(mocks.mongoFindDocuments).toHaveBeenCalledWith("mongo-1", "app", "events", 0, 50, expect.any(String), undefined, expect.any(String), undefined, expect.any(String), false);
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    expect(tab.result?.rows).toHaveLength(2);
+    expect(tab.result?.truncated).toBe(false);
+    expect(tab.resultTotalRowCount).toBe(2);
+  });
+
+  it("keeps counting when an explicit limit spans more than one page", async () => {
+    mocks.mongoFindDocuments.mockResolvedValue({ documents: [{ _id: "1" }], extended_documents: [], total: 500, total_is_exact: true });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mongo-1", "app", "Query");
+
+    await store.executeTabSql(tabId, "db.events.find({ type: 0 }).limit(150)");
+
+    expect(mocks.mongoFindDocuments).toHaveBeenCalledWith("mongo-1", "app", "events", 0, 100, expect.any(String), undefined, undefined, undefined, expect.any(String), true);
   });
 
   it("marks a failing mongo command as error instead of leaving it stuck at 'skipped'", async () => {
@@ -131,8 +165,8 @@ describe("queryStore MongoDB execution summary", () => {
 
     await store.executeTabSql(tabId, 'db.getSiblingDB("reports").events.find();\ndb.users.find()');
 
-    expect(mocks.mongoFindDocuments).toHaveBeenNthCalledWith(1, "mongo-1", "reports", "events", expect.any(Number), expect.any(Number), "{}", undefined, undefined, undefined, expect.any(String));
-    expect(mocks.mongoFindDocuments).toHaveBeenNthCalledWith(2, "mongo-1", "app", "users", expect.any(Number), expect.any(Number), "{}", undefined, undefined, undefined, expect.any(String));
+    expect(mocks.mongoFindDocuments).toHaveBeenNthCalledWith(1, "mongo-1", "reports", "events", expect.any(Number), expect.any(Number), "{}", undefined, undefined, undefined, expect.any(String), true);
+    expect(mocks.mongoFindDocuments).toHaveBeenNthCalledWith(2, "mongo-1", "app", "users", expect.any(Number), expect.any(Number), "{}", undefined, undefined, undefined, expect.any(String), true);
     const tab = store.tabs.find((item) => item.id === tabId)!;
     expect(tab.batchSqlExecution).toMatchObject({
       total: 2,

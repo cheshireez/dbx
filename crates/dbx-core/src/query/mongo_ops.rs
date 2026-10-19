@@ -11,6 +11,67 @@ use crate::types::QueryResult;
 pub const MONGO_SHOW_DATABASES_DATABASE: &str = "admin";
 pub const MONGO_SHOW_DATABASES_COMMAND_JSON: &str = r#"{"listDatabases":1}"#;
 
+/// Runs one server command through the legacy agent's generic `runCommand` and returns the
+/// response document. The agent surfaces `ok: 0` as an error, so a returned document succeeded.
+async fn agent_run_command_document(
+    client: &crate::db::agent_driver::PooledAgentClient,
+    database: &str,
+    command: mongodb::bson::Document,
+    label: &str,
+) -> Result<mongodb::bson::Document, String> {
+    let mut client = client.lock().await;
+    if !client.supports_capability(AgentCapability::MongoRunCommand) {
+        return Err(format!(
+            "MongoDB Legacy Agent does not support {label}; upgrade or reinstall the MongoDB Legacy driver"
+        ));
+    }
+    let result: MongoDocumentResult = client
+        .mongo_run_command(serde_json::json!({
+            "database": database,
+            "command_json": mongo_driver::document_to_canonical_extended_json(&command).to_string(),
+        }))
+        .await?;
+    let response = result
+        .extended_documents
+        .as_ref()
+        .and_then(|documents| documents.first())
+        .or_else(|| result.documents.first())
+        .ok_or_else(|| format!("MongoDB Legacy Agent returned an empty {label} response"))?;
+    mongo_driver::json_object_to_document_extended_json(response)
+}
+
+/// The database view's per-collection "rows"/"size" columns over the legacy agent: one
+/// `collStats` per non-view collection through `runCommand`, mirroring
+/// `mongo_driver::list_object_statistics`. A collection whose `collStats` fails is left out so
+/// the view keeps that row blank instead of failing the whole listing. The agent connection is
+/// a single RPC channel, so the round trips run sequentially.
+pub async fn mongo_agent_list_object_statistics(
+    client: &crate::db::agent_driver::PooledAgentClient,
+    database: &str,
+) -> Result<Vec<crate::db::ObjectStatistics>, String> {
+    let database = database.trim();
+    if database.is_empty() {
+        return Err("Database name is required".to_string());
+    }
+    let specs = {
+        let mut client = client.lock().await;
+        if !client.supports_capability(AgentCapability::MongoRunCommand) {
+            return Ok(Vec::new());
+        }
+        crate::document_ops::mongo_collection_specs_from_agent_response(
+            client.mongo_list_collection_specs(database).await?,
+        )?
+    };
+    let mut statistics = Vec::with_capacity(specs.len());
+    for spec in specs.into_iter().filter(|spec| spec.kind != mongo_driver::MongoCollectionKind::View) {
+        let Ok(command) = mongo_driver::collection_stats_command(&spec.name, None) else { continue };
+        if let Ok(result) = agent_run_command_document(client, database, command, "collection stats").await {
+            statistics.push(mongo_driver::object_statistics_from_collection_stats(&spec.name, database, &result));
+        }
+    }
+    Ok(statistics)
+}
+
 async fn ensure_document_pool(state: &AppState, connection_id: &str) -> Result<(), String> {
     state.get_or_create_pool(connection_id, None).await.map(|_| ())
 }
@@ -27,12 +88,35 @@ pub async fn mongo_list_collections_core(
     crate::document_ops::list_collections_core(state, connection_id, database).await
 }
 
+pub async fn ensure_collection_exists_for_query(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+) -> Result<(), String> {
+    match mongo_list_collections_core(state, connection_id, database).await {
+        Ok(collections) => {
+            if !collections.iter().any(|c| c.name == collection) {
+                return Err(format!("Collection '{}' does not exist in database '{}'", collection, database));
+            }
+        }
+        Err(e) => {
+            log::warn!("Could not list collections to verify existence of '{}': {}", collection, e);
+        }
+    }
+    Ok(())
+}
+
 pub async fn mongo_create_database_core(state: &AppState, connection_id: &str, database: &str) -> Result<(), String> {
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
     match &pool {
         PoolKind::MongoDb(client) => mongo_driver::create_database(client, database).await,
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support create database".to_string()),
+        PoolKind::Agent(client) => {
+            let database = mongo_driver::validate_create_database_name(database)?;
+            let command = mongodb::bson::doc! { "create": mongo_driver::CREATE_DATABASE_PLACEHOLDER_COLLECTION };
+            agent_run_command_document(client, database, command, "create database").await.map(|_| ())
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }
@@ -167,15 +251,12 @@ pub async fn mongo_server_version_core(
     }
 }
 
-pub async fn mongo_run_command_core(
-    state: &AppState,
-    connection_id: &str,
+pub(crate) async fn mongo_run_command_with_existing_pool(
+    pool: &PoolKind,
     database: &str,
     command_json: &str,
 ) -> Result<MongoDocumentResult, String> {
-    ensure_document_pool(state, connection_id).await?;
-    let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    match pool {
         PoolKind::MongoDb(client) => mongo_driver::run_command(client, database, command_json).await,
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
@@ -196,6 +277,17 @@ pub async fn mongo_run_command_core(
     }
 }
 
+pub async fn mongo_run_command_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    command_json: &str,
+) -> Result<MongoDocumentResult, String> {
+    ensure_document_pool(state, connection_id).await?;
+    let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
+    mongo_run_command_with_existing_pool(&pool, database, command_json).await
+}
+
 pub async fn mongo_show_databases_core(state: &AppState, connection_id: &str) -> Result<MongoDocumentResult, String> {
     mongo_run_command_core(state, connection_id, MONGO_SHOW_DATABASES_DATABASE, MONGO_SHOW_DATABASES_COMMAND_JSON).await
 }
@@ -211,7 +303,11 @@ pub async fn mongo_collection_stats_core(
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
     match &pool {
         PoolKind::MongoDb(client) => mongo_driver::collection_stats(client, database, collection, scale).await,
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support collection stats helpers".to_string()),
+        PoolKind::Agent(client) => {
+            let command = mongo_driver::collection_stats_command(collection, scale.as_ref())?;
+            let response = agent_run_command_document(client, database, command, "collection stats").await?;
+            Ok(mongo_driver::collection_stats_result_from_document(&response))
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }
@@ -229,7 +325,7 @@ pub async fn mongo_find_documents_core(
     sort: Option<&str>,
     collation: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
-    crate::document_ops::find_documents_core(
+    let result = crate::document_ops::find_documents_core(
         state,
         connection_id,
         database,
@@ -243,7 +339,13 @@ pub async fn mongo_find_documents_core(
         None,
         false,
     )
-    .await
+    .await?;
+
+    if result.documents.is_empty() {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
+    }
+
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,7 +363,7 @@ async fn mongo_find_documents_without_total_core(
 ) -> Result<MongoDocumentResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    let result = match &pool {
         PoolKind::MongoDb(client) => {
             mongo_driver::find_documents_without_total(
                 client, database, collection, skip, limit, filter, projection, sort, collation,
@@ -287,7 +389,12 @@ async fn mongo_find_documents_without_total_core(
             client.mongo_find_documents(params).await
         }
         _ => Err("Not a MongoDB connection".to_string()),
+    }?;
+
+    if result.documents.is_empty() {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
     }
+    Ok(result)
 }
 
 pub async fn mongo_find_one_core(
@@ -301,7 +408,7 @@ pub async fn mongo_find_one_core(
 ) -> Result<MongoDocumentResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    let result = match &pool {
         PoolKind::MongoDb(client) => {
             mongo_driver::find_one(client, database, collection, filter, projection, options).await
         }
@@ -318,7 +425,12 @@ pub async fn mongo_find_one_core(
                 .await
         }
         _ => Err("Not a MongoDB connection".to_string()),
+    }?;
+
+    if result.documents.is_empty() {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
     }
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,7 +487,7 @@ pub async fn mongo_count_documents_core(
     let accurate = mode != Some("legacy");
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    let total = match &pool {
         PoolKind::MongoDb(client) => {
             mongo_driver::count_documents(client, database, collection, filter, accurate).await
         }
@@ -405,7 +517,12 @@ pub async fn mongo_count_documents_core(
             }
         }
         _ => Err("Not a MongoDB connection".to_string()),
+    }?;
+
+    if total == 0 {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
     }
+    Ok(total)
 }
 
 /// Read MongoDB documents as relaxed Extended JSON for MongoDB transfer paths.
@@ -423,7 +540,7 @@ pub async fn mongo_find_documents_extended_json_core(
 ) -> Result<MongoDocumentResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    let result = match &pool {
         PoolKind::MongoDb(client) => {
             mongo_driver::find_documents_extended_json(
                 client, database, collection, skip, limit, filter, projection, sort, None,
@@ -452,7 +569,12 @@ pub async fn mongo_find_documents_extended_json_core(
             }
         }
         _ => Err("Not a MongoDB connection".to_string()),
+    }?;
+
+    if result.documents.is_empty() {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
     }
+    Ok(result)
 }
 
 pub(crate) fn is_unknown_agent_method_error(error: &str, method: &str) -> bool {
@@ -478,7 +600,7 @@ pub async fn mongo_aggregate_documents_core(
 ) -> Result<MongoDocumentResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    let result = match &pool {
         PoolKind::MongoDb(client) => {
             mongo_driver::aggregate_documents(client, database, collection, pipeline_json, max_rows, options_json).await
         }
@@ -501,7 +623,12 @@ pub async fn mongo_aggregate_documents_core(
             }
         }
         _ => Err("Not a MongoDB connection".to_string()),
+    }?;
+
+    if result.documents.is_empty() {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
     }
+    Ok(result)
 }
 
 pub async fn mongo_distinct_core(
@@ -514,12 +641,20 @@ pub async fn mongo_distinct_core(
 ) -> Result<MongoDocumentResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
-    match &pool {
+    let result = match &pool {
         PoolKind::MongoDb(client) => mongo_driver::distinct(client, database, collection, field, filter).await,
-        // The legacy agent protocol has no distinct method and no read that could stand in for it.
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support distinct".to_string()),
+        PoolKind::Agent(client) => {
+            let command = mongo_driver::distinct_command(collection, field, filter)?;
+            let response = agent_run_command_document(client, database, command, "distinct").await?;
+            mongo_driver::distinct_response_result(response)
+        }
         _ => Err("Not a MongoDB connection".to_string()),
+    }?;
+
+    if result.documents.is_empty() {
+        ensure_collection_exists_for_query(state, connection_id, database, collection).await?;
     }
+    Ok(result)
 }
 
 /// Read every index of a collection with its full MongoDB option set.
@@ -729,6 +864,25 @@ pub async fn mongo_insert_documents_core(
         PoolKind::Agent(client) => {
             let documents: serde_json::Value =
                 serde_json::from_str(docs_json).map_err(|error| format!("Invalid JSON: {error}"))?;
+            // A single-document insert()/insertOne() rides the per-document RPC
+            // the legacy agent already serves for grid row inserts (#11656);
+            // only bulk arrays need the MongoInsertDocuments capability.
+            if let Some(document) = documents.as_object() {
+                let doc_json = serde_json::to_string(document).map_err(|error| format!("Invalid JSON: {error}"))?;
+                let mut client = client.lock().await;
+                let result: serde_json::Value = client
+                    .mongo_insert_document(serde_json::json!({
+                        "database": database,
+                        "collection": collection,
+                        "doc_json": doc_json,
+                    }))
+                    .await?;
+                // The single-document RPC fails the whole call on rejection and
+                // reports the resolved _id on success (see the agent's
+                // insertDocument handler).
+                result.get("inserted_id").ok_or_else(|| "MongoDB Legacy Agent returned no inserted id".to_string())?;
+                return Ok(1);
+            }
             let documents = documents.as_array().ok_or_else(|| {
                 "MongoDB legacy agent does not support bulk insertMany/insertOne writes; insertMany requires an array"
                     .to_string()
@@ -983,7 +1137,12 @@ pub async fn mongo_find_one_and_update_core(
             mongo_driver::find_one_and_update(client, database, collection, filter_json, update_json, options_json)
                 .await
         }
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support findOneAndUpdate".to_string()),
+        PoolKind::Agent(client) => {
+            let command =
+                mongo_driver::find_one_and_update_command(collection, filter_json, update_json, options_json)?;
+            let response = agent_run_command_document(client, database, command, "findOneAndUpdate").await?;
+            mongo_driver::find_and_modify_response_result(&response)
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }
@@ -1011,7 +1170,12 @@ pub async fn mongo_find_one_and_replace_core(
             )
             .await
         }
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support findOneAndReplace".to_string()),
+        PoolKind::Agent(client) => {
+            let command =
+                mongo_driver::find_one_and_replace_command(collection, filter_json, replacement_json, options_json)?;
+            let response = agent_run_command_document(client, database, command, "findOneAndReplace").await?;
+            mongo_driver::find_and_modify_response_result(&response)
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }
@@ -1030,7 +1194,11 @@ pub async fn mongo_find_one_and_delete_core(
         PoolKind::MongoDb(client) => {
             mongo_driver::find_one_and_delete(client, database, collection, filter_json, options_json).await
         }
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support findOneAndDelete".to_string()),
+        PoolKind::Agent(client) => {
+            let command = mongo_driver::find_one_and_delete_command(collection, filter_json, options_json)?;
+            let response = agent_run_command_document(client, database, command, "findOneAndDelete").await?;
+            mongo_driver::find_and_modify_response_result(&response)
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }
@@ -1289,6 +1457,7 @@ fn query_result(columns: Vec<String>, rows: Vec<Vec<serde_json::Value>>, affecte
         affected_rows,
         execution_time_ms: 0,
         server_execute_time_us: None,
+        query_timings_ms: None,
         truncated: false,
         session_id: None,
         has_more: false,
@@ -1542,8 +1711,6 @@ mod tests {
     use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec};
     #[cfg(unix)]
     use crate::models::connection::ConnectionConfig;
-    #[cfg(unix)]
-    use crate::storage::Storage;
 
     #[cfg(unix)]
     async fn legacy_mongo_state(
@@ -1701,7 +1868,7 @@ for line in sys.stdin:
         .await
         .unwrap();
         client.try_optional_handshake("test").await.unwrap();
-        let storage = Storage::open(&directory.path().join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
             "id": "legacy",
@@ -1945,24 +2112,67 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mongo_insert_one_keeps_the_existing_legacy_agent_behavior() {
+    async fn mongo_insert_one_routes_single_document_to_the_per_document_rpc() {
+        // #11656: a shell insert()/insertOne() with one document used to be
+        // rejected by the legacy-agent bulk path; it rides the per-document
+        // RPC that grid row inserts already use, without the bulk capability.
         let document = r#"{"name":"Ada"}"#;
+        let (state, _directory) = legacy_mongo_state(
+            "insert_document",
+            serde_json::json!({
+                "database": "app",
+                "collection": "users",
+                "doc_json": document,
+            }),
+            serde_json::json!({ "inserted_id": "507f1f77bcf86cd799439011" }),
+        )
+        .await;
+
+        let affected = mongo_insert_documents_core(&state, "legacy", "app", "users", document).await.unwrap();
+
+        assert_eq!(affected, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mongo_insert_many_keeps_requiring_the_bulk_capability() {
+        let documents = r#"[{"name":"Ada"},{"name":"Grace"}]"#;
         let (state, _directory) = legacy_mongo_state_with_capabilities(
             "insert_documents",
             serde_json::json!({
                 "database": "app",
                 "collection": "users",
-                "docs_json": document,
+                "docs_json": documents,
+            }),
+            serde_json::json!({ "affected_rows": 2 }),
+            &[AgentCapability::MongoInsertDocuments.as_str()],
+        )
+        .await;
+
+        let affected = mongo_insert_documents_core(&state, "legacy", "app", "users", documents).await.unwrap();
+
+        assert_eq!(affected, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mongo_insert_many_still_rejects_non_object_documents() {
+        let (state, _directory) = legacy_mongo_state_with_capabilities(
+            "insert_documents",
+            serde_json::json!({
+                "database": "app",
+                "collection": "users",
+                "docs_json": r#"[{"name":"Ada"}]"#,
             }),
             serde_json::json!({ "affected_rows": 1 }),
             &[AgentCapability::MongoInsertDocuments.as_str()],
         )
         .await;
 
-        let error = mongo_insert_documents_core(&state, "legacy", "app", "users", document).await.unwrap_err();
+        let error =
+            mongo_insert_documents_core(&state, "legacy", "app", "users", r#"["not an object"]"#).await.unwrap_err();
 
-        assert!(error.contains("insertMany/insertOne"), "{error}");
-        assert!(!error.contains("unexpected MongoDB RPC"), "{error}");
+        assert!(error.contains("insertMany document"), "{error}");
     }
 
     #[cfg(unix)]

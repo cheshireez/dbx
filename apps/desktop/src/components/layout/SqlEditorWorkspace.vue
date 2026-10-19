@@ -15,7 +15,8 @@ import EditorGroup from "./EditorGroup.vue";
 import QueryResultSurface from "./QueryResultSurface.vue";
 import { createContentSurfaceEventForwarders } from "@/lib/tabs/contentSurfaceEvents";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps, StatementRange } from "./querySurfaces";
-import type { QueryTab } from "@/types/database";
+import type { QueryTab, TableInfoTab } from "@/types/database";
+import type { AiConversationBinding } from "@/lib/ai/aiConversationBinding";
 
 defineOptions({ inheritAttrs: false });
 
@@ -33,7 +34,6 @@ const props = defineProps<
 >();
 const emit = defineEmits<
   ContentAreaSurfaceEmits & {
-    "locate-tab": [tab: QueryTab];
     "toggle-zen-mode": [];
     "start-resize": [event: PointerEvent];
     "toggle-collapse": [];
@@ -50,6 +50,7 @@ const surfaceProps = computed(() => ({
   activeOutputView: props.activeOutputView,
   formatSqlRequest: props.formatSqlRequest,
   compressSqlRequest: props.compressSqlRequest,
+  keywordCaseRequest: props.keywordCaseRequest,
   selectedSql: props.selectedSql,
   cursorPos: props.cursorPos,
   blockDangerousRedisCommands: props.blockDangerousRedisCommands,
@@ -57,7 +58,7 @@ const surfaceProps = computed(() => ({
 }));
 const contentEmits = createContentSurfaceEventForwarders(emit);
 const editorGroupBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits }));
-const resultSurfaceBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits, activeTab: activeTab.value! }));
+const resultSurfaceBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits, activeTab: activeQueryTab.value! }));
 
 defineExpose({
   focusSearch: (target: Element | null = null) => {
@@ -72,7 +73,12 @@ defineExpose({
     const group = groupForElement(element) ?? activeEditorGroup();
     return group?.focusSearch(element) ?? false;
   },
+  focusWhere: () => activeEditorGroup()?.focusWhere() ?? false,
   openGoToColumn: () => activeEditorGroup()?.openGoToColumn() ?? false,
+  openConnectionPicker: () => activeEditorGroup()?.openConnectionPicker() ?? false,
+  openDatabasePicker: () => activeEditorGroup()?.openDatabasePicker() ?? false,
+  openSchemaPicker: () => activeEditorGroup()?.openSchemaPicker() ?? false,
+  openTableStructureEditor: (initialTab?: TableInfoTab) => activeEditorGroup()?.openTableStructureEditor?.(initialTab) ?? false,
   refreshData: (target: Element | null = null) => {
     const element = commandTargetElement(target);
     if (element?.closest("[data-shared-result-surface]")) {
@@ -107,8 +113,11 @@ defineExpose({
     const group = groupForElement(commandTargetElement(null));
     return group?.applyTableStructureChanges() ?? activeEditorGroup()?.applyTableStructureChanges() ?? Promise.resolve(false);
   },
-  insertRedisCommand: (command: string) => (groupForElement(commandTargetElement(null)) ?? activeEditorGroup())?.insertRedisCommand(command) ?? Promise.resolve(false),
-  executeRedisCommand: (command: string) => (groupForElement(commandTargetElement(null)) ?? activeEditorGroup())?.executeRedisCommand(command) ?? Promise.resolve(false),
+  // Redis's logical DB is part of the target, so a visible tab on another DB
+  // must be refused even when it shares the same connection.
+  insertRedisCommand: (command: string, target: AiConversationBinding) => (groupForElement(commandTargetElement(null)) ?? activeEditorGroup())?.insertRedisCommand(command, target) ?? Promise.resolve(false),
+  executeRedisCommand: (command: string, target: AiConversationBinding) => (groupForElement(commandTargetElement(null)) ?? activeEditorGroup())?.executeRedisCommand(command, target) ?? Promise.resolve(false),
+  isRedisConsoleReady: (target: AiConversationBinding) => (groupForElement(commandTargetElement(null)) ?? activeEditorGroup())?.isRedisConsoleReady(target) ?? false,
 });
 
 const { t } = useI18n();
@@ -135,9 +144,9 @@ function setTabBarTarget(groupId: string, element: unknown) {
   if (element instanceof HTMLElement) workspaceTabBarPortal.targets.set(groupId, element);
   else workspaceTabBarPortal.targets.delete(groupId);
 }
-const activeTab = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId));
-const showSharedResult = computed(() => activeTab.value?.mode === "query");
-const hasSharedOutput = computed(() => showSharedResult.value && hasQueryOutput(activeTab.value));
+const activeQueryTab = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId));
+const showSharedResult = computed(() => activeQueryTab.value?.mode === "query");
+const hasSharedOutput = computed(() => showSharedResult.value && hasQueryOutput(activeQueryTab.value));
 
 const SHARED_RESULT_PANE_MIN_SIZE = 12;
 const SHARED_RESULT_PANE_MAX_SIZE = 80;
@@ -146,9 +155,9 @@ const SHARED_RESULT_PANE_STORAGE_KEY = "dbx-shared-results-pane-size";
 const storedResultPaneSize = Number(safeLocalStorageGet(SHARED_RESULT_PANE_STORAGE_KEY));
 const resultPaneSize = ref(Number.isFinite(storedResultPaneSize) && storedResultPaneSize >= SHARED_RESULT_PANE_MIN_SIZE && storedResultPaneSize <= SHARED_RESULT_PANE_MAX_SIZE ? storedResultPaneSize : SHARED_RESULT_PANE_DEFAULT_SIZE);
 const showResultPane = computed({
-  get: () => activeTab.value?.uiState?.resultPaneOpen ?? true,
+  get: () => activeQueryTab.value?.uiState?.resultPaneOpen ?? true,
   set: (open: boolean) => {
-    const tab = activeTab.value;
+    const tab = activeQueryTab.value;
     if (tab?.mode === "query") queryStore.updateTabUiState(tab.id, { resultPaneOpen: open });
   },
 });
@@ -178,7 +187,7 @@ function toggleSharedResultsPane(): boolean {
 // behavior (see issue #6193): a collapsed shared pane comes back when the
 // active tab starts executing.
 watch(
-  () => [activeTab.value?.id, activeTab.value?.isExecuting, activeTab.value?.isExplaining] as const,
+  () => [activeQueryTab.value?.id, activeQueryTab.value?.isExecuting, activeQueryTab.value?.isExplaining] as const,
   ([, isExecuting, isExplaining]) => {
     if (isExecuting || isExplaining) showResultPane.value = true;
   },
@@ -318,7 +327,6 @@ function handleFocusErrorOffset(tabId: string, offset: number): boolean {
           v-bind="editorGroupBindings"
           @focus-group="queryStore.focusGroup($event)"
           @activate-tab="queryStore.activateTabInGroup(group.id, $event)"
-          @locate-tab="emit('locate-tab', $event)"
           @toggle-zen-mode="emit('toggle-zen-mode')"
           @start-resize="emit('start-resize', $event)"
           @toggle-collapse="emit('toggle-collapse')"
@@ -351,7 +359,6 @@ function handleFocusErrorOffset(tabId: string, offset: number): boolean {
                 v-bind="editorGroupBindings"
                 @focus-group="queryStore.focusGroup($event)"
                 @activate-tab="queryStore.activateTabInGroup(group.id, $event)"
-                @locate-tab="emit('locate-tab', $event)"
                 @toggle-zen-mode="emit('toggle-zen-mode')"
                 @start-resize="emit('start-resize', $event)"
                 @toggle-collapse="emit('toggle-collapse')"

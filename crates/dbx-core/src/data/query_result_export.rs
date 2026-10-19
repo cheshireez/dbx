@@ -11,17 +11,20 @@ use std::time::{Duration, Instant};
 
 use crate::connection::{AppState, PoolKind};
 use crate::csv_export::{
-    format_query_result_csv_with_quote_mode, format_tsv, push_query_result_csv_row_with_quote_mode, push_tsv_row,
-    CsvQuoteMode,
+    csv_null_literal, format_query_result_csv_with_options, format_tsv, push_query_result_csv_row_with_options,
+    push_tsv_row, CsvQuoteMode,
 };
+use crate::data_grid_sql::DataGridPrimaryKeyMode;
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{
-    build_export_insert_statements_excluding, is_export_cancelled, BuildExportInsertStatementsOptions, SqlInsertMode,
+    build_export_insert_statements_excluding, is_export_cancelled, sql_export_column_index,
+    sql_export_excluded_primary_keys, BuildExportInsertStatementsOptions, SqlExportProjection, SqlInsertMode,
 };
 use crate::models::connection::DatabaseType;
 use crate::query::{
-    await_stream_with_progress_timeout, canceled_error, close_query_session, execute_sql_statement_with_options,
-    operation_budget_for_pool_key, QueryExecutionOptions, StreamProgressClock, QUERY_CANCELED,
+    await_stream_with_progress_timeout, canceled_error, close_query_session,
+    execute_in_manual_transaction_with_options, execute_sql_statement_with_options, operation_budget_for_pool_key,
+    ManualTransactionExecutionOptions, QueryExecutionOptions, StreamProgressClock, QUERY_CANCELED,
 };
 use crate::query_result_sql::{
     build_query_pagination_execution_plan, has_top_level_top, top_level_top_row_count, QueryPagination,
@@ -87,6 +90,10 @@ pub struct QueryResultExportRequest {
     pub insert_mode: SqlInsertMode,
     #[serde(default)]
     pub csv_quote_mode: CsvQuoteMode,
+    /// CSV 里 NULL 写成什么。默认 `\N`；空字符串表示关闭该字面量，
+    /// 退回「NULL 写成空字段」的旧行为（此时 NULL 与空字符串在文件里无法区分）。
+    #[serde(default = "dbx_formats::csv_export::default_csv_null_literal")]
+    pub null_literal: String,
     #[serde(default)]
     pub include_sql_sheet: bool,
     pub page_size: usize,
@@ -100,6 +107,12 @@ pub struct QueryResultExportRequest {
     pub keyset_optimization_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_session_id: Option<String>,
+    /// Open manual transaction of the source query tab. When set, every page is
+    /// read through that transaction's connection so the export sees the same
+    /// uncommitted changes as the result grid; a separate session would only
+    /// see committed data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,22 +120,38 @@ pub struct QueryResultExportRequest {
     // -- new fields for SQL INSERT export --
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_table_name: Option<String>,
+    /// Explicit INSERT target schema; separate from `schema`, which scopes query execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_schema: Option<String>,
     /// Column type overrides for SQL INSERT export. Each entry may be `null`
     /// (meaning "infer from the query result") so the inner element is `Option`.
     /// Frontend sends these in original full-query column order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_column_types: Option<Vec<Option<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_columns: Option<Vec<crate::types::SqlExportColumnSelection>>,
+    /// Column EXTRA metadata (for example SQL Server/Dameng `identity`) for SQL
+    /// INSERT export, sent by the frontend from the result's table metadata.
+    /// Without it the exported INSERT writes identity values without
+    /// `SET IDENTITY_INSERT` and fails with SQL Server error 544 on replay.
+    /// Entries align with `export_column_types` (original full-query order).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_column_extras: Option<Vec<Option<String>>>,
     #[serde(default)]
     pub numeric_column_right_align: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_comments: Option<Vec<Option<String>>>,
+    /// Render `column_comments` as a second header row (names on row 1,
+    /// comments on row 2, data from row 3) instead of overriding headers.
+    #[serde(default)]
+    pub header_comment_rows: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_filter: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
-    /// 导出 SQL 时是否排除主键列（对应前端数据提取设置里的“排除主键”）。
+    /// SQL INSERT 导出使用的数据提取器主键模式。
     #[serde(default)]
-    pub exclude_primary_keys: bool,
+    pub primary_key_mode: DataGridPrimaryKeyMode,
     /// 结果集对应的原表主键列名。查询结果导出由前端从表元数据带过来；
     /// 没有表元数据（例如自由 SQL 查询）时为空，此时无法排除主键。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -236,7 +265,30 @@ fn query_sql_worksheets(request: &QueryResultExportRequest) -> Vec<XlsxWorksheet
         column_comments: Vec::new(),
         rows: split_excel_cell_text(&request.sql).into_iter().map(|sql| vec![Value::String(sql)]).collect(),
         numeric_column_right_align: false,
+        auto_filter: Some(false),
+        header_comment_rows: false,
     }]
+}
+
+fn resolve_export_column_types(
+    columns: &[String],
+    inferred_types: &[String],
+    overrides: Option<&[Option<String>]>,
+) -> Vec<String> {
+    let overrides = overrides.unwrap_or(&[]);
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, _col)| {
+            if let Some(Some(override_type)) = overrides.get(index) {
+                let trimmed = override_type.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+            inferred_types.get(index).map(|t| t.trim().to_string()).unwrap_or_default()
+        })
+        .collect()
 }
 
 fn start_query_result_xlsx_workbook<W: Write + Seek>(
@@ -247,16 +299,19 @@ fn start_query_result_xlsx_workbook<W: Write + Seek>(
 ) -> Result<StreamingXlsxWriter<W>, String> {
     let trailing_sheets = query_sql_worksheets(request);
     let column_comments: &[Option<String>] = request.column_comments.as_deref().unwrap_or(&[]);
+    let effective_column_types =
+        resolve_export_column_types(columns, column_types, request.export_column_types.as_deref());
     start_streaming_xlsx_workbook_with_options(
         writer,
         Some("Result"),
         columns,
-        column_types,
+        &effective_column_types,
         column_comments,
         &trailing_sheets,
         request.date_time_format.as_deref(),
         request.numeric_column_right_align,
         request.auto_filter.unwrap_or(true),
+        request.header_comment_rows,
     )
 }
 
@@ -289,19 +344,29 @@ fn stream_export_was_cancelled(error: &str, token_cancelled: bool, export_cancel
 /// Missing, `None`, or empty overrides infer only MySQL spatial types, which
 /// preserves the historical literal formatting of other database types.
 fn sql_insert_column_types(request: &QueryResultExportRequest, column_types: &[String]) -> Vec<Option<String>> {
+    resolve_sql_insert_column_types(
+        request.database_type,
+        column_types,
+        request.export_column_types.as_deref().unwrap_or_default(),
+    )
+}
+
+fn resolve_sql_insert_column_types(
+    database_type: DatabaseType,
+    column_types: &[String],
+    overrides: &[Option<String>],
+) -> Vec<Option<String>> {
     column_types
         .iter()
         .enumerate()
         .map(|(index, inferred)| {
-            request
-                .export_column_types
-                .as_ref()
-                .and_then(|overrides| overrides.get(index))
+            overrides
+                .get(index)
                 .and_then(|override_type| override_type.as_deref())
                 .filter(|override_type| !override_type.is_empty())
                 .map(str::to_string)
                 .or_else(|| {
-                    (request.database_type == DatabaseType::Mysql
+                    (database_type == DatabaseType::Mysql
                         && crate::database_export::is_mysql_spatial_export_type(inferred))
                     .then(|| inferred.clone())
                 })
@@ -324,11 +389,13 @@ struct SqlInsertWriter {
     insert_mode: SqlInsertMode,
     columns: Vec<String>,
     column_types: Vec<Option<String>>,
+    column_extras: Vec<Option<String>>,
     spatial_columns: Vec<SpatialColumn>,
     database_type: DatabaseType,
     schema: Option<String>,
     table_name: String,
     identifier_quote: Option<String>,
+    projection: Option<SqlExportProjection>,
     /// 生成 INSERT 时需要排除的列名，来自请求里的“不含主键”设置。
     exclude_columns: Vec<String>,
 }
@@ -412,12 +479,14 @@ impl SqlInsertWriter {
             insert_mode: request.insert_mode,
             columns: Vec::new(),
             column_types: Vec::new(),
+            column_extras: Vec::new(),
             spatial_columns: Vec::new(),
             database_type: request.database_type,
-            schema: request.schema.clone(),
+            schema: request.export_schema.clone(),
             table_name,
             identifier_quote: request.identifier_quote.clone(),
-            exclude_columns: if request.exclude_primary_keys { request.primary_keys.clone() } else { Vec::new() },
+            projection: None,
+            exclude_columns: Vec::new(),
         })
     }
 
@@ -430,15 +499,55 @@ impl SqlInsertWriter {
         result_column_types: &[String],
         spatial_columns: &[SpatialColumn],
         request: &QueryResultExportRequest,
-    ) {
-        self.column_types = sql_insert_column_types(request, result_column_types);
-        self.spatial_columns = spatial_columns.to_vec();
-        self.columns = columns;
+    ) -> Result<(), String> {
+        let projection = SqlExportProjection::resolve(&columns, request.selected_columns.as_deref())?;
+        self.column_types = if request.selected_columns.is_some() {
+            resolve_sql_insert_column_types(
+                request.database_type,
+                &projection.project(result_column_types),
+                &projection.project_request(request.export_column_types.as_deref().unwrap_or_default()),
+            )
+        } else {
+            sql_insert_column_types(request, result_column_types)
+        };
+        // Column extras come from the request and align with the result columns the
+        // same way `export_column_types` does; missing entries simply mean "unknown".
+        self.column_extras = projection.project_request(request.export_column_extras.as_deref().unwrap_or_default());
+        self.spatial_columns = projection.project_spatial_columns(spatial_columns);
+        self.columns = projection.project(&columns);
+        let primary_keys = request
+            .primary_keys
+            .iter()
+            .filter_map(|key| sql_export_column_index(Some(request.database_type), key, &columns))
+            .map(|index| columns[index].clone())
+            .collect::<Vec<_>>();
+        self.exclude_columns = sql_export_excluded_primary_keys(
+            Some(request.database_type),
+            request.primary_key_mode,
+            &projection.project_excluded_columns(&columns, &primary_keys),
+            &self.columns,
+            &self.column_extras,
+        );
+        self.projection = request.selected_columns.as_ref().map(|_| projection);
+        Ok(())
     }
 
     fn write_row(&mut self, row: Vec<Value>, spatial_values: Option<Vec<Option<u32>>>) -> Result<(), String> {
+        let row = match &self.projection {
+            Some(projection) => projection.project_owned(row),
+            None => row,
+        };
+        let spatial_values = spatial_values.unwrap_or_default();
+        let spatial_values = if spatial_values.is_empty() {
+            spatial_values
+        } else {
+            match &self.projection {
+                Some(projection) => projection.project_owned(spatial_values),
+                None => spatial_values,
+            }
+        };
         self.pending_rows.push(row);
-        self.pending_spatial_values.push(spatial_values.unwrap_or_default());
+        self.pending_spatial_values.push(spatial_values);
         if self.insert_mode.flush_each_row() || self.pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
             self.flush_batch()?;
         }
@@ -458,11 +567,12 @@ impl SqlInsertWriter {
                 qualified_table_name: None,
                 columns: self.columns.clone(),
                 column_types: self.column_types.clone(),
-                column_extras: Vec::new(),
+                column_extras: self.column_extras.clone(),
                 spatial_columns: self.spatial_columns.clone(),
                 spatial_values: mem::take(&mut self.pending_spatial_values),
                 rows: mem::take(&mut self.pending_rows),
                 batch_size: Some(self.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
+                preserve_original_language: false,
             },
             &self.exclude_columns,
         )?;
@@ -492,9 +602,14 @@ fn effective_row_limit(request: &QueryResultExportRequest) -> Option<usize> {
     request.row_limit
 }
 
-fn format_text_export_header(format: &str, columns: &[String], csv_quote_mode: CsvQuoteMode) -> String {
+fn format_text_export_header(
+    format: &str,
+    columns: &[String],
+    csv_quote_mode: CsvQuoteMode,
+    null_literal: Option<&str>,
+) -> String {
     let content = if format == "csv" {
-        format_query_result_csv_with_quote_mode(columns, &[], csv_quote_mode)
+        format_query_result_csv_with_options(columns, &[], csv_quote_mode, null_literal)
     } else {
         format_tsv(columns, &[])
     };
@@ -507,13 +622,14 @@ fn write_text_export_row<W: Write>(
     row: &[Value],
     buffer: &mut String,
     csv_quote_mode: CsvQuoteMode,
+    null_literal: Option<&str>,
 ) -> Result<(), String> {
     buffer.clear();
     buffer.push('\n');
     if format == "csv" {
-        push_query_result_csv_row_with_quote_mode(buffer, row, csv_quote_mode);
+        push_query_result_csv_row_with_options(buffer, row, csv_quote_mode, null_literal);
     } else {
-        push_tsv_row(buffer, row);
+        push_tsv_row(buffer, row, null_literal);
     }
     file.write_all(buffer.as_bytes()).map_err(|error| format!("Failed to write export rows: {error}"))
 }
@@ -524,14 +640,15 @@ fn write_text_export_rows<W: Write>(
     rows: &[Vec<Value>],
     buffer: &mut String,
     csv_quote_mode: CsvQuoteMode,
+    null_literal: Option<&str>,
 ) -> Result<(), String> {
     buffer.clear();
     for row in rows {
         buffer.push('\n');
         if format == "csv" {
-            push_query_result_csv_row_with_quote_mode(buffer, row, csv_quote_mode);
+            push_query_result_csv_row_with_options(buffer, row, csv_quote_mode, null_literal);
         } else {
-            push_tsv_row(buffer, row);
+            push_tsv_row(buffer, row, null_literal);
         }
     }
     file.write_all(buffer.as_bytes()).map_err(|error| format!("Failed to write export rows: {error}"))
@@ -578,6 +695,7 @@ fn supports_streaming_offset_pagination(request: &QueryResultExportRequest, page
         pagination: QueryPagination { limit: page_size, offset: 0, session_id: None },
         use_agent_cursor: false,
         first_page_uses_actual_sql: true,
+        execution_hint: None,
     });
     let second_page = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
         sql: request.sql.clone(),
@@ -586,6 +704,7 @@ fn supports_streaming_offset_pagination(request: &QueryResultExportRequest, page
         pagination: QueryPagination { limit: page_size, offset: page_size, session_id: None },
         use_agent_cursor: false,
         first_page_uses_actual_sql: true,
+        execution_hint: None,
     });
 
     let (Some(first_sql), Some(second_sql)) = (first_page.page_sql.as_deref(), second_page.page_sql.as_deref()) else {
@@ -601,6 +720,7 @@ fn streaming_pagination_preflight_error(
     page_size: usize,
     has_keyset_plan: bool,
     has_single_execution_bound: bool,
+    use_agent_cursor: bool,
 ) -> Option<&'static str> {
     if has_keyset_plan || supports_streaming_offset_pagination(request, page_size) || has_single_execution_bound {
         return None;
@@ -608,7 +728,7 @@ fn streaming_pagination_preflight_error(
     if request.database_type == DatabaseType::Highgo {
         return Some(HIGHGO_STREAMING_PAGINATION_UNSUPPORTED_ERROR);
     }
-    (!request.use_agent_cursor).then_some(STREAMING_PAGINATION_UNSUPPORTED_ERROR)
+    (!use_agent_cursor).then_some(STREAMING_PAGINATION_UNSUPPORTED_ERROR)
 }
 
 /// Enforceable in-memory row bound for a single-execution export, or `None`
@@ -635,7 +755,20 @@ fn single_execution_row_bound(request: &QueryResultExportRequest) -> Option<usiz
 /// page payload, so later pages may reorder, add, or drop columns; values must
 /// follow their column name instead of their position in the page.
 fn export_column_remap(page_columns: &[String], header_columns: &[String]) -> Vec<Option<usize>> {
-    header_columns.iter().map(|column| page_columns.iter().position(|page_column| page_column == column)).collect()
+    let mut occurrences = std::collections::HashMap::<&str, usize>::new();
+    let mut indexes_by_name = std::collections::HashMap::<&str, Vec<usize>>::new();
+    for (index, name) in page_columns.iter().enumerate() {
+        indexes_by_name.entry(name.as_str()).or_default().push(index);
+    }
+    header_columns
+        .iter()
+        .map(|column| {
+            let occurrence = occurrences.entry(column.as_str()).or_default();
+            let index = indexes_by_name.get(column.as_str()).and_then(|indexes| indexes.get(*occurrence)).copied();
+            *occurrence += 1;
+            index
+        })
+        .collect()
 }
 
 /// Reorders one page row (or a page-level cell list such as column types) into
@@ -831,24 +964,34 @@ async fn export_query_result_core_inner(
 
     on_progress(progress(request, 0, ExportStatus::Running, None));
 
-    if try_export_postgres_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
-        return Ok(());
-    }
+    // The streaming fast paths below check out their own pooled connection, which
+    // cannot see an open manual transaction. Inside a transaction the export pages
+    // through the transaction's connection instead, the same way the result grid
+    // pages, and result-session cursors are not opened there.
+    let txn_session_id = request.txn_session_id.as_deref().map(str::trim).filter(|id| !id.is_empty());
+    let use_agent_cursor = request.use_agent_cursor && txn_session_id.is_none();
 
-    if try_export_sqlserver_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
-        return Ok(());
-    }
+    if txn_session_id.is_none() {
+        if try_export_postgres_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
+            return Ok(());
+        }
 
-    // MySQL does not guarantee a stable row order for independent LIMIT/OFFSET
-    // executions without ORDER BY, so query-result export must stream one run.
-    if try_export_mysql_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
-        return Ok(());
-    }
+        if try_export_sqlserver_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
+            return Ok(());
+        }
 
-    // ClickHouse HTTP pagination is unsafe for unsorted result sets; stream one
-    // response so large exports preserve the server's single execution order.
-    if try_export_clickhouse_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
-        return Ok(());
+        // MySQL does not guarantee a stable row order for independent LIMIT/OFFSET
+        // executions without ORDER BY, so query-result export must stream one run.
+        if try_export_mysql_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await? {
+            return Ok(());
+        }
+
+        // ClickHouse HTTP pagination is unsafe for unsorted result sets; stream one
+        // response so large exports preserve the server's single execution order.
+        if try_export_clickhouse_query_result_stream(state, request, &format, cancel_token.clone(), on_progress).await?
+        {
+            return Ok(());
+        }
     }
 
     let mut text_file = if format == "csv" || format == "txt" {
@@ -878,6 +1021,7 @@ async fn export_query_result_core_inner(
         page_size,
         keyset_plan.is_some(),
         single_execution_bound.is_some(),
+        use_agent_cursor,
     ) {
         return Err(error.to_string());
     }
@@ -920,9 +1064,13 @@ async fn export_query_result_core_inner(
                     query_base_sql: request.query_base_sql.clone(),
                     database_type: Some(request.database_type),
                     pagination: QueryPagination { limit: this_page, offset, session_id: session_id.clone() },
-                    use_agent_cursor: request.use_agent_cursor,
+                    use_agent_cursor,
                     first_page_uses_actual_sql: true,
+                    execution_hint: None,
                 });
+                if let Some(error) = plan.pagination_error {
+                    return Err(error);
+                }
                 let Some(plan_limit) = plan.page_limit else {
                     return Err("Failed to build query pagination plan for export".to_string());
                 };
@@ -953,17 +1101,41 @@ async fn export_query_result_core_inner(
             }
         };
 
-        let mut result = match execute_sql_statement_with_options(
-            state,
-            &request.connection_id,
-            &request.database,
-            &sql_to_execute,
-            request.schema.as_deref(),
-            cancel_token.clone(),
-            options,
-        )
-        .await
-        {
+        let page_result = if let Some(txn_session_id) = txn_session_id {
+            execute_in_manual_transaction_with_options(
+                state,
+                txn_session_id,
+                &sql_to_execute,
+                &request.database,
+                request.schema.as_deref(),
+                ManualTransactionExecutionOptions {
+                    max_rows: Some(plan_limit),
+                    execution_id: request.execution_id.clone(),
+                    timeout_secs: request.timeout_secs,
+                    ..Default::default()
+                },
+            )
+            .await
+            .and_then(|results| {
+                results
+                    .into_iter()
+                    .next()
+                    .map(|result| result.result)
+                    .ok_or_else(|| "Manual transaction export returned no result".to_string())
+            })
+        } else {
+            execute_sql_statement_with_options(
+                state,
+                &request.connection_id,
+                &request.database,
+                &sql_to_execute,
+                request.schema.as_deref(),
+                cancel_token.clone(),
+                options,
+            )
+            .await
+        };
+        let mut result = match page_result {
             Ok(result) => result,
             Err(error) => {
                 if error == QUERY_CANCELED
@@ -996,9 +1168,10 @@ async fn export_query_result_core_inner(
 
         let page_column_types = if columns.is_empty() {
             columns = result.columns.clone();
-            column_types = result.column_types.clone();
+            column_types =
+                resolve_export_column_types(&columns, &result.column_types, request.export_column_types.as_deref());
             if let Some(writer) = sql_writer.as_mut() {
-                writer.set_columns(columns.clone(), &column_types, &result.spatial_columns, request);
+                writer.set_columns(columns.clone(), &column_types, &result.spatial_columns, request)?;
             }
             column_types.clone()
         } else if result.columns == columns {
@@ -1008,7 +1181,9 @@ async fn export_query_result_core_inner(
             // must be aligned by column name; writing page rows positionally
             // dropped/duplicated values into the wrong columns.
             let remap = export_column_remap(&result.columns, &columns);
-            let page_column_types = realign_page_cells(&remap, result.column_types.clone());
+            let page_inferred = realign_page_cells(&remap, result.column_types.clone());
+            let page_column_types =
+                resolve_export_column_types(&columns, &page_inferred, request.export_column_types.as_deref());
             result.rows = realign_page_rows(&remap, mem::take(&mut result.rows));
             if !result.spatial_values.is_empty() {
                 result.spatial_values = realign_page_rows(&remap, mem::take(&mut result.spatial_values));
@@ -1020,6 +1195,11 @@ async fn export_query_result_core_inner(
             result.rows.truncate(this_page);
         }
         let row_count = result.rows.len();
+        if request.database_type == DatabaseType::Nebula {
+            crate::text_export::normalize_nebula_export_rows(&mut result.rows);
+        } else if request.database_type == DatabaseType::Neo4j {
+            crate::text_export::normalize_neo4j_export_rows(&mut result.rows);
+        }
         let formatted_rows = crate::temporal_format::format_temporal_export_rows_with_string_types_cow(
             &result.rows,
             &page_column_types,
@@ -1029,7 +1209,12 @@ async fn export_query_result_core_inner(
         if format == "csv" || format == "txt" {
             if let Some(file) = text_file.as_mut() {
                 if !wrote_text_header {
-                    let header = format_text_export_header(&format, &columns, request.csv_quote_mode);
+                    let header = format_text_export_header(
+                        &format,
+                        &columns,
+                        request.csv_quote_mode,
+                        csv_null_literal(&request.null_literal),
+                    );
                     file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
                     if row_count > 0 {
                         write_text_export_rows(
@@ -1038,6 +1223,7 @@ async fn export_query_result_core_inner(
                             formatted_rows.as_ref(),
                             &mut text_buffer,
                             request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
                         )?;
                     }
                     wrote_text_header = true;
@@ -1048,6 +1234,7 @@ async fn export_query_result_core_inner(
                         formatted_rows.as_ref(),
                         &mut text_buffer,
                         request.csv_quote_mode,
+                        csv_null_literal(&request.null_literal),
                     )?;
                 }
             }
@@ -1120,7 +1307,12 @@ async fn export_query_result_core_inner(
 
     if format == "csv" || format == "txt" {
         if !wrote_text_header {
-            let header = format_text_export_header(&format, &columns, request.csv_quote_mode);
+            let header = format_text_export_header(
+                &format,
+                &columns,
+                request.csv_quote_mode,
+                csv_null_literal(&request.null_literal),
+            );
             if let Some(file) = text_file.as_mut() {
                 file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
             }
@@ -1235,9 +1427,14 @@ async fn try_export_postgres_query_result_stream(
                     columns = stream_columns;
                     temporal_column_types = column_types.clone();
                     if let Some(writer) = sql_writer.as_mut() {
-                        writer.set_columns(columns.clone(), &column_types, &[], request);
+                        writer.set_columns(columns.clone(), &column_types, &[], request)?;
                     } else if let Some(file) = text_file.as_mut() {
-                        let header = format_text_export_header(format, &columns, request.csv_quote_mode);
+                        let header = format_text_export_header(
+                            format,
+                            &columns,
+                            request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
+                        );
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
                     } else if json_writer.is_none() {
                         let xlsx_file =
@@ -1265,6 +1462,7 @@ async fn try_export_postgres_query_result_stream(
                             formatted.as_ref(),
                             &mut text_buffer,
                             request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
                         )?;
                     } else if let Some(writer) = json_writer.as_mut() {
                         writer.write_row(&columns, formatted.as_ref())?;
@@ -1481,9 +1679,14 @@ async fn try_export_mysql_query_result_stream(
                     columns = stream_columns;
                     temporal_column_types = column_types.clone();
                     if let Some(writer) = sql_writer.as_mut() {
-                        writer.set_columns(columns.clone(), &column_types, &[], request);
+                        writer.set_columns(columns.clone(), &column_types, &[], request)?;
                     } else if let Some(file) = text_file.as_mut() {
-                        let header = format_text_export_header(format, &columns, request.csv_quote_mode);
+                        let header = format_text_export_header(
+                            format,
+                            &columns,
+                            request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
+                        );
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
                     } else if json_writer.is_none() {
                         let xlsx_file =
@@ -1511,6 +1714,7 @@ async fn try_export_mysql_query_result_stream(
                             formatted.as_ref(),
                             &mut text_buffer,
                             request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
                         )?;
                     } else if let Some(writer) = json_writer.as_mut() {
                         writer.write_row(&columns, formatted.as_ref())?;
@@ -1706,9 +1910,14 @@ async fn try_export_clickhouse_query_result_stream(
                     columns = stream_columns;
                     temporal_column_types = column_types.clone();
                     if let Some(writer) = sql_writer.as_mut() {
-                        writer.set_columns(columns.clone(), &column_types, &[], request);
+                        writer.set_columns(columns.clone(), &column_types, &[], request)?;
                     } else if let Some(file) = text_file.as_mut() {
-                        let header = format_text_export_header(format, &columns, request.csv_quote_mode);
+                        let header = format_text_export_header(
+                            format,
+                            &columns,
+                            request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
+                        );
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
                     } else if json_writer.is_none() {
                         let xlsx_file =
@@ -1736,6 +1945,7 @@ async fn try_export_clickhouse_query_result_stream(
                             formatted.as_ref(),
                             &mut text_buffer,
                             request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
                         )?;
                     } else if let Some(writer) = json_writer.as_mut() {
                         writer.write_row(&columns, formatted.as_ref())?;
@@ -1900,9 +2110,14 @@ async fn try_export_sqlserver_query_result_stream(
                     columns = stream_columns.to_vec();
                     temporal_column_types = column_types.to_vec();
                     if let Some(writer) = sql_writer.as_mut() {
-                        writer.set_columns(columns.clone(), &temporal_column_types, &[], request);
+                        writer.set_columns(columns.clone(), &temporal_column_types, &[], request)?;
                     } else if let Some(file) = text_file.as_mut() {
-                        let header = format_text_export_header(format, &columns, request.csv_quote_mode);
+                        let header = format_text_export_header(
+                            format,
+                            &columns,
+                            request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
+                        );
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
                     } else if json_writer.is_none() {
                         let xlsx_file =
@@ -1926,6 +2141,7 @@ async fn try_export_sqlserver_query_result_stream(
                             formatted.as_ref(),
                             &mut text_buffer,
                             request.csv_quote_mode,
+                            csv_null_literal(&request.null_literal),
                         )?;
                     } else if let Some(writer) = json_writer.as_mut() {
                         writer.write_row(&columns, formatted.as_ref())?;
@@ -2016,6 +2232,54 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn query_sql_export_primary_key_modes_distinguish_generated_and_manual_keys() {
+        let keys = vec!["id".to_string(), "stat_date".to_string()];
+        let columns = vec!["id".to_string(), "stat_date".to_string()];
+        let extras = vec![Some("identity".to_string()), None];
+
+        assert_eq!(
+            sql_export_excluded_primary_keys(
+                Some(DatabaseType::Postgres),
+                DataGridPrimaryKeyMode::ExcludeGenerated,
+                &keys,
+                &columns,
+                &extras,
+            ),
+            vec!["id"]
+        );
+        assert_eq!(
+            sql_export_excluded_primary_keys(
+                Some(DatabaseType::Postgres),
+                DataGridPrimaryKeyMode::ExcludeAll,
+                &keys,
+                &columns,
+                &extras,
+            ),
+            keys
+        );
+        assert!(sql_export_excluded_primary_keys(
+            Some(DatabaseType::Postgres),
+            DataGridPrimaryKeyMode::Include,
+            &keys,
+            &columns,
+            &extras
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn query_generated_key_export_matches_case_distinct_column_names_exactly() {
+        assert!(sql_export_excluded_primary_keys(
+            Some(DatabaseType::Postgres),
+            DataGridPrimaryKeyMode::ExcludeGenerated,
+            &["id".to_string()],
+            &["ID".to_string(), "id".to_string()],
+            &[Some("identity".to_string()), None],
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn export_column_remap_follows_column_names_across_pages() {
         // Elasticsearch-style page drift: the second page reports `beta` where the
         // header has `alpha`, so the `alpha` cell must be filled with NULL instead
@@ -2091,8 +2355,102 @@ mod tests {
         assert!(!stream_export_was_cancelled("network failure", false, false));
     }
 
+    fn sqlserver_identity_export_request(
+        file_path: &std::path::Path,
+        export_column_extras: Option<Vec<Option<String>>>,
+    ) -> QueryResultExportRequest {
+        QueryResultExportRequest {
+            export_id: "export-identity".to_string(),
+            connection_id: "conn-1".to_string(),
+            database: "dbx_test".to_string(),
+            schema: Some("dbo".to_string()),
+            catalog: None,
+            sql: "SELECT * FROM [dbo].[gen_table]".to_string(),
+            query_base_sql: "SELECT * FROM [dbo].[gen_table]".to_string(),
+            setup_sql: Vec::new(),
+            database_type: DatabaseType::SqlServer,
+            use_agent_cursor: false,
+            file_path: file_path.to_string_lossy().to_string(),
+            format: "sql".to_string(),
+            include_sql_sheet: false,
+            page_size: 1000,
+            row_limit: None,
+            total_rows: None,
+            timeout_secs: None,
+            keyset_optimization_enabled: false,
+            client_session_id: None,
+            txn_session_id: None,
+            execution_id: None,
+            date_time_format: None,
+            export_table_name: Some("gen_table".to_string()),
+            export_schema: Some("dbo".to_string()),
+            export_column_types: Some(vec![Some("int".to_string()), Some("nvarchar(200)".to_string())]),
+            selected_columns: None,
+            export_column_extras,
+            numeric_column_right_align: false,
+            column_comments: None,
+            auto_filter: None,
+            header_comment_rows: false,
+            identifier_quote: None,
+            insert_mode: SqlInsertMode::Batch,
+            csv_quote_mode: Default::default(),
+            null_literal: String::new(),
+            primary_key_mode: DataGridPrimaryKeyMode::Include,
+            primary_keys: Vec::new(),
+        }
+    }
+
     #[test]
-    fn sql_insert_writer_omits_excluded_primary_key_columns() {
+    fn sql_insert_writer_wraps_sqlserver_identity_columns_with_identity_insert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("gen_table.sql");
+        let request =
+            sqlserver_identity_export_request(&file_path, Some(vec![Some("identity(1,1)".to_string()), None]));
+
+        let mut writer = SqlInsertWriter::create(&request).expect("create sql insert writer");
+        writer
+            .set_columns(
+                vec!["table_id".to_string(), "table_name".to_string()],
+                &["int".to_string(), "nvarchar(200)".to_string()],
+                &[],
+                &request,
+            )
+            .expect("set SQL export columns");
+        writer.write_row(vec![json!(23), json!("t_destype")], None).expect("write export row");
+        writer.finish().expect("finish export");
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read sql export"),
+            "SET IDENTITY_INSERT [dbo].[gen_table] ON;\nINSERT INTO [dbo].[gen_table] ([table_id], [table_name]) VALUES (23, N't_destype');\nSET IDENTITY_INSERT [dbo].[gen_table] OFF;\n"
+        );
+    }
+
+    #[test]
+    fn sql_insert_writer_skips_identity_wrapper_without_column_extras() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("gen_table.sql");
+        let request = sqlserver_identity_export_request(&file_path, None);
+
+        let mut writer = SqlInsertWriter::create(&request).expect("create sql insert writer");
+        writer
+            .set_columns(
+                vec!["table_id".to_string(), "table_name".to_string()],
+                &["int".to_string(), "nvarchar(200)".to_string()],
+                &[],
+                &request,
+            )
+            .expect("set SQL export columns");
+        writer.write_row(vec![json!(23), json!("t_destype")], None).expect("write export row");
+        writer.finish().expect("finish export");
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read sql export"),
+            "INSERT INTO [dbo].[gen_table] ([table_id], [table_name]) VALUES (23, N't_destype');\n"
+        );
+    }
+
+    #[test]
+    fn sql_insert_writer_excludes_all_primary_keys_in_all_keys_mode() {
         let dir = tempfile::tempdir().expect("temp dir");
         let file_path = dir.path().join("users.sql");
         let request = QueryResultExportRequest {
@@ -2115,33 +2473,106 @@ mod tests {
             timeout_secs: None,
             keyset_optimization_enabled: false,
             client_session_id: None,
+            txn_session_id: None,
             execution_id: None,
             date_time_format: None,
             export_table_name: Some("users".to_string()),
+            export_schema: Some("public".to_string()),
             export_column_types: None,
+            selected_columns: None,
+            export_column_extras: None,
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            header_comment_rows: false,
             identifier_quote: None,
             insert_mode: Default::default(),
             csv_quote_mode: Default::default(),
-            exclude_primary_keys: true,
+            null_literal: String::new(),
+            primary_key_mode: DataGridPrimaryKeyMode::ExcludeAll,
             primary_keys: vec!["id".to_string()],
         };
 
         let mut writer = SqlInsertWriter::create(&request).expect("create sql insert writer");
-        writer.set_columns(
-            vec!["id".to_string(), "name".to_string()],
-            &["integer".to_string(), "text".to_string()],
-            &[],
-            &request,
-        );
+        writer
+            .set_columns(
+                vec!["id".to_string(), "name".to_string()],
+                &["integer".to_string(), "text".to_string()],
+                &[],
+                &request,
+            )
+            .expect("set SQL export columns");
         writer.write_row(vec![json!(1), json!("Ada")], None).expect("write export row");
         writer.finish().expect("finish export");
 
         assert_eq!(
             std::fs::read_to_string(&file_path).expect("read sql export"),
             "INSERT INTO \"public\".\"users\" (\"name\") VALUES ('Ada');\n"
+        );
+    }
+
+    #[test]
+    fn sql_insert_writer_keeps_projected_case_distinct_non_primary_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("users.sql");
+        let mut request = sqlserver_identity_export_request(&file_path, None);
+        request.database_type = DatabaseType::Postgres;
+        request.export_schema = Some("public".into());
+        request.export_table_name = Some("users".into());
+        request.export_column_types = None;
+        request.primary_keys = vec!["id".into()];
+        request.primary_key_mode = DataGridPrimaryKeyMode::ExcludeAll;
+        request.selected_columns = Some(vec![
+            crate::types::SqlExportColumnSelection { source_index: 0, name: "ID".into(), name_occurrence: 0 },
+            crate::types::SqlExportColumnSelection { source_index: 2, name: "name".into(), name_occurrence: 0 },
+        ]);
+
+        let mut writer = SqlInsertWriter::create(&request).expect("create SQL writer");
+        writer
+            .set_columns(
+                vec!["ID".into(), "id".into(), "name".into()],
+                &["integer".into(), "integer".into(), "text".into()],
+                &[],
+                &request,
+            )
+            .expect("set SQL export columns");
+        writer.write_row(vec![json!(91), json!(1), json!("Ada")], None).expect("write row");
+        writer.finish().expect("finish export");
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read SQL export"),
+            "INSERT INTO \"public\".\"users\" (\"ID\", \"name\") VALUES (91, 'Ada');\n"
+        );
+    }
+
+    #[test]
+    fn sql_insert_writer_keeps_manual_key_with_case_distinct_identity_metadata() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("users.sql");
+        let mut request =
+            sqlserver_identity_export_request(&file_path, Some(vec![Some("identity".into()), None, None]));
+        request.database_type = DatabaseType::Postgres;
+        request.export_schema = Some("public".into());
+        request.export_table_name = Some("users".into());
+        request.export_column_types = None;
+        request.primary_keys = vec!["id".into()];
+        request.primary_key_mode = DataGridPrimaryKeyMode::ExcludeGenerated;
+
+        let mut writer = SqlInsertWriter::create(&request).expect("create SQL writer");
+        writer
+            .set_columns(
+                vec!["ID".into(), "id".into(), "name".into()],
+                &["integer".into(), "integer".into(), "text".into()],
+                &[],
+                &request,
+            )
+            .expect("set SQL export columns");
+        writer.write_row(vec![json!(91), json!(1), json!("Ada")], None).expect("write row");
+        writer.finish().expect("finish export");
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read SQL export"),
+            "INSERT INTO \"public\".\"users\" (\"ID\", \"id\", \"name\") VALUES (91, 1, 'Ada');\n"
         );
     }
 
@@ -2196,18 +2627,47 @@ mod tests {
             timeout_secs: None,
             keyset_optimization_enabled: true,
             client_session_id: None,
+            txn_session_id: None,
             execution_id: None,
             date_time_format: None,
             csv_quote_mode: CsvQuoteMode::All,
+            null_literal: String::new(),
             export_table_name: None,
+            export_schema: None,
             export_column_types: None,
+            selected_columns: None,
+            export_column_extras: None,
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            header_comment_rows: false,
             identifier_quote: None,
-            exclude_primary_keys: false,
+            primary_key_mode: DataGridPrimaryKeyMode::Include,
             primary_keys: Vec::new(),
         }
+    }
+
+    #[test]
+    fn oracle_sql_insert_uses_export_schema_not_query_execution_schema() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let destination = dir.path().join("users.sql");
+        let mut req = request("sql", None, None);
+        req.database_type = DatabaseType::Oracle;
+        req.file_path = destination.to_string_lossy().into_owned();
+        req.schema = Some("CURRENT_USER".to_string());
+        req.export_table_name = Some("USERS".to_string());
+        req.export_schema = Some("APP_OWNER".to_string());
+
+        let mut writer = SqlInsertWriter::create(&req).expect("create SQL writer");
+        assert_eq!(writer.schema.as_deref(), Some("APP_OWNER"));
+        writer.set_columns(vec!["ID".to_string()], &["NUMBER".to_string()], &[], &req).expect("set SQL export columns");
+        writer.write_row(vec![serde_json::json!(1)], None).expect("write export row");
+        writer.finish().expect("finish export");
+
+        assert_eq!(
+            std::fs::read_to_string(destination).expect("read SQL export"),
+            "INSERT INTO \"APP_OWNER\".\"USERS\" (\"ID\") VALUES (1);\n"
+        );
     }
 
     fn rendered_sql_insert_output(mode: SqlInsertMode) -> String {
@@ -2220,12 +2680,14 @@ mod tests {
         req.insert_mode = mode;
 
         let mut writer = SqlInsertWriter::create(&req).expect("create SQL writer");
-        writer.set_columns(
-            vec!["id".to_string(), "name".to_string()],
-            &["int".to_string(), "text".to_string()],
-            &[],
-            &req,
-        );
+        writer
+            .set_columns(
+                vec!["id".to_string(), "name".to_string()],
+                &["int".to_string(), "text".to_string()],
+                &[],
+                &req,
+            )
+            .expect("set SQL export columns");
         writer.write_row(vec![serde_json::json!(1), serde_json::json!("Ada")], None).expect("write first row");
         writer.write_row(vec![serde_json::json!(2), serde_json::json!("Lin")], None).expect("write second row");
         writer.finish().expect("finish SQL writer");
@@ -2243,11 +2705,111 @@ mod tests {
     }
 
     #[test]
+    fn sql_export_column_selection_is_optional_and_round_trips() {
+        let mut serialized = serde_json::to_value(request("sql", None, None)).unwrap();
+        serialized.as_object_mut().unwrap().remove("selectedColumns");
+        let mut decoded: QueryResultExportRequest = serde_json::from_value(serialized).unwrap();
+        assert!(decoded.selected_columns.is_none());
+        decoded.selected_columns = Some(vec![crate::types::SqlExportColumnSelection {
+            source_index: 2,
+            name: "id".into(),
+            name_occurrence: 1,
+        }]);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["selectedColumns"], json!([{ "sourceIndex": 2, "name": "id", "nameOccurrence": 1 }]));
+        let round_trip: QueryResultExportRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(round_trip.selected_columns.unwrap()[0].name_occurrence, 1);
+    }
+
+    #[test]
+    fn sql_insert_writer_projects_duplicate_columns_and_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("selected.sql");
+        let mut request = request("sql", None, None);
+        request.file_path = destination.to_string_lossy().into_owned();
+        request.export_column_types = Some(vec![Some("int".into()), Some("text".into()), Some("bigint".into())]);
+        request.selected_columns = Some(vec![crate::types::SqlExportColumnSelection {
+            source_index: 2,
+            name: "id".into(),
+            name_occurrence: 1,
+        }]);
+        let mut writer = SqlInsertWriter::create(&request).unwrap();
+        writer
+            .set_columns(
+                vec!["id".into(), "name".into(), "id".into()],
+                &["int".into(), "text".into(), "bigint".into()],
+                &[],
+                &request,
+            )
+            .unwrap();
+        assert_eq!(writer.column_types, vec![Some("bigint".into())]);
+        writer.write_row(vec![json!(1), json!("Ada"), json!(20)], None).unwrap();
+        writer.write_row(vec![json!(2), json!("Lin"), Value::Null], None).unwrap();
+        writer.finish().unwrap();
+        let output = std::fs::read_to_string(destination).unwrap();
+        assert!(output.contains("(\"id\") VALUES\n(20),\n(NULL);"), "{output}");
+        assert!(!output.contains("name"));
+    }
+
+    #[test]
+    fn sql_insert_writer_aligns_request_types_and_identity_after_header_reorder() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("identity.sql");
+        let mut request =
+            sqlserver_identity_export_request(&destination, Some(vec![Some("identity(1,1)".into()), None]));
+        request.selected_columns = Some(vec![crate::types::SqlExportColumnSelection {
+            source_index: 0,
+            name: "table_id".into(),
+            name_occurrence: 0,
+        }]);
+        let mut writer = SqlInsertWriter::create(&request).unwrap();
+        writer
+            .set_columns(
+                vec!["table_name".into(), "table_id".into()],
+                &["nvarchar".into(), "int".into()],
+                &[],
+                &request,
+            )
+            .unwrap();
+        assert_eq!(writer.column_types, vec![Some("int".into())]);
+        assert_eq!(writer.column_extras, vec![Some("identity(1,1)".into())]);
+        writer.write_row(vec![json!("Ada"), json!(23)], None).unwrap();
+        writer.finish().unwrap();
+        let output = std::fs::read_to_string(destination).unwrap();
+        assert!(output.contains("SET IDENTITY_INSERT [dbo].[gen_table] ON;"));
+        assert!(output.contains("([table_id]) VALUES (23);"));
+        assert!(!output.contains("table_name"));
+    }
+
+    #[test]
+    fn sql_insert_writer_rejects_empty_selection_without_replacing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("preserved.sql");
+        std::fs::write(&destination, "original").unwrap();
+        let mut request = sqlserver_identity_export_request(&destination, None);
+        request.selected_columns = Some(Vec::new());
+        let mut writer = SqlInsertWriter::create(&request).unwrap();
+        assert!(writer.set_columns(vec!["id".into()], &["int".into()], &[], &request).is_err());
+        drop(writer);
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "original");
+    }
+
+    #[test]
+    fn export_column_remap_keeps_duplicate_occurrences_across_pages() {
+        let remap =
+            export_column_remap(&["id".into(), "id".into(), "name".into()], &["id".into(), "name".into(), "id".into()]);
+        assert_eq!(
+            realign_page_cells(&remap, vec![json!(1), json!(2), json!("Ada")]),
+            vec![json!(1), json!("Ada"), json!(2)]
+        );
+    }
+
+    #[test]
     fn sql_insert_writer_uses_one_batched_statement_by_default() {
         let output = rendered_sql_insert_output(SqlInsertMode::Batch);
 
         assert_eq!(output.matches("INSERT INTO").count(), 1);
-        assert!(output.contains("VALUES (1, 'Ada'), (2, 'Lin');"));
+        assert!(output.contains("VALUES\n(1, 'Ada'),\n(2, 'Lin');"));
     }
 
     #[test]
@@ -2269,7 +2831,7 @@ mod tests {
 
         assert!(!supports_streaming_offset_pagination(&req, 100));
         assert_eq!(
-            streaming_pagination_preflight_error(&req, 100, false, false),
+            streaming_pagination_preflight_error(&req, 100, false, false, req.use_agent_cursor),
             Some(HIGHGO_STREAMING_PAGINATION_UNSUPPORTED_ERROR)
         );
     }
@@ -2282,7 +2844,29 @@ mod tests {
         req.sql = "SELECT * FROM users; SELECT 1".to_string();
         req.query_base_sql = req.sql.clone();
 
-        assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false), None);
+        assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false, req.use_agent_cursor), None);
+    }
+
+    #[test]
+    fn oceanbase_wildcard_and_duplicate_projection_export_require_cursor_and_follow_its_end() {
+        for sql in
+            ["SELECT * FROM events", "SELECT t.* FROM events t", "SELECT a.name, a.* FROM people a ORDER BY a.id"]
+        {
+            let mut req = request("csv", None, None);
+            req.database_type = DatabaseType::OceanbaseOracle;
+            req.sql = sql.into();
+            req.query_base_sql = req.sql.clone();
+            req.use_agent_cursor = true;
+            assert!(!supports_streaming_offset_pagination(&req, 100));
+            assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false, req.use_agent_cursor), None);
+            assert!(should_fetch_next_page(true, true, 100, 100, 100));
+            assert!(!should_fetch_next_page(true, false, 100, 100, 100));
+            req.use_agent_cursor = false;
+            assert_eq!(
+                streaming_pagination_preflight_error(&req, 100, false, false, req.use_agent_cursor),
+                Some(STREAMING_PAGINATION_UNSUPPORTED_ERROR)
+            );
+        }
     }
 
     #[test]
@@ -2298,7 +2882,7 @@ mod tests {
     #[test]
     fn txt_export_header_keeps_columns_for_empty_results() {
         assert_eq!(
-            format_text_export_header("txt", &["id".to_string(), "note".to_string()], CsvQuoteMode::All),
+            format_text_export_header("txt", &["id".to_string(), "note".to_string()], CsvQuoteMode::All, None),
             "id\tnote"
         );
     }
@@ -2340,7 +2924,7 @@ mod tests {
         let mut output = Vec::new();
         let mut buffer = String::new();
 
-        write_text_export_row(&mut output, "csv", &row, &mut buffer, CsvQuoteMode::All).expect("write csv row");
+        write_text_export_row(&mut output, "csv", &row, &mut buffer, CsvQuoteMode::All, None).expect("write csv row");
         assert_eq!(String::from_utf8(output).expect("utf8 csv"), "\n,\"\",\"line\n\"\"two\"\"\"");
     }
 
@@ -2801,5 +3385,83 @@ mod tests {
         cancel_token.cancel();
 
         assert_eq!(task.await.unwrap(), Err(QUERY_CANCELED.to_string()));
+    }
+
+    #[test]
+    fn resolve_export_column_types_handles_overrides_and_inferred() {
+        let cols = vec!["id".to_string(), "amount".to_string(), "name".to_string()];
+
+        // Overrides take precedence when non-empty
+        let overrides = Some(vec![Some("bigint".to_string()), Some("decimal(18, 2)".to_string()), None]);
+        let inferred = vec!["int".to_string(), "".to_string(), "varchar".to_string()];
+        let resolved = resolve_export_column_types(&cols, &inferred, overrides.as_deref());
+        assert_eq!(resolved, vec!["bigint", "decimal(18, 2)", "varchar"]);
+
+        // Empty inferred (e.g. DuckDB) with overrides
+        let duckdb_overrides = Some(vec![Some("int".to_string()), Some("decimal".to_string()), None]);
+        let resolved = resolve_export_column_types(&cols, &[], duckdb_overrides.as_deref());
+        assert_eq!(resolved, vec!["int", "decimal", ""]);
+
+        // No overrides
+        let resolved = resolve_export_column_types(&cols, &inferred, None);
+        assert_eq!(resolved, vec!["int", "", "varchar"]);
+    }
+
+    #[test]
+    fn start_query_result_xlsx_workbook_uses_export_column_types_override() {
+        use std::io::Read;
+
+        let mut req = request("xlsx", None, None);
+        req.export_column_types = Some(vec![Some("decimal(18, 2)".to_string())]);
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        // Inferred column_types is empty (like DuckDB query result)
+        let mut writer =
+            start_query_result_xlsx_workbook(&mut cursor, &req, &["amount".to_string()], &[]).expect("start workbook");
+        writer.write_row(&[serde_json::Value::String("123.45".to_string())]).expect("write row");
+        finish_streaming_xlsx_workbook(writer).expect("finish workbook");
+        let bytes = cursor.into_inner();
+
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open zip");
+        let mut sheet_file = zip.by_name("xl/worksheets/sheet1.xml").expect("sheet1.xml");
+        let mut sheet_xml = String::new();
+        sheet_file.read_to_string(&mut sheet_xml).expect("read sheet1");
+
+        // The decimal value must be exported as a numeric cell (<v>123.45</v>) rather than text
+        assert!(sheet_xml.contains("<v>123.45</v>"), "expected numeric cell in sheet XML, got: {sheet_xml}");
+        assert!(
+            !sheet_xml.contains(r#"<c r="A2" t="inlineStr""#),
+            "did not expect cell A2 to be inlineStr, got: {sheet_xml}"
+        );
+        assert!(!sheet_xml.contains("<t>123.45</t>"), "did not expect 123.45 to be exported as text, got: {sheet_xml}");
+    }
+
+    #[test]
+    fn start_query_result_xlsx_workbook_exports_duckdb_computed_column_as_numeric() {
+        use std::io::Read;
+
+        let req = request("xlsx", None, None);
+        // Column types populated directly from DuckDB query execution
+        let column_types = vec!["DECIMAL(18, 2)".to_string()];
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = start_query_result_xlsx_workbook(&mut cursor, &req, &["金额".to_string()], &column_types)
+            .expect("start workbook");
+        writer.write_row(&[serde_json::Value::String("101.10".to_string())]).expect("write row");
+        finish_streaming_xlsx_workbook(writer).expect("finish workbook");
+        let bytes = cursor.into_inner();
+
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open zip");
+        let mut sheet_file = zip.by_name("xl/worksheets/sheet1.xml").expect("sheet1.xml");
+        let mut sheet_xml = String::new();
+        sheet_file.read_to_string(&mut sheet_xml).expect("read sheet1");
+
+        // The decimal value must be exported as a numeric cell (<v>101.10</v>) rather than text
+        assert!(sheet_xml.contains("<v>101.10</v>"), "expected numeric cell in sheet XML, got: {sheet_xml}");
+        assert!(
+            !sheet_xml.contains(r#"<c r="A2" t="inlineStr""#),
+            "did not expect cell A2 to be inlineStr, got: {sheet_xml}"
+        );
+        assert!(!sheet_xml.contains("<t>101.10</t>"), "did not expect 101.10 to be exported as text, got: {sheet_xml}");
     }
 }

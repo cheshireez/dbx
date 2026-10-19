@@ -1,4 +1,5 @@
 import type { DatabaseType } from "@/types/database";
+import { graphQueryProfile, isGraphQueryDatabase } from "@/lib/graph/graphQueryProfiles";
 
 const SQL_LINE_COMMENT_TOKEN = "--";
 
@@ -9,6 +10,7 @@ const LINE_COMMENT_TOKENS: Partial<Record<DatabaseType, string>> = {
 
 export function queryEditorLineCommentToken(dbType?: DatabaseType): string {
   if (!dbType) return SQL_LINE_COMMENT_TOKEN;
+  if (isGraphQueryDatabase(dbType)) return graphQueryProfile(dbType).lineComment;
   return LINE_COMMENT_TOKENS[dbType] ?? SQL_LINE_COMMENT_TOKEN;
 }
 
@@ -20,5 +22,5 @@ export function queryEditorCommentTokens(dbType?: DatabaseType) {
 }
 
 export function queryEditorWordLanguageData(dbType?: DatabaseType) {
-  return dbType === "sqlserver" ? [{ wordChars: "@" }] : [];
+  return dbType === "sqlserver" ? [{ wordChars: "@#" }] : [];
 }

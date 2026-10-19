@@ -8,6 +8,7 @@ import {
   dataGridToolbarIntervalOptions,
   isDataGridToolbarActionCompact,
   isDataGridToolbarCompact,
+  shouldCompactDataGridConditionInput,
   selectDataGridToolbarAddRowItem,
   selectDataGridToolbarAutoRefreshInterval,
   selectDataGridToolbarCopyItem,
@@ -27,6 +28,7 @@ function autoRefreshCapability(overrides: Partial<DataGridToolbarAutoRefreshCapa
     stopLabel: "Stop auto-refresh",
     enabled: false,
     intervalSeconds: 10,
+    sweepKey: 0,
     intervalOptions: [5, 10, 30],
     intervalLabel: (seconds) => `${seconds}s`,
     onToggle: vi.fn(),
@@ -64,6 +66,19 @@ describe("data grid toolbar capabilities", () => {
     expect(dataGridToolbarCompactBreakpoint(1100, DATA_GRID_CONDITION_TOOLBAR_MIN_WIDTH)).toBe(1050);
     expect(isDataGridToolbarCompact(1000, 1100, DATA_GRID_CONDITION_TOOLBAR_MIN_WIDTH)).toBe(true);
     expect(isDataGridToolbarCompact(1000, 1100)).toBe(false);
+  });
+
+  it("reserves usable condition input width even when the flex row does not overflow", () => {
+    expect(shouldCompactDataGridConditionInput(159)).toBe(true);
+    expect(shouldCompactDataGridConditionInput(160)).toBe(false);
+    expect(shouldCompactDataGridConditionInput(250)).toBe(false);
+  });
+
+  it("accounts for the hidden prefix before restoring condition labels", () => {
+    expect(shouldCompactDataGridConditionInput(210, 60, true)).toBe(true);
+    expect(shouldCompactDataGridConditionInput(235, 60, true)).toBe(true);
+    expect(shouldCompactDataGridConditionInput(236, 60, true)).toBe(false);
+    expect(shouldCompactDataGridConditionInput(Number.NaN)).toBe(false);
   });
 
   it("progressively compacts toolbar actions as the available width shrinks", () => {

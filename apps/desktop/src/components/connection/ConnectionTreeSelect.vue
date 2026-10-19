@@ -5,9 +5,8 @@ import { Check, ChevronDown, ChevronRight, Folder, Search } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
+import ConnectionIcon from "@/components/icons/ConnectionIcon.vue";
 import { buildConnectionPickerRows, connectionPickerSelectableRows } from "@/lib/connection/connectionPickerTree";
-import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import { cn } from "@/lib/common/utils";
 import type { ConnectionConfig, SidebarLayout } from "@/types/database";
 
@@ -45,6 +44,7 @@ const searchInput = ref<InstanceType<typeof Input>>();
 const listContainer = ref<HTMLDivElement>();
 const collapsedGroupIds = ref<Set<string>>(new Set());
 const highlightIndex = ref(-1);
+let focusRestoreElement: HTMLElement | null = null;
 
 const connectionById = computed(() => new Map(props.connections.map((connection) => [connection.id, connection])));
 
@@ -88,6 +88,15 @@ watch(open, async (value) => {
   if (!value) {
     searchText.value = "";
     highlightIndex.value = -1;
+    const restoreTarget = focusRestoreElement;
+    focusRestoreElement = null;
+    if (restoreTarget) {
+      // Reka's modal popover refocuses the trigger synchronously on close, so
+      // the restore must land on the next tick to win for shortcut-opened
+      // dropdowns.
+      await nextTick();
+      if (restoreTarget.isConnected) restoreTarget.focus();
+    }
     return;
   }
   await nextTick();
@@ -131,6 +140,15 @@ function handleKeydown(event: KeyboardEvent) {
     open.value = false;
   }
 }
+
+defineExpose({
+  openDropdown: () => {
+    if (props.disabled) return false;
+    focusRestoreElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    open.value = true;
+    return true;
+  },
+});
 </script>
 
 <template>
@@ -184,7 +202,7 @@ function handleKeydown(event: KeyboardEvent) {
                 @click="selectConnection(row.id)"
               >
                 <Check :class="cn('h-3.5 w-3.5 shrink-0', row.id === modelValue ? 'opacity-100' : 'opacity-0')" />
-                <DatabaseIcon :db-type="connectionIconType(connectionById.get(row.id))" class="h-3.5 w-3.5 shrink-0" />
+                <ConnectionIcon :connection="connectionById.get(row.id)" class="h-3.5 w-3.5 shrink-0" />
                 <span class="min-w-0 flex-1 truncate">{{ row.label }}</span>
               </button>
             </template>

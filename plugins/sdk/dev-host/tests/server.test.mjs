@@ -168,10 +168,10 @@ test("refresh cleanup does not disconnect a connection still used by another pag
   assert.equal(closed.value.connections[0].connected, false);
 });
 async function fixture(t, frontend = false, overrides = {}) {
-  const { pluginManifest = manifest, ...hostOverrides } = overrides;
+  const { pluginManifest = manifest, uiHtml = "<html><head></head><body>Test</body></html>", ...hostOverrides } = overrides;
   const root = await mkdtemp(join(tmpdir(), "dbx-mock-test-"));
   await mkdir(join(root, "ui"));
-  await writeFile(join(root, "ui/index.html"), "<html><head></head><body>Test</body></html>");
+  await writeFile(join(root, "ui/index.html"), uiHtml);
   const actual = frontend ? { ...pluginManifest, entrypoints: { ui: pluginManifest.entrypoints.ui }, contributions: pluginManifest.contributions.filter((c) => c.type === "workbench") } : pluginManifest;
   await writeFile(join(root, "manifest.json"), JSON.stringify(actual));
   const host = await createMockHost({
@@ -322,6 +322,24 @@ test("a frontend-only workbench opens without a connection or sidecar", async (t
   assert.match(rpc.error.message, /no backend/);
   assert.equal((await request("frames/close", { id: f.id })).status, 200);
 });
+test("host AI methods enforce permission and keep recommendation state per frame", async (t) => {
+  const denied = await fixture(t, true);
+  const deniedFrame = (await denied.request("workbenches/open", { contributionId: "example.main" })).value.frame;
+  const deniedDocument = (await denied.request("frame-document", { frameId: deniedFrame.id })).value;
+  const deniedCall = (method, params) => denied.request("bridge", { frameId: deniedFrame.id, channel: deniedDocument.channel, method, params });
+  assert.equal((await deniedCall("host.ai.setRecommendations", { context: {}, items: [] })).status, 400);
+
+  const allowed = await fixture(t, true, { pluginManifest: { ...manifest, permissions: ["host.ai"] } });
+  const frame = (await allowed.request("workbenches/open", { contributionId: "example.main" })).value.frame;
+  const document = (await allowed.request("frame-document", { frameId: frame.id })).value;
+  const call = (method, params) => allowed.request("bridge", { frameId: frame.id, channel: document.channel, method, params });
+  assert.equal((await call("host.ai.openConversation", { title: "Inspect", prompt: "Check", context: {}, send: true })).value, null);
+  assert.equal((await call("host.ai.setRecommendations", { context: { resource: { name: "orders" } }, items: [{ id: "health", label: "Inspect {{resource.name}}", prompt: "Check {{resource.name}}" }] })).value, null);
+  assert.equal((await call("host.ai.setRecommendations", { context: {}, items: [{ id: "bad", label: "Inspect {{resource..name}}", prompt: "Check" }] })).status, 400);
+  assert.deepEqual((await call("host.getContext", {})).value, {});
+  assert.equal((await call("host.ai.clearRecommendations", {})).value, null);
+  assert.equal((await call("host.ai.setRecommendations", { context: {}, items: Array.from({ length: 6 }, (_, index) => ({ id: `item-${index}`, label: "Item", prompt: "Prompt" })) })).status, 400);
+});
 test("srcdoc workbench documents inline local Vite scripts and styles", async (t) => {
   const { root, request } = await fixture(t, true);
   await mkdir(join(root, "ui/assets"));
@@ -371,6 +389,38 @@ test("save, reload, iframe isolation, generic RPC and close lifecycle", async (t
   assert.equal(failedBuild.status, 400);
   assert.equal(host.sidecar.state, "stopped");
 });
+test("host.storage persists per-plugin entries behind the declared permission", async (t) => {
+  const { request } = await fixture(t);
+  const saved = await request("connections/save", { providerId: "example.connection", values });
+  const frame = (await request("connections/connect", { id: saved.value.id })).value.frame;
+  const document = (await request("frame-document", { frameId: frame.id })).value;
+  const call = (method, params) => request("bridge", { frameId: frame.id, channel: document.channel, method, params });
+
+  assert.equal((await call("host.storageGet", { key: "theme" })).status, 400, "permission must gate storage");
+
+  const { request: allowedRequest, root: allowedRoot } = await fixture(t, false, {
+    pluginManifest: { ...manifest, permissions: [...manifest.permissions, "host.storage"] },
+  });
+  const allowedSave = await allowedRequest("connections/save", { providerId: "example.connection", values });
+  const allowedFrame = (await allowedRequest("connections/connect", { id: allowedSave.value.id })).value.frame;
+  const allowedDocument = (await allowedRequest("frame-document", { frameId: allowedFrame.id })).value;
+  const storage = (method, params) => allowedRequest("bridge", { frameId: allowedFrame.id, channel: allowedDocument.channel, method, params });
+
+  assert.equal((await storage("host.storageGet", { key: "theme" })).value, null);
+  assert.equal((await storage("host.storageSet", { key: "theme", value: { mode: "dark", tabs: [1, 2] } })).status, 200);
+  assert.deepEqual((await storage("host.storageGet", { key: "theme" })).value, { mode: "dark", tabs: [1, 2] });
+  assert.equal((await storage("host.storageSet", { key: "theme", value: undefined })).status, 200);
+  assert.equal((await storage("host.storageGet", { key: "theme" })).value, null, "undefined normalizes to null");
+  assert.equal((await storage("host.storageSet", { key: "blob", value: "x".repeat(256 * 1024 + 1) })).status, 400, "oversized values are rejected");
+  assert.equal((await storage("host.storageGet", { key: "" })).status, 400, "empty keys are rejected");
+  assert.equal((await storage("host.storageSet", { key: "last", value: "keep" })).status, 200);
+  assert.equal((await storage("host.storageDelete", { key: "last" })).status, 200);
+  assert.equal((await storage("host.storageGet", { key: "last" })).value, null);
+
+  const persisted = JSON.parse(await readFile(join(allowedRoot, "data/ui-storage.json"), "utf8"));
+  assert.deepEqual(persisted, { theme: null });
+  if (process.platform !== "win32") assert.equal((await stat(join(allowedRoot, "data/ui-storage.json"))).mode & 0o777, 0o600);
+});
 test("loopback endpoint rejects cross-origin, forged Host, CSRF and unowned frames", async (t) => {
   const { host, request, headers } = await fixture(t);
   assert.equal((await request("connections/save", {}, { Origin: "https://evil.example" })).status, 403);
@@ -389,6 +439,32 @@ test("loopback endpoint rejects cross-origin, forged Host, CSRF and unowned fram
   const boot = await other.json();
   assert.equal((await request("frame-document", { frameId: f.id }, { ...headers, Cookie: other.headers.get("set-cookie").split(";")[0], "X-Mock-Csrf": boot.csrf })).status, 400);
 });
+test("development host opens a self-contained UI larger than 8 MiB (#11286)", async (t) => {
+  const payload = "x".repeat(12 * 1024 * 1024);
+  const uiHtml = `<html><head></head><body><script>/*${payload}*/</script><p>Complete UI</p></body></html>`;
+  const { request } = await fixture(t, true, { uiHtml });
+  const opened = await request("workbenches/open", { contributionId: "example.main" });
+  assert.equal(opened.status, 200);
+  const document = await request("frame-document", { frameId: opened.value.frame.id });
+  assert.equal(document.status, 200);
+  assert.ok(document.value.html.includes(payload), "the UI payload must not be truncated");
+  assert.ok(document.value.html.includes("<p>Complete UI</p>"));
+});
+
+test("asset reader accepts 32 MiB and rejects larger files and directories", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "dbx-asset-size-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bytes = Buffer.alloc(32 * 1024 * 1024, 0x61);
+  await writeFile(join(root, "at-limit.bin"), bytes);
+  const asset = await readAsset(root, "at-limit.bin");
+  assert.equal(asset.contentType, "application/octet-stream");
+  assert.ok(Buffer.from(asset.dataBase64, "base64").equals(bytes));
+  await writeFile(join(root, "too-large.bin"), Buffer.alloc(bytes.length + 1));
+  await assert.rejects(readAsset(root, "too-large.bin"), /Asset exceeds 33554432 byte limit/);
+  await mkdir(join(root, "directory"));
+  await assert.rejects(readAsset(root, "directory"), /Asset is not a file/);
+});
+
 test("asset reader rejects traversal and symlinks outside the UI root", async (t) => {
   const { root } = await fixture(t);
   await writeFile(join(root, "secret"), "test-secret");
@@ -449,7 +525,7 @@ test("icon reads reject unsafe paths, missing files, non-images, symlink escapes
   await mkdir(join(root, "assets"));
   await writeFile(join(outside, "private.svg"), "private-icon-content");
   await symlink(join(outside, "private.svg"), join(root, "assets/link.svg"));
-  await writeFile(join(root, "assets/large.svg"), Buffer.alloc(8 * 1024 * 1024 + 1));
+  await writeFile(join(root, "assets/large.svg"), Buffer.alloc(32 * 1024 * 1024 + 1));
   for (const contribution of pluginManifest.contributions) {
     const result = await request("icon", { contributionId: contribution.id });
     assert.equal(result.status, 400, contribution.icon);

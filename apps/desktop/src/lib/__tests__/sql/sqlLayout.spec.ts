@@ -3,7 +3,7 @@ import { formatSqlText } from "@/lib/sql/sqlFormatter";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 
 /**
- * Golden tests for the layout engine behind DBX's default formatting style.
+ * Golden tests for DBX's default layout.
  * The expectations for the queries in issues #827, #4850 and #5170 pin the
  * real-world shapes those reports asked for; the rest pin the rules those
  * examples exercise — the collapse of short statements, the wrap of long ones,
@@ -19,6 +19,30 @@ async function format(sql: string, overrides: Partial<SqlFormatterSettings> = {}
 const lines = (...rows: string[]) => rows.join("\n");
 
 describe("sql layout", () => {
+  it.each([
+    ["SELECT 1\nSELECT 2", "SELECT 1\nSELECT 2"],
+    ["SELECT a FROM t\nSELECT b FROM u", "SELECT a\nFROM t\nSELECT b\nFROM u"],
+    ["SELECT 1\nUPDATE t SET a = 2", "SELECT 1\nUPDATE t\nSET a = 2"],
+    ["UPDATE t SET a = 1\nUPDATE t SET a = 2", "UPDATE t\nSET a = 1\nUPDATE t\nSET a = 2"],
+    ["SET @a = 1\nSELECT @a", "SET @a = 1\nSELECT @a"],
+    ["DELETE FROM t\nINSERT INTO t VALUES (1)", "DELETE FROM t\nINSERT INTO t\nVALUES (1)"],
+    ["SELECT 1\nSHOW TABLES", "SELECT 1\nSHOW TABLES"],
+  ])("keeps unseparated statements on different lines (#12523): %s", async (sql, expected) => {
+    const formatted = await format(sql);
+    expect(formatted).toBe(expected);
+    expect(await format(formatted)).toBe(formatted);
+    expect(formatted).not.toContain(";");
+  });
+
+  it.each([
+    ["SELECT (SELECT 1) AS value", "SELECT (SELECT 1) AS value"],
+    ["WITH t AS (SELECT 1 AS a) SELECT a FROM t", "WITH t AS (SELECT 1 AS a) SELECT a FROM t"],
+    ["SELECT 'SELECT UPDATE' AS value", "SELECT 'SELECT UPDATE' AS value"],
+    ["UPDATE t SET a = 1 WHERE id = 2", "UPDATE t SET a = 1 WHERE id = 2"],
+  ])("keeps a single short statement compact: %s", async (sql, expected) => {
+    expect(await format(sql)).toBe(expected);
+  });
+
   it("formats a query with a derived table (#827)", async () => {
     const sql = lines(
       "SELECT loc_id, loc_name, loc_type, delivery_emp_num, update_time",
@@ -31,10 +55,8 @@ describe("sql layout", () => {
     // The subquery's clauses align under the `(` that opens it, and the closing
     // `)` stays on the last clause's line.
     //
-    // The subquery's two select elements could be split; the screenshots in
-    // #827 and #4850 disagree on that point (both are two-element lists, one
-    // split, one not), so the keeping rule here is the one #4850's rendering
-    // matches.
+    // Expanded subqueries use the same one-field-per-line rule as the outer
+    // SELECT, while their clauses remain aligned under the opening parenthesis.
     expect(await format(sql)).toBe(
       lines(
         "SELECT loc_id,",
@@ -42,7 +64,8 @@ describe("sql layout", () => {
         "       loc_type,",
         "       delivery_emp_num,",
         "       update_time",
-        "FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY loc_id ORDER BY update_time DESC) AS rn",
+        "FROM (SELECT *,",
+        "             ROW_NUMBER() OVER (PARTITION BY loc_id ORDER BY update_time DESC) AS rn",
         "      FROM responsible_area_info",
         "      WHERE DATE_FORMAT(update_time, '%Y-%m') = DATE_FORMAT(NOW(), '%Y-%m')) t",
         "WHERE rn = 1;",
@@ -62,9 +85,12 @@ describe("sql layout", () => {
     // subquery expands rather than pushing `ON` onto a line of its own.
     expect(await format(sql)).toBe(
       lines(
-        "SELECT HIMMS_XDSBDJ.HIMMS_XDSBDJ_ID, HIMMS_XDSBDJ.YNKE, himms_zwxsysj_sysj(V_HIMMS_XDSBDJ.HIMMS_XDSBDJ_ID) AS SJSYSJ",
+        "SELECT HIMMS_XDSBDJ.HIMMS_XDSBDJ_ID,",
+        "       HIMMS_XDSBDJ.YNKE,",
+        "       himms_zwxsysj_sysj(V_HIMMS_XDSBDJ.HIMMS_XDSBDJ_ID) AS SJSYSJ",
         "FROM HIMMS_XDSBDJ",
-        "    LEFT JOIN (SELECT himms_xdsbdj_id, MAX(SJ) SJ",
+        "    LEFT JOIN (SELECT himms_xdsbdj_id,",
+        "                      MAX(SJ) SJ",
         "               FROM himms_zwxqdjc",
         "               GROUP BY himms_xdsbdj_id) SUB_QDJC ON HIMMS_XDSBDJ.HIMMS_XDSBDJ_ID = SUB_QDJC.himms_xdsbdj_id",
         "WHERE HIMMS_XDSBDJ.tybz IS NULL;",
@@ -121,7 +147,7 @@ describe("sql layout", () => {
     // `logicalOperatorNewline: "before"` starts each continuation line with the
     // operator, aligned under the condition's first operand like any other
     // clause item.
-    expect(await format(sql)).toBe(lines("SELECT a, b", "FROM t", "WHERE alpha = 1", "      AND beta = 2", "      AND gamma = 3", "      AND delta = 4", "      AND epsilon = 5", "      AND zeta = 6", "      AND eta = 7", "      AND theta = 8;"));
+    expect(await format(sql)).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE alpha = 1", "      AND beta = 2", "      AND gamma = 3", "      AND delta = 4", "      AND epsilon = 5", "      AND zeta = 6", "      AND eta = 7", "      AND theta = 8;"));
   });
 
   it("puts a wrapped condition's operators where the setting asks", async () => {
@@ -130,7 +156,7 @@ describe("sql layout", () => {
     // `after` ends the previous line with the operator instead.
     expect(await format(sql, { logicalOperatorNewline: "after" })).toContain("WHERE alpha = 1 AND\n      beta = 2 AND");
     // `none` keeps the condition on the clause's line, however long it gets.
-    expect(await format(sql, { logicalOperatorNewline: "none" })).toBe(lines("SELECT a, b", "FROM t", "WHERE alpha = 1 AND beta = 2 AND gamma = 3 AND delta = 4 AND epsilon = 5 AND zeta = 6 AND eta = 7 AND theta = 8;"));
+    expect(await format(sql, { logicalOperatorNewline: "none" })).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE alpha = 1 AND beta = 2 AND gamma = 3 AND delta = 4 AND epsilon = 5 AND zeta = 6 AND eta = 7 AND theta = 8;"));
   });
 
   it("expands a parenthesized list that does not fit, aligned under its first item", async () => {
@@ -167,27 +193,106 @@ describe("sql layout", () => {
   it("collapses each clause independently", async () => {
     const sql = "SELECT (SELECT count(*) FROM orders o WHERE o.customer_id = c.id AND o.status = 'paid') AS order_count, c.name FROM customers c;";
 
-    // The scalar subquery fits, the select list does not: only the second one
-    // breaks.
-    expect(await format(sql)).toBe(lines("SELECT (SELECT count(*) FROM orders o WHERE o.customer_id = c.id AND o.status = 'paid') AS order_count, c.name", "FROM customers c;"));
+    // The scalar subquery stays compact within its own SELECT field.
+    expect(await format(sql)).toBe(lines("SELECT (SELECT count(*) FROM orders o WHERE o.customer_id = c.id AND o.status = 'paid') AS order_count,", "       c.name", "FROM customers c;"));
   });
 
-  it("never joins a CASE onto one line", async () => {
-    expect(await format("SELECT CASE WHEN a = 1 THEN 'one' WHEN a = 2 THEN 'two' ELSE 'other' END AS label FROM t;")).toBe(lines("SELECT CASE", "         WHEN a = 1 THEN 'one'", "         WHEN a = 2 THEN 'two'", "         ELSE 'other'", "       END AS label", "FROM t;"));
+  it("keeps a CASE expression compact (#10783)", async () => {
+    expect(await format("SELECT CASE WHEN a = 1 THEN 'one' WHEN a = 2 THEN 'two' ELSE 'other' END AS label FROM t;")).toBe("SELECT CASE WHEN a = 1 THEN 'one' WHEN a = 2 THEN 'two' ELSE 'other' END AS label FROM t;");
+  });
+
+  it("puts each SELECT field on its own line even in a short query (#10783)", async () => {
+    expect(await format("SELECT id, CASE WHEN a = 1 THEN 'one' ELSE 'other' END AS label, coalesce(a, b) FROM t;")).toBe(lines("SELECT id,", "       CASE WHEN a = 1 THEN 'one' ELSE 'other' END AS label,", "       coalesce(a, b)", "FROM t;"));
+  });
+
+  it("puts fields on separate lines when SELECT has a modifier (#10783)", async () => {
+    expect(await format("SELECT DISTINCT a, b FROM t;")).toBe(lines("SELECT DISTINCT a,", "                b", "FROM t;"));
+    expect(await format("SELECT DISTINCT ON (key) a, b FROM t;")).toBe(lines("SELECT DISTINCT ON (KEY) a,", "                b", "FROM t;"));
+  });
+
+  it("keeps nested and simple CASE expressions compact", async () => {
+    const sql = "SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END) AS total, CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label FROM t;";
+    const expected = lines("SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END)                  AS total,", "       CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label", "FROM t;");
+    expect(await format(sql)).toBe(expected);
+    expect(await format(expected)).toBe(expected);
+  });
+
+  it("falls back to unaligned fields when an aligned alias would overflow the line width", async () => {
+    // Alignment pads every alias to one column past the widest expression, so
+    // the short expression's long alias lands exactly at the 120-column width;
+    // one more character and the whole list keeps the plain one-space layout.
+    const fitting = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(49)} FROM t;`;
+    expect(await format(fitting)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)}${" ".repeat(31)}AS ${"y".repeat(49)}`, "FROM t;"));
+
+    const overflowing = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(50)} FROM t;`;
+    expect(await format(overflowing)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)} AS ${"y".repeat(50)}`, "FROM t;"));
+  });
+
+  it("keeps an unaliased field plain while the aliased ones align", async () => {
+    expect(await format("SELECT a, b AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       b AS x,", "       c AS yyy", "FROM t;"));
+
+    // The alignment column comes from the aliased expressions only, so the
+    // bare field stays untouched beside the padded aliases.
+    expect(await format("SELECT a, bb AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       bb AS x,", "       c  AS yyy", "FROM t;"));
+  });
+
+  it("keeps DBX JOIN and condition layout while aligning aliases and FROM", async () => {
+    const sql = lines(
+      "SELECT js.start_time AS jobslipstarttime, js.end_time AS jobslipendtime, js.job_area_ids AS jobareaids, jsm.job_slip_id, jsm.flag, upi.worker_basic_info_id AS workerid",
+      "FROM loc_job_slip js LEFT JOIN loc_job_slip_audit jsa ON js.id = jsa.job_slip_id LEFT JOIN loc_job_slip_manager jsm ON js.id = jsm.job_slip_id LEFT JOIN loc_user_proj_info upi ON upi.bp_user_id = jsm.user_id",
+      "WHERE js.deleted = 0 AND jsa.deleted = 0 AND jsm.deleted = 0;",
+    );
+
+    const expected = lines(
+      "SELECT js.start_time            AS jobslipstarttime,",
+      "       js.end_time              AS jobslipendtime,",
+      "       js.job_area_ids          AS jobareaids,",
+      "       jsm.job_slip_id,",
+      "       jsm.flag,",
+      "       upi.worker_basic_info_id AS workerid",
+      "FROM loc_job_slip js",
+      "    LEFT JOIN loc_job_slip_audit jsa ON js.id = jsa.job_slip_id",
+      "    LEFT JOIN loc_job_slip_manager jsm ON js.id = jsm.job_slip_id",
+      "    LEFT JOIN loc_user_proj_info upi ON upi.bp_user_id = jsm.user_id",
+      "WHERE js.deleted = 0",
+      "      AND jsa.deleted = 0",
+      "      AND jsm.deleted = 0;",
+    );
+
+    const formatted = await format(sql);
+    expect(formatted).toBe(expected);
+    expect(await formatSqlText(sql, "mysql")).toBe(expected);
+
+    const projection = formatted.split("\n").slice(0, 6);
+    const fieldStartColumns = projection.map((line, index) => (index === 0 ? line.indexOf("js.start_time") : line.search(/\S/)));
+    expect(new Set(fieldStartColumns)).toEqual(new Set([7]));
+    expect(new Set(projection.filter((line) => line.includes(" AS ")).map((line) => line.indexOf("AS"))).size).toBe(1);
+  });
+
+  it("preserves comments and width wrapping inside CASE expressions", async () => {
+    const commented = await format(lines("SELECT id, CASE WHEN a = 1 THEN 'one' -- retain this", "ELSE 'other' END AS label FROM t;"));
+    expect(commented).toContain("-- retain this\n");
+    expect(commented).toContain("ELSE 'other'");
+    expect(await format(commented)).toBe(commented);
+
+    const longCase = await format(`SELECT id, CASE WHEN a = 1 THEN '${"x".repeat(100)}' ELSE 'other' END AS label FROM t;`);
+    expect(longCase).toContain("CASE\n");
+    expect(longCase).toContain("END AS label");
+    expect(await format(longCase)).toBe(longCase);
   });
 
   it("gives a set operation its own line", async () => {
     expect(await format("SELECT a FROM t UNION ALL SELECT b FROM u;")).toBe(lines("SELECT a", "FROM t", "UNION ALL", "SELECT b", "FROM u;"));
   });
 
-  it("keeps comments and does not fold them onto a line", async () => {
+  it("keeps a trailing comment on its line without swallowing the next item", async () => {
     const sql = lines("-- heading", "SELECT a, -- why", "       b", "FROM t; /* trailing */");
 
-    expect(await format(sql)).toBe(lines("-- heading", "SELECT a,", "       -- why", "       b", "FROM t;", "", "/* trailing */"));
+    expect(await format(sql)).toBe(lines("-- heading", "SELECT a, -- why", "       b", "FROM t;", "", "/* trailing */"));
   });
 
   it("keeps PostgreSQL casts tight", async () => {
-    expect(await format("select coalesce(a, b)::text, (x + y)::int from t;", {}, "postgres")).toBe("SELECT coalesce(a, b)::text, (x + y)::int FROM t;");
+    expect(await format("select coalesce(a, b)::text, (x + y)::int from t;", {}, "postgres")).toBe(lines("SELECT coalesce(a, b)::text,", "       (x + y)::int", "FROM t;"));
   });
 
   it("keeps the comma of a MySQL LIMIT offset", async () => {
@@ -229,7 +334,110 @@ describe("sql layout", () => {
     expect(await format("SELECT a, b FROM t WHERE x = 1;", { indentStyle: "tabularLeft" })).toBe(lines("SELECT    a,", "          b", "FROM      t", "WHERE     x = 1;"));
   });
 
+  it("keeps every branch of a union whose operands are parenthesized (#10472)", async () => {
+    const sql = lines(
+      "SELECT a.id, a.starttime, t.name AS taskName",
+      "FROM ( (SELECT l.id, l.starttime FROM `log_1_4` l WHERE l.taskid = 'abc' ORDER BY l.starttime DESC LIMIT 0, 10)",
+      "UNION ALL (SELECT l.id, l.starttime FROM `log_2_4` l WHERE l.taskid = 'abc' ORDER BY l.starttime DESC LIMIT 0, 10)",
+      "UNION ALL (SELECT l.id, l.starttime FROM `log_3_4` l WHERE l.taskid = 'abc' ORDER BY l.starttime DESC LIMIT 0, 10) ) a",
+      "INNER JOIN task t ON a.taskid = t.id WHERE 1 = 1 ORDER BY a.starttime DESC LIMIT 0, 10",
+    );
+
+    // A bare `SELECT` after the operator becomes a sibling clause, but a
+    // parenthesized branch stays inside the set-operation node. Printing the
+    // keyword alone deleted every branch after the first one.
+    expect(await format(sql)).toBe(
+      lines(
+        "SELECT a.id,",
+        "       a.starttime,",
+        "       t.name AS taskName",
+        "FROM ((SELECT l.id, l.starttime FROM `log_1_4` l WHERE l.taskid = 'abc' ORDER BY l.starttime DESC LIMIT 0, 10)",
+        "      UNION ALL",
+        "      (SELECT l.id, l.starttime FROM `log_2_4` l WHERE l.taskid = 'abc' ORDER BY l.starttime DESC LIMIT 0, 10)",
+        "      UNION ALL",
+        "      (SELECT l.id, l.starttime FROM `log_3_4` l WHERE l.taskid = 'abc' ORDER BY l.starttime DESC LIMIT 0, 10)) a",
+        "    INNER JOIN task t ON a.taskid = t.id",
+        "WHERE 1 = 1",
+        "ORDER BY a.starttime DESC",
+        "LIMIT 0, 10",
+      ),
+    );
+  });
+
+  it("drops no branch of a long parenthesized union chain (#10472)", async () => {
+    const branches = Array.from({ length: 12 }, (_, index) => `SELECT l.id, l.payload FROM log_${index + 1}_4 l WHERE l.taskid = 'abc' AND l.ytenant_id = '0000MEJRT61ACN8QOZ0000' ORDER BY l.starttime DESC LIMIT 0, 10`);
+    const sql = `SELECT a.id FROM ( ${branches.map((branch) => `(${branch})`).join(" UNION ALL ")} ) a`;
+
+    const formatted = await format(sql);
+
+    for (let index = 0; index < branches.length; index += 1) expect(formatted).toContain(`log_${index + 1}_4`);
+    expect(formatted.match(/UNION ALL/g)).toHaveLength(branches.length - 1);
+    expect(formatted.match(/0000MEJRT61ACN8QOZ0000/g)).toHaveLength(branches.length);
+  });
+
   it("formats a dialect without its own grammar", async () => {
     expect(await format("select * from t where a = 1 and b = 2;", {}, "generic")).toBe("SELECT * FROM t WHERE a = 1 AND b = 2;");
+  });
+
+  it("formats a query with leading comma position (#7723, #5110)", async () => {
+    const sql = lines("SELECT loc_id, loc_name, loc_type, delivery_emp_num, update_time", "FROM tbl", "WHERE rn = 1;");
+
+    expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT loc_id", "     , loc_name", "     , loc_type", "     , delivery_emp_num", "     , update_time", "FROM tbl", "WHERE rn = 1;"));
+  });
+
+  it("formats aligned projection aliases with leading commas", async () => {
+    const sql = lines("SELECT id AS emp_id, department_name AS dept, active_status AS status", "FROM employees;");
+
+    expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT id              AS emp_id", "     , department_name AS dept", "     , active_status   AS status", "FROM employees;"));
+  });
+
+  it("formats CREATE TABLE with leading commas in DDL", async () => {
+    const sql = lines(
+      "CREATE TABLE IF NOT EXISTS `delivery_emp_info`",
+      "(",
+      "  `id` varchar(20) PRIMARY KEY NOT NULL COMMENT '主键',",
+      "  `emp_id` varchar(20) NOT NULL COMMENT '员工id',",
+      "  `delivery_type_ids` varchar(512) DEFAULT NULL COMMENT '负责的运送类型id集合',",
+      "  `update_time` datetime NOT NULL COMMENT '更新时间',",
+      "  CONSTRAINT idx_emp_phone UNIQUE (emp_id, emp_phone_num) COMMENT '运送员id电话唯一'",
+      ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT '运达员信息表';",
+    );
+
+    expect(await format(sql, { commaPosition: "before" })).toBe(
+      lines(
+        "CREATE TABLE IF NOT EXISTS `delivery_emp_info`",
+        "(",
+        "    `id`                varchar(20)  PRIMARY KEY NOT NULL COMMENT '主键'",
+        "  , `emp_id`            varchar(20)              NOT NULL COMMENT '员工id'",
+        "  , `delivery_type_ids` varchar(512)         DEFAULT NULL COMMENT '负责的运送类型id集合'",
+        "  , `update_time`       datetime                 NOT NULL COMMENT '更新时间'",
+        "  , CONSTRAINT idx_emp_phone UNIQUE (emp_id, emp_phone_num) COMMENT '运送员id电话唯一'",
+        ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT '运达员信息表';",
+      ),
+    );
+  });
+
+  it("preserves keyword case when keywordCase is preserve (#11382)", async () => {
+    const sql = lines("select id as emp_id, name as emp_name", "from employees", "where status = 1 and dept = 'sales'", "order by id desc", "limit 10;");
+    expect(await format(sql, { keywordCase: "preserve" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
+  });
+
+  it("converts keyword case to lower when keywordCase is lower (#11382)", async () => {
+    const sql = lines("SELECT id AS emp_id, name AS emp_name", "FROM employees", "WHERE status = 1 AND dept = 'sales'", "ORDER BY id DESC", "LIMIT 10;");
+    expect(await format(sql, { keywordCase: "lower" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
+  });
+
+  it("preserves keyword case in join, union, case expression and ddl (#11382)", async () => {
+    const joinSql = "select a.id from t1 left join t2 on t1.id = t2.id;";
+    expect(await format(joinSql, { keywordCase: "preserve" })).toBe(lines("select a.id", "from t1", "    left join t2 on t1.id = t2.id;"));
+
+    const unionSql = lines("select 1", "union all", "select 2;");
+    expect(await format(unionSql, { keywordCase: "preserve" })).toBe(lines("select 1", "union all", "select 2;"));
+
+    const caseSql = "select case when a = 1 then 'one' else 'other' end as val from t;";
+    expect(await format(caseSql, { keywordCase: "preserve" })).toBe("select case when a = 1 then 'one' else 'other' end as val from t;");
+
+    const ddlSql = "create table test (id int, name varchar(255));";
+    expect(await format(ddlSql, { keywordCase: "preserve" })).toBe("create table test (id int, name varchar(255));");
   });
 });

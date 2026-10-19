@@ -7,20 +7,34 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const read = (name) => readFileSync(path.join(root, name), "utf8");
-const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"], {
-  cwd: root,
-  encoding: "utf8",
-  maxBuffer: 8 * 1024 * 1024,
-}));
+const metadata = JSON.parse(
+  execFileSync("cargo", ["metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+  }),
+);
 const members = new Map(metadata.packages.filter((pkg) => metadata.workspace_members.includes(pkg.id)).map((pkg) => [pkg.name, pkg]));
 const allowedDependencies = {
   "dbx-types": [],
   "dbx-platform": [],
   "dbx-formats": [],
-  "dbx-sql": ["dbx-types"],
+  "dbx-sql-core": ["dbx-types"],
+  "dbx-sql-dialect": ["dbx-types"],
+  "dbx-sql-data": ["dbx-sql-core", "dbx-sql-dialect", "dbx-types"],
+  "dbx-sql-schema": ["dbx-sql-core", "dbx-sql-dialect", "dbx-types"],
+  "dbx-sql": ["dbx-sql-core", "dbx-sql-data", "dbx-sql-dialect", "dbx-sql-schema", "dbx-types"],
   "dbx-ai-provider": ["dbx-platform"],
   "dbx-plugin-runtime": ["dbx-types", "dbx-platform"],
-  "dbx-drivers": ["dbx-types", "dbx-sql", "dbx-platform", "dbx-sqlite-worker"],
+  "dbx-driver-support": ["dbx-types", "dbx-platform"],
+  "dbx-driver-agent": ["dbx-types", "dbx-sql-core", "dbx-platform"],
+  "dbx-driver-elasticsearch": ["dbx-types", "dbx-driver-support"],
+  "dbx-driver-mongodb": ["dbx-types", "dbx-driver-support"],
+  "dbx-driver-mysql": ["dbx-types", "dbx-sql-core", "dbx-sql-dialect", "dbx-driver-support"],
+  "dbx-driver-postgres": ["dbx-types", "dbx-sql-core", "dbx-driver-support"],
+  "dbx-driver-redis": ["dbx-types", "dbx-driver-support"],
+  "dbx-driver-sqlserver": ["dbx-types", "dbx-sql-core", "dbx-sql-data", "dbx-driver-support"],
+  "dbx-drivers": ["dbx-types", "dbx-sql-core", "dbx-sql-data", "dbx-sql-dialect", "dbx-platform", "dbx-sqlite-worker", "dbx-driver-support", "dbx-driver-agent", "dbx-driver-elasticsearch", "dbx-driver-mongodb", "dbx-driver-mysql", "dbx-driver-postgres", "dbx-driver-redis", "dbx-driver-sqlserver"],
 };
 const core = members.get("dbx-core");
 
@@ -42,21 +56,68 @@ for (const [name, allowed] of Object.entries(allowedDependencies)) {
 
 test("core owns application orchestration in real business directories", () => {
   const ownedFiles = [
-    "connection/mod.rs", "connection/connection_secrets.rs", "connection/driver_runtime.rs",
-    "query/mod.rs", "query/query_cancel.rs", "query/document_ops.rs",
-    "schema/mod.rs", "schema/table_structure_sql/sqlite_rebuild.rs",
-    "data/transfer.rs", "data/table_import.rs", "data/docs/export.rs", "data/cloudflare_d1/import.rs",
-    "ai/agent_loop.rs", "ai/agent_tools.rs", "admin/consul/mod.rs", "admin/mq/mod.rs", "admin/mqtt/mod.rs",
-    "persistence/storage.rs", "persistence/config/mod.rs", "safety/production_safety.rs", "host/update.rs",
+    "connection/mod.rs",
+    "connection/connection_secrets.rs",
+    "connection/driver_runtime.rs",
+    "query/mod.rs",
+    "query/query_cancel.rs",
+    "query/document_ops.rs",
+    "schema/mod.rs",
+    "schema/table_structure_sql/sqlite_rebuild.rs",
+    "data/transfer.rs",
+    "data/transfer_runner.rs",
+    "data/table_import.rs",
+    "data/docs/export.rs",
+    "data/cloudflare_d1/import.rs",
+    "ai/agent_loop.rs",
+    "ai/agent_tools.rs",
+    "admin/consul/mod.rs",
+    "admin/mq/mod.rs",
+    "admin/mqtt/mod.rs",
+    "persistence/storage.rs",
+    "persistence/config/mod.rs",
+    "safety/production_safety.rs",
+    "host/update.rs",
   ];
   for (const name of ownedFiles) {
     assert.ok(existsSync(path.join(root, "crates/dbx-core/src", name)), `missing owned business source: ${name}`);
   }
   const rootSources = readdirSync(path.join(root, "crates/dbx-core/src")).filter((name) => name.endsWith(".rs"));
-  assert.deepEqual(rootSources, ["lib.rs"]);
+  assert.deepEqual(rootSources, ["cc_switch.rs", "lib.rs"]);
   assert.match(read("crates/dbx-core/src/ai/mod.rs"), /pub use dbx_ai_provider::ai::\*/);
   assert.match(read("crates/dbx-core/src/db/mod.rs"), /pub use crate::data::cloudflare_d1/);
   assert.ok(!existsSync(path.join(root, "crates/dbx-core/build.rs")));
+});
+
+test("transfer entrypoints delegate orchestration to the core runner", () => {
+  const entrypoints = [
+    "src-tauri/src/commands/transfer.rs",
+    "crates/dbx-web/src/routes/transfer.rs",
+  ];
+  const orchestrationCalls = [
+    "rename_tables_to_backup",
+    "transfer_postgres_schema_dependencies",
+    "clear_foreign_key_linked_overwrite_targets",
+    "transfer_table_with_result",
+    "transfer_schema_objects",
+    "drop_backup_tables",
+  ];
+
+  for (const entrypoint of entrypoints) {
+    const source = read(entrypoint);
+    assert.match(source, /transfer_runner::run_transfer\(/, `${entrypoint} must use the shared transfer runner`);
+    for (const call of orchestrationCalls) {
+      const directCall = new RegExp(`(?:dbx_core::)?transfer::${call}\\(`);
+      assert.doesNotMatch(source, directCall, `${entrypoint} must not own ${call} orchestration`);
+    }
+  }
+});
+
+test("database comparison admission comes from the shared driver manifest", () => {
+  const source = read("apps/desktop/src/lib/database/databaseCompareCapabilities.ts");
+  assert.match(source, /supportsDatabaseCompareMode\(type, mode\)/);
+  assert.doesNotMatch(source, /new Set<DatabaseType>/);
+  assert.doesNotMatch(source, /SQL_COMPARE_TYPES/);
 });
 
 test("core forwards capability flags without enabling driver defaults or test hooks", () => {
@@ -78,13 +139,10 @@ test("core forwards capability flags without enabling driver defaults or test ho
 
 test("code generators and runtime assets belong to their implementation crates", () => {
   assert.match(read("crates/dbx-types/build.rs"), /plugins\/connection-types/);
-  assert.match(read("crates/dbx-sql/build.rs"), /plugins\/dialects/);
+  assert.match(read("crates/dbx-sql-dialect/build.rs"), /plugins\/dialects/);
   assert.match(read("crates/dbx-ai-provider/src/ai_pi_agent_cli.rs"), /assets\/pi-mcp-bridge\.mjs/);
   assert.ok(existsSync(path.join(root, "crates/dbx-ai-provider/assets/pi-mcp-bridge.mjs")));
-  assert.deepEqual(
-    JSON.parse(read("crates/dbx-drivers/assets/agent-protocol-v2.json")),
-    JSON.parse(read("agents/common/src/main/resources/agent-protocol-v2.json")),
-  );
+  assert.deepEqual(JSON.parse(read("crates/dbx-driver-agent/assets/agent-protocol-v2.json")), JSON.parse(read("agents/common/src/main/resources/agent-protocol-v2.json")));
   assert.match(read("crates/dbx-platform/src/lib.rs"), /#\[cfg\(all\(target_os = "windows", target_env = "gnu"\)\)\]\s*mod nanosleep_stub/);
 });
 
@@ -106,16 +164,21 @@ test("CI and release tracking follow the new source owners", () => {
   const ci = read(".github/workflows/ci.yml");
   assert.ok(ci.includes("node --test scripts/core-architecture.test.mjs"));
   assert.ok(ci.includes("'crates/**'"));
-  for (const input of ["plugins/dialects/**", "plugins/connection-types/**", "crates/dbx-drivers/assets/agent-protocol-v2.json"]) {
+  for (const input of ["plugins/dialects/**", "plugins/connection-types/**", "crates/dbx-driver-agent/assets/agent-protocol-v2.json"]) {
     assert.ok(ci.includes(`'${input}'`), `CI misses ${input}`);
   }
-  assert.ok(read("scripts/release.mjs").includes('"crates/dbx-drivers/src/mongo_shell.rs"'));
+  assert.ok(read("scripts/release.mjs").includes('"crates/dbx-driver-mongodb/src/mongo_shell.rs"'));
+  assert.ok(read("scripts/release.mjs").includes('"skills/dbx/"'));
+  assert.ok(ci.includes("'skills/dbx/**'"));
 });
 
 test("the standalone DuckDB lockfile includes core's internal dependency closure", () => {
-  const lockedPackages = new Map(read("agents/drivers/duckdb/Cargo.lock")
-    .split("\n[[package]]\n").slice(1)
-    .map((block) => [block.match(/^name = "([^"]+)"$/m)[1], block]));
+  const lockedPackages = new Map(
+    read("agents/drivers/duckdb/Cargo.lock")
+      .split("\n[[package]]\n")
+      .slice(1)
+      .map((block) => [block.match(/^name = "([^"]+)"$/m)[1], block]),
+  );
   const visited = new Set();
   function inspect(name) {
     if (visited.has(name)) return;

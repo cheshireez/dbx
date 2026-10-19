@@ -520,6 +520,7 @@ fn wrap_conditional_check(sql: &str, db_type: DatabaseType) -> String {
             | DatabaseType::Highgo
             | DatabaseType::Vastbase
             | DatabaseType::Uxdb
+            | DatabaseType::Gbase8c
             | DatabaseType::Redshift => {
                 let (schema_name, table_name) = postgres_table_identity(table_identifier);
                 let schema_predicate = schema_name.map_or_else(
@@ -1434,6 +1435,8 @@ mod tests {
             name: name.to_string(),
             data_type: data_type.to_string(),
             resolved_schema: None,
+            resolved_table: None,
+            resolved_object_type: None,
             is_nullable: true,
             column_default: None,
             is_primary_key: false,
@@ -1446,6 +1449,7 @@ mod tests {
             enum_values: None,
             character_set: None,
             collation: None,
+            metadata_capabilities: None,
         }
     }
 
@@ -2387,6 +2391,8 @@ mod tests {
                 name: "large_val".to_string(),
                 data_type: "BIGINT".to_string(),
                 resolved_schema: None,
+                resolved_table: None,
+                resolved_object_type: None,
                 is_nullable: true,
                 column_default: None,
                 is_primary_key: false,
@@ -2399,11 +2405,14 @@ mod tests {
                 enum_values: None,
                 character_set: None,
                 collation: None,
+                metadata_capabilities: None,
             }),
             target: Some(ColumnInfo {
                 name: "large_val".to_string(),
                 data_type: "INT".to_string(),
                 resolved_schema: None,
+                resolved_table: None,
+                resolved_object_type: None,
                 is_nullable: true,
                 column_default: None,
                 is_primary_key: false,
@@ -2416,6 +2425,7 @@ mod tests {
                 enum_values: None,
                 character_set: None,
                 collation: None,
+                metadata_capabilities: None,
             }),
             changes: vec!["data_type BIGINT → INT".to_string()],
             add_position: None,

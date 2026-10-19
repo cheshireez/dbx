@@ -1,18 +1,28 @@
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::State;
+use async_stream::stream;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use dbx_core::connection::{
     connection_configs_pool_equivalent, connection_configs_session_credentials_compatible, AppState, PoolKind,
 };
-use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType};
+use dbx_core::models::connection::{
+    ConnectionConfig, ConnectionIdleClosedEvent, ConnectionLivenessMessage, ConnectionTestResult,
+    DatabaseConnectionInfo, DatabaseType,
+};
 use dbx_core::nacos::config::{
     take_transient_passwords, NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD,
 };
 use dbx_core::runtime_config::{
     release_runtime_config_on_disconnect, should_retain_runtime_config, TEST_PROBE_ID_PREFIX,
+};
+use dbx_core::salesforce_oauth::{
+    device_authorization_request, device_poll, password_grant_token, refresh_access_token, SfDeviceAuthorization,
+    SfDevicePoll, SfOauthParams, SfRefreshedToken, SfTokenSet,
 };
 use dbx_core::session_credentials::{PurposeSessionCredentialWriteToken, SessionCredentialWriteToken};
 use serde::{Deserialize, Serialize};
@@ -37,8 +47,22 @@ struct SessionCredentialWrites {
 }
 
 fn prepare_runtime_config(mut config: ConnectionConfig) -> (ConnectionConfig, NoSaveRuntimeSecrets) {
+    dbx_core::connection::connection_secrets::normalize_rocketmq_credentials(&mut config);
     if config.save_password {
         return (config, NoSaveRuntimeSecrets::default());
+    }
+    if dbx_core::connection::connection_secrets::is_rocketmq_connection(&config) {
+        let primary = config
+            .external_config
+            .as_mut()
+            .and_then(|external| external.get_mut("auth"))
+            .filter(|auth| auth.get("kind").and_then(serde_json::Value::as_str) == Some("basic"))
+            .and_then(|auth| auth.as_object_mut())
+            .and_then(|auth| auth.insert("password".into(), serde_json::json!("")))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .filter(|value| !value.is_empty());
+        config.password.clear();
+        return (config, NoSaveRuntimeSecrets { primary, console: None });
     }
     if config.db_type == DatabaseType::Nacos {
         let passwords = take_transient_passwords(&mut config);
@@ -108,6 +132,15 @@ pub struct DisconnectRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrewarmConnectionRequest {
+    pub connection_id: String,
+    pub database: Option<String>,
+    pub catalog: Option<String>,
+    pub client_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloseDatabaseConnectionRequest {
     pub connection_id: String,
     pub database: String,
@@ -158,6 +191,11 @@ pub struct WriteUnlockStateResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
+    /// Ids the client deleted locally. Connections are saved by upsert, so a
+    /// client that no longer lists a connection must say so explicitly instead
+    /// of wiping every connection another client may have created meanwhile.
+    #[serde(default)]
+    pub removed_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -263,14 +301,50 @@ async fn sync_mongo_legacy_driver_fallback(state: &WebState, config: &Connection
     apply_mongo_legacy_driver_profile(state, config).await
 }
 
+async fn with_temporary_connection_config<T, F, Fut>(
+    app: &Arc<AppState>,
+    config: ConnectionConfig,
+    test: F,
+) -> Result<T, String>
+where
+    F: FnOnce(String, ConnectionConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let temp_id = format!("{TEST_PROBE_ID_PREFIX}{}", uuid::Uuid::new_v4());
+    // Only RocketMQ needs auth.password moved into the owner-scoped probe store.
+    // Other connectors (notably plugin password binding) consume the draft directly.
+    let (mut config, secrets) = if dbx_core::connection::connection_secrets::is_rocketmq_connection(&config) {
+        prepare_runtime_config(config)
+    } else {
+        (config, NoSaveRuntimeSecrets::default())
+    };
+    config.id = temp_id.clone();
+    let owner = dbx_core::session_credentials::current_credential_owner().unwrap_or_default();
+    record_session_credentials(app, &owner, &temp_id, &secrets, false);
+    app.configs.write().await.insert(temp_id.clone(), config.clone());
+    let result = test(temp_id.clone(), config).await;
+    app.configs.write().await.remove(&temp_id);
+    app.session_credentials.clear_connection(&temp_id);
+    result
+}
+
 async fn run_temporary_connection_test(
     app: &Arc<AppState>,
     config: ConnectionConfig,
     include_database_info: bool,
 ) -> Result<ConnectionTestResult, String> {
-    let temp_id = format!("{TEST_PROBE_ID_PREFIX}{}", uuid::Uuid::new_v4());
-    app.configs.write().await.insert(temp_id.clone(), config.clone());
+    with_temporary_connection_config(app, config, |temp_id, config| {
+        run_prepared_temporary_connection_test(app, temp_id, config, include_database_info)
+    })
+    .await
+}
 
+async fn run_prepared_temporary_connection_test(
+    app: &Arc<AppState>,
+    temp_id: String,
+    config: ConnectionConfig,
+    include_database_info: bool,
+) -> Result<ConnectionTestResult, String> {
     if config.db_type == DatabaseType::Plugin {
         let result = async {
             let endpoint = app.plugin_connection_endpoint(&temp_id, &config).await?;
@@ -278,7 +352,6 @@ async fn run_temporary_connection_test(
         }
         .await;
         app.reset_connection_transport_for_config(&temp_id, &config).await;
-        app.configs.write().await.remove(&temp_id);
         return result;
     }
 
@@ -357,7 +430,6 @@ async fn run_temporary_connection_test(
     #[cfg(feature = "mq-admin")]
     app.mq_registry.drop_connection(&temp_id).await;
     app.reset_connection_transport_for_config(&temp_id, &config).await;
-    app.configs.write().await.remove(&temp_id);
 
     result
 }
@@ -366,7 +438,8 @@ pub async fn test_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, false)
+    let config = state.resolve_connection_credentials(body.config).await?;
+    run_temporary_connection_test(&state.app, config, false)
         .await
         .map(|result| Json(result.message))
         .map_err(AppError::from)
@@ -376,14 +449,16 @@ pub async fn test_connection_with_info(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<ConnectionTestResult>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, true).await.map(Json).map_err(AppError::from)
+    let config = state.resolve_connection_credentials(body.config).await?;
+    run_temporary_connection_test(&state.app, config, true).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn test_ssh_tunnel(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    state.app.test_connection_ssh_tunnel(&body.config.canonicalized()).await.map(Json).map_err(AppError::from)
+    let config = state.resolve_connection_credentials(body.config).await?;
+    state.app.test_connection_ssh_tunnel(&config.canonicalized()).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn connect_db(
@@ -391,7 +466,12 @@ pub async fn connect_db(
     headers: HeaderMap,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    let config = body.config;
+    let config = state.resolve_connection_credentials(body.config).await?;
+    // 演示模式：只允许连接已保存的连接，端点身份以存储为准，防止伪造 body
+    // 配置把服务器拨向任意主机（见 demo 模块）。
+    if state.demo_mode {
+        crate::demo::ensure_demo_connect_allowed(&state.app, &config).await.map_err(AppError::forbidden)?;
+    }
     if config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
         dbx_core::db::sqlite::validate_persistent_attachments(
             &config.host,
@@ -535,7 +615,7 @@ pub async fn connection_final_proxy_port(
     headers: HeaderMap,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<u16>, AppError> {
-    let runtime_config = body.config.canonicalized();
+    let runtime_config = state.resolve_connection_credentials(body.config).await?.canonicalized();
     if !runtime_config.has_effective_transport_layers() {
         return Err(AppError::from("Connection has no configured transport layers".to_string()));
     }
@@ -599,6 +679,136 @@ pub async fn check_connection_health(
     Json(body): Json<DisconnectRequest>,
 ) -> Result<Json<()>, AppError> {
     state.app.check_connection_health(&body.connection_id).await.map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+/// Read-only counterpart of `check_connection_health`: reports whether the connection still
+/// has a pool, without probing, mutating, or triggering a reconnect (#4339).
+pub async fn connection_is_open(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<DisconnectRequest>,
+) -> Result<Json<bool>, AppError> {
+    Ok(Json(state.app.is_connection_open(&body.connection_id).await))
+}
+
+/// Serialise one liveness message for the SSE stream, or `None` when serialisation fails.
+fn liveness_sse_event(message: &ConnectionLivenessMessage) -> Option<Event> {
+    match serde_json::to_string(message) {
+        Ok(payload) => Some(Event::default().data(payload)),
+        // The payload is a tagged enum of plain fields, so this is unreachable in practice.
+        Err(error) => {
+            log::warn!("Connection liveness message could not be serialised: {error}");
+            None
+        }
+    }
+}
+
+/// Stream backend-confirmed liveness messages to the browser (#4339).
+///
+/// The payload is the message itself, byte-identical to what the desktop shell emits as
+/// `dbx-connection-liveness`, so the frontend parses one shape on both transports.
+pub async fn connection_liveness_events(
+    State(state): State<Arc<WebState>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let mut events = state.app.subscribe_connection_liveness();
+    let stream = stream! {
+        loop {
+            match events.recv().await {
+                Ok(message) => {
+                    if let Some(event) = liveness_sse_event(&message) {
+                        yield Ok(event);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The skipped messages are gone for good, so ask the client to re-check
+                    // every connection it still shows as connected. Dropping the transition
+                    // silently would leave a sidebar green indefinitely — exactly the state
+                    // this stream exists to prevent.
+                    log::warn!("Web connection liveness stream skipped {skipped} messages; requesting a resync");
+                    if let Some(event) = liveness_sse_event(&ConnectionLivenessMessage::Resync) {
+                        yield Ok(event);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Serialise one idle-closed message for the SSE stream, or `None` when serialisation fails.
+fn idle_closed_sse_event(event: &ConnectionIdleClosedEvent) -> Option<Event> {
+    match serde_json::to_string(event) {
+        Ok(payload) => Some(Event::default().data(payload)),
+        // The payload is a struct of plain fields, so this is unreachable in practice.
+        Err(error) => {
+            log::warn!("Connection idle-closed event could not be serialised: {error}");
+            None
+        }
+    }
+}
+
+/// Stream backend idle-closed notifications to the browser (#12112).
+///
+/// The payload is byte-identical to what the desktop shell emits as
+/// `dbx:connection-idle-closed`, so the frontend parses one shape on both transports.
+pub async fn connection_idle_closed_events(
+    State(state): State<Arc<WebState>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let mut events = state.app.subscribe_connection_idle_closed();
+    let stream = stream! {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if let Some(event) = idle_closed_sse_event(&event) {
+                        yield Ok(event);
+                    }
+                }
+                // 丢弃事件不影响正确性：前端下次触发查询时会经 `ensureConnected` 自动重连，
+                // 侧边栏状态也会在下一次刷新时对齐，因此这里只记日志、不做 resync 补偿。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    log::warn!("Web connection idle-closed stream skipped {skipped} messages");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// 启动「空闲自动断开」定时清扫（issue #12112）。
+///
+/// web shell 与 desktop shell 一样只负责传输：这里周期调用 core 的
+/// `sweep_idle_connections` 触发清扫，关闭结果由 core 发布到广播通道，再由
+/// [`connection_idle_closed_events`] 以 SSE 下发给浏览器。
+///
+/// 用 `Weak` 持有状态：前端 WebState 被销毁后任务在下一轮自行退出。间隔取 30 秒的理由
+/// 与 desktop 侧的 `install_connection_idle_closed_bridge` 相同（面向分钟级空闲，
+/// 未启用阈值的连接会被 core 直接过滤）。
+pub fn start_connection_idle_sweeper(state: &Arc<WebState>) {
+    let state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let Some(state) = state.upgrade() else { break };
+            state.app.sweep_idle_connections().await;
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+}
+
+pub async fn prewarm_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<PrewarmConnectionRequest>,
+) -> Result<Json<()>, AppError> {
+    let database = body.database.as_deref().filter(|value| !value.is_empty());
+    let catalog = body.catalog.as_deref().filter(|value| !value.is_empty());
+    let client_session_id = body.client_session_id.as_deref().filter(|value| !value.is_empty());
+    state
+        .app
+        .prewarm_connection_pool(&body.connection_id, database, catalog, client_session_id)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -672,7 +882,15 @@ pub async fn save_connections(
     headers: HeaderMap,
     Json(body): Json<SaveConnectionsRequest>,
 ) -> Result<Json<()>, AppError> {
-    for config in &body.configs {
+    let mut configs = body.configs;
+    if configs.iter().any(|config| crate::credentials::contains_reference(&serde_json::to_value(config).unwrap())) {
+        let saved = state.saved_credential_configs().await?;
+        configs = configs
+            .into_iter()
+            .map(|config| crate::credentials::restore(config, &saved))
+            .collect::<Result<Vec<_>, AppError>>()?;
+    }
+    for config in &configs {
         if config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
             dbx_core::db::sqlite::validate_persistent_attachments(
                 &config.host,
@@ -682,11 +900,18 @@ pub async fn save_connections(
             .map_err(AppError::from)?;
         }
     }
-    state.app.storage.save_connections(&body.configs).await.map_err(AppError::from)?;
+    if !body.removed_ids.is_empty() {
+        state.app.storage.delete_connections(&body.removed_ids).await.map_err(AppError::from)?;
+    }
+    state.app.storage.save_connections(&configs).await.map_err(AppError::from)?;
     let owner = session_token_from_headers(&headers).unwrap_or_default();
-    let runtime_configs = body.configs.iter().cloned().map(prepare_runtime_config).collect::<Vec<_>>();
-    let sanitized_configs = runtime_configs.iter().map(|(config, _)| config.clone()).collect::<Vec<_>>();
-    let sync = sync_connection_configs(&state, &sanitized_configs).await;
+    let runtime_configs = configs.iter().cloned().map(prepare_runtime_config).collect::<Vec<_>>();
+    // Saving is an upsert, so the request only describes the connections of this
+    // client. Sync the runtime cache against the whole persisted list instead of
+    // the request payload, otherwise a concurrent save from another client would
+    // drop its runtime config, pool and session credentials.
+    let persisted = state.app.storage.load_connections().await.map_err(AppError::from)?;
+    let sync = sync_connection_configs(&state, &persisted).await;
     for (config, secrets) in &runtime_configs {
         record_session_credentials(&state.app, &owner, &config.id, secrets, config.db_type == DatabaseType::Nacos);
     }
@@ -700,11 +925,12 @@ pub async fn mcp_add_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<McpAddConnectionRequest>,
 ) -> Result<Json<ConnectionConfig>, AppError> {
-    let saved = state.app.storage.add_connection_for_mcp(body.config).await.map_err(AppError::from)?;
+    let config = state.resolve_connection_credentials(body.config).await?;
+    let saved = state.app.storage.add_connection_for_mcp(config).await.map_err(AppError::from)?;
     state.app.session_credentials.clear_connection(&saved.id);
     state.app.remove_connection_pools_detached(&saved.id).await;
     state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
-    Ok(Json(saved))
+    Ok(Json(state.connection_response(saved)))
 }
 
 pub async fn mcp_duplicate_connection(
@@ -720,7 +946,7 @@ pub async fn mcp_duplicate_connection(
     state.app.session_credentials.clear_connection(&saved.id);
     state.app.remove_connection_pools_detached(&saved.id).await;
     state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
-    Ok(Json(saved))
+    Ok(Json(state.connection_response(saved)))
 }
 
 pub async fn mcp_remove_connection(
@@ -750,7 +976,7 @@ pub async fn load_connections(
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
-    Ok(Json(configs))
+    Ok(Json(configs.into_iter().map(|config| state.connection_response(config)).collect()))
 }
 
 struct ConnectionConfigSync {
@@ -836,6 +1062,87 @@ async fn remove_connection_pools_for_connection_ids(state: &WebState, connection
     }
 }
 
+// ── Salesforce OAuth ──────────────────────────────────────────────
+//
+// Web mode does not have a system browser opener; the browser flow is refused
+// with a clear message pointing users at the device flow which works fine
+// headless. The device flow endpoints proxy directly into dbx-drivers.
+
+pub async fn salesforce_oauth_browser_authorize(
+    State(_state): State<Arc<WebState>>,
+    Json(_body): Json<SalesforceOauthParamsRequest>,
+) -> Result<Json<SfTokenSet>, AppError> {
+    Err(AppError::from("Browser OAuth is not available in web mode. Use the device code flow instead.".to_string()))
+}
+
+pub async fn salesforce_oauth_device_start(
+    State(_state): State<Arc<WebState>>,
+    Json(body): Json<SalesforceOauthParamsRequest>,
+) -> Result<Json<SfDeviceAuthorization>, AppError> {
+    device_authorization_request(&body.params).await.map(Json).map_err(AppError::from)
+}
+
+pub async fn salesforce_oauth_device_poll(
+    State(_state): State<Arc<WebState>>,
+    Json(body): Json<SalesforceDevicePollRequest>,
+) -> Result<Json<SfDevicePoll>, AppError> {
+    device_poll(&body.params, &body.device_code, body.interval_secs).await.map(Json).map_err(AppError::from)
+}
+
+pub async fn salesforce_oauth_refresh(
+    State(_state): State<Arc<WebState>>,
+    Json(body): Json<SalesforceRefreshRequest>,
+) -> Result<Json<SfRefreshedToken>, AppError> {
+    refresh_access_token(&body.params, &body.refresh_token).await.map(Json).map_err(AppError::from)
+}
+
+pub async fn salesforce_oauth_password_login(
+    State(_state): State<Arc<WebState>>,
+    Json(body): Json<SalesforcePasswordLoginRequest>,
+) -> Result<Json<SfTokenSet>, AppError> {
+    password_grant_token(&body.params, &body.username, &body.password).await.map(Json).map_err(AppError::from)
+}
+
+#[derive(Deserialize)]
+pub struct SalesforceOauthParamsRequest {
+    pub params: SfOauthParams,
+}
+
+#[derive(Deserialize)]
+pub struct SalesforceDevicePollRequest {
+    pub params: SfOauthParams,
+    #[serde(rename = "deviceCode")]
+    pub device_code: String,
+    #[serde(rename = "intervalSecs")]
+    pub interval_secs: u64,
+}
+
+#[derive(Deserialize)]
+pub struct SalesforceRefreshRequest {
+    pub params: SfOauthParams,
+    #[serde(rename = "refreshToken")]
+    pub refresh_token: String,
+}
+
+#[derive(Deserialize)]
+pub struct SalesforcePasswordLoginRequest {
+    pub params: SfOauthParams,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct SalesforceCurrentUserQuery {
+    pub connection_id: String,
+}
+
+pub async fn salesforce_current_user(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SalesforceCurrentUserQuery>,
+) -> Result<Json<dbx_core::connection::SalesforceCurrentUser>, AppError> {
+    state.app.salesforce_current_user(&q.connection_id).await.map(Json).map_err(AppError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -858,13 +1165,31 @@ mod tests {
     use dbx_core::nacos::config::{
         NacosAuthConfig, NacosRNacosConsoleAuth, NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD,
     };
-    use dbx_core::storage::{McpGlobalPolicy, Storage};
+    use dbx_core::storage::McpGlobalPolicy;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn rocketmq_no_save_runtime_moves_sk_to_session_capture() {
+        let mut config = sqlite_config("rocketmq", "");
+        config.db_type = DatabaseType::MessageQueue;
+        config.save_password = false;
+        config.external_config = Some(serde_json::json!({
+            "systemKind": "rocketmq", "adminUrl": "",
+            "auth": { "kind": "basic", "username": "ak", "password": "sk" },
+            "extra": { "secretKey": "stale" }
+        }));
+        let (runtime, secrets) = super::prepare_runtime_config(config);
+        assert_eq!(secrets.primary.as_deref(), Some("sk"));
+        assert_eq!(runtime.external_config.as_ref().unwrap()["auth"]["password"], "");
+        assert!(runtime.external_config.as_ref().unwrap()["extra"].get("secretKey").is_none());
+    }
+
     fn sqlite_config(id: &str, path: &str) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "SQLite".to_string(),
@@ -884,6 +1209,8 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -891,6 +1218,8 @@ mod tests {
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_core::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: dbx_core::models::connection::default_idle_timeout_secs(),
+            manual_transaction_timeout_secs: dbx_core::models::connection::default_manual_transaction_timeout_secs(),
+            idle_disconnect_secs: dbx_core::models::connection::default_idle_disconnect_secs(),
             keepalive_interval_secs: dbx_core::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
@@ -910,6 +1239,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -926,6 +1256,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -1066,10 +1397,73 @@ mod tests {
     async fn test_web_state() -> (Arc<WebState>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("dbx-web-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let app = Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")));
         let state = Arc::new(WebState::for_tests(app, dir.clone()));
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn temporary_plugin_probe_preserves_no_save_password_for_password_binding() {
+        let (state, _dir) = test_web_state().await;
+        let mut config = plugin_config("plugin-probe-password");
+        config.save_password = false;
+        config.password = "plugin-password".into();
+        super::with_temporary_connection_config(&state.app, config, |_id, runtime| async move {
+            // plugin_host.test_connection receives this config directly and binds
+            // ConnectionConfig.password into the provider's declared password field.
+            assert_eq!(runtime.password, "plugin-password");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn temporary_rocketmq_test_scopes_credentials_to_probe_and_cleans_success_and_failure() {
+        let (state, _dir) = test_web_state().await;
+        for fail in [false, true] {
+            let mut config = sqlite_config("saved-rocketmq", "");
+            config.db_type = DatabaseType::MessageQueue;
+            config.save_password = false;
+            config.external_config = Some(serde_json::json!({
+                "systemKind": "rocketmq", "adminUrl": "",
+                "auth": { "kind": "basic", "username": "ak", "password": "probe-sk" },
+                "extra": { "connectionMode": "proxy", "proxyEndpoint": "proxy:8081" }
+            }));
+            state.app.session_credentials.set("owner-a", "saved-rocketmq", "saved-sk");
+            let probe_id = Arc::new(std::sync::Mutex::new(String::new()));
+            let captured = probe_id.clone();
+            let app = &state.app;
+            let result = dbx_core::session_credentials::with_credential_owner(
+                Some("owner-a".into()),
+                super::with_temporary_connection_config(app, config, |id, runtime| async move {
+                    *captured.lock().unwrap() = id.clone();
+                    assert_ne!(id, "saved-rocketmq");
+                    assert_eq!(runtime.id, id);
+                    assert_eq!(runtime.external_config.as_ref().unwrap()["auth"]["password"], "");
+                    assert_eq!(app.session_credentials.get("owner-a", &id).as_deref(), Some("probe-sk"));
+                    assert!(!app.session_credentials.has("owner-b", &id));
+                    let mqc = app.mq_admin_config_for_connection(&id, &runtime).await.unwrap();
+                    match mqc.auth {
+                        dbx_core::mq::auth::MqAuth::Basic { password, .. } => assert_eq!(password, "probe-sk"),
+                        _ => panic!("expected Basic auth"),
+                    }
+                    if fail {
+                        Err("probe failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(result.is_err(), fail);
+            let id = probe_id.lock().unwrap().clone();
+            assert!(!state.app.session_credentials.has("owner-a", &id));
+            assert!(!state.app.configs.read().await.contains_key(&id));
+            assert_eq!(state.app.session_credentials.get("owner-a", "saved-rocketmq").as_deref(), Some("saved-sk"));
+        }
     }
 
     #[tokio::test]
@@ -1300,13 +1694,77 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![config.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![config.clone()], removed_ids: Vec::new() }),
         )
         .await;
         assert!(result.is_ok());
 
         let configs = state.app.configs.read().await;
         assert_eq!(configs.get("sqlite-conn").map(|c| c.host.as_str()), Some(config.host.as_str()));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn save_connections_keeps_connections_saved_by_another_client() {
+        let (state, dir) = test_web_state().await;
+        let client_one = sqlite_config("client-one", &dir.join("one.db").to_string_lossy());
+
+        // Client two loaded its list before client one saved anything.
+        let client_two_snapshot = state.app.storage.load_connections().await.unwrap();
+
+        let saved = save_connections(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SaveConnectionsRequest { configs: vec![client_one.clone()], removed_ids: Vec::new() }),
+        )
+        .await;
+        assert!(saved.is_ok());
+
+        // Client two saves its stale snapshot plus its own new connection.
+        let client_two = sqlite_config("client-two", &dir.join("two.db").to_string_lossy());
+        let mut payload = client_two_snapshot;
+        payload.push(client_two.clone());
+        let saved = save_connections(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SaveConnectionsRequest { configs: payload, removed_ids: Vec::new() }),
+        )
+        .await;
+        assert!(saved.is_ok());
+
+        let persisted = state.app.storage.load_connections().await.unwrap();
+        assert!(
+            persisted.iter().any(|config| config.id == client_one.id),
+            "a connection saved by another client must survive a save that does not mention it"
+        );
+        assert!(persisted.iter().any(|config| config.id == client_two.id));
+        let runtime = state.app.configs.read().await;
+        assert!(runtime.contains_key(&client_one.id), "the other client's runtime config must be kept");
+        assert!(runtime.contains_key(&client_two.id));
+        drop(runtime);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn save_connections_deletes_only_explicitly_removed_connections() {
+        let (state, dir) = test_web_state().await;
+        let kept = sqlite_config("kept", &dir.join("kept.db").to_string_lossy());
+        let removed = sqlite_config("removed", &dir.join("removed.db").to_string_lossy());
+        state.app.storage.save_connections(&[kept.clone(), removed.clone()]).await.unwrap();
+
+        let saved = save_connections(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SaveConnectionsRequest { configs: vec![kept.clone()], removed_ids: vec![removed.id.clone()] }),
+        )
+        .await;
+        assert!(saved.is_ok());
+
+        let persisted = state.app.storage.load_connections().await.unwrap();
+        assert_eq!(persisted.iter().map(|config| config.id.as_str()).collect::<Vec<_>>(), vec![kept.id.as_str()]);
+        assert!(!state.app.configs.read().await.contains_key(&removed.id));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1495,7 +1953,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![updated.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![updated.clone()], removed_ids: Vec::new() }),
         )
         .await;
         assert!(result.is_ok());
@@ -1583,7 +2041,7 @@ mod tests {
             .await
         })
         .await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
 
         // 全局运行态配置不含明文密码（泄露面消除）。
         let stored = state.app.configs.read().await.get("conn-a").cloned().unwrap();
@@ -1616,10 +2074,13 @@ mod tests {
         let config = nacos_config("nacos-a");
         let headers_a = cookie_headers("token-a");
 
-        let _ =
-            save_connections(State(state.clone()), headers_a, Json(SaveConnectionsRequest { configs: vec![config] }))
-                .await
-                .unwrap();
+        let _ = save_connections(
+            State(state.clone()),
+            headers_a,
+            Json(SaveConnectionsRequest { configs: vec![config], removed_ids: Vec::new() }),
+        )
+        .await
+        .unwrap();
 
         let runtime = state.app.configs.read().await.get("nacos-a").cloned().unwrap();
         assert!(runtime.password.is_empty());
@@ -1910,6 +2371,7 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let kept = sqlite_config("kept", &dir.join("kept.db").to_string_lossy());
         let removed = mq_config("removed-mq", "http://127.0.0.1:8080");
+        state.app.storage.save_connections(&[kept.clone(), removed.clone()]).await.unwrap();
         {
             let mut configs = state.app.configs.write().await;
             configs.insert(kept.id.clone(), kept.clone());
@@ -1920,7 +2382,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![kept.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![kept.clone()], removed_ids: vec![removed.id.clone()] }),
         )
         .await;
         assert!(result.is_ok());
@@ -1942,6 +2404,7 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let kept = sqlite_config("kept", &dir.join("kept.db").to_string_lossy());
         let removed = mq_config("removed-mq", "http://127.0.0.1:8080");
+        state.app.storage.save_connections(&[kept.clone(), removed.clone()]).await.unwrap();
         {
             let mut configs = state.app.configs.write().await;
             configs.insert(kept.id.clone(), kept.clone());
@@ -1957,7 +2420,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![kept.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![kept.clone()], removed_ids: vec![removed.id.clone()] }),
         )
         .await;
         assert!(result.is_ok());

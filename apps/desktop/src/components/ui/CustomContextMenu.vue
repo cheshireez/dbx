@@ -3,6 +3,7 @@ import { ref, watch, onBeforeUnmount, onMounted, nextTick } from "vue";
 import { Check, ChevronRight } from "@lucide/vue";
 import { shortcutDisplayKeys } from "@/lib/editor/shortcutDisplay";
 import { registerGlobalContextMenu, type ContextMenuRegistration, type ContextMenuItem } from "@/components/ui/customContextMenuRegistry";
+import { buildSubmenuGraceArea, isPointerInGraceArea, type GraceAreaPoint } from "@/lib/ui/pointerGraceArea";
 
 export type { ContextMenuItem };
 
@@ -34,12 +35,19 @@ const subX = ref(0);
 const subY = ref(0);
 let subCloseTimer: ReturnType<typeof setTimeout> | null = null;
 let subAnchorRect: { left: number; right: number; top: number; bottom: number } | null = null;
+// The wedge between the trigger row and the submenu panel, rebuilt each time the
+// pointer leaves a trigger. While the pointer stays inside it the submenu is
+// treated as hovered, so a diagonal move towards the panel does not close it.
+let subGraceArea: GraceAreaPoint[] | null = null;
 let contextMenuRegistration: ContextMenuRegistration | null = null;
+let menuRevision = 0;
 
 function close() {
   if (!show.value) return;
+  menuRevision += 1;
   activeSubIndex.value = null;
   subAnchorRect = null;
+  subGraceArea = null;
   activeItems.value = [];
   show.value = false;
   emit("close");
@@ -70,7 +78,10 @@ function isScrollInsideMenu(e: Event): boolean {
 function onScroll(e: Event) {
   // Submenus (and tall main menus) are scrollable; ignore their own scroll
   // so wheel/trackpad scrolling does not dismiss the menu.
-  if (isScrollInsideMenu(e)) return;
+  if (isScrollInsideMenu(e)) {
+    if (e.target instanceof Node && menuRef.value?.contains(e.target)) activeSubIndex.value = null;
+    return;
+  }
   close();
 }
 
@@ -89,11 +100,15 @@ watch(show, (val) => {
     document.addEventListener("pointerdown", onPointerDownOutside, true);
     document.addEventListener("keydown", onKeydown, true);
     document.addEventListener("scroll", onScroll, true);
+    // Tracked on the document, in the capture phase, so the trigger-to-submenu
+    // journey is observed even where neither panel is under the cursor.
+    document.addEventListener("pointermove", onDocumentPointerMove, true);
     window.addEventListener("resize", onResize);
   } else {
     document.removeEventListener("pointerdown", onPointerDownOutside, true);
     document.removeEventListener("keydown", onKeydown, true);
     document.removeEventListener("scroll", onScroll, true);
+    document.removeEventListener("pointermove", onDocumentPointerMove, true);
     window.removeEventListener("resize", onResize);
   }
 });
@@ -102,17 +117,52 @@ onMounted(() => {
   contextMenuRegistration = registerGlobalContextMenu(close);
 });
 
-function handleItemClick(item: ContextMenuItem) {
+function handleItemClick(item: ContextMenuItem, index: number, event: MouseEvent) {
   if (itemIsDisabled(item)) return;
-  if (item.children?.length) return; // submenu trigger — do nothing on click
-  close();
-  item.action?.();
+  if (item.children?.length) {
+    onItemMouseEnter(index, event);
+    return;
+  }
+  if (item.closeOnSelect !== false) close();
+  runItemAction(item);
 }
 
 function handleSubItemClick(item: ContextMenuItem) {
   if (itemIsDisabled(item)) return;
-  close();
-  item.action?.();
+  if (item.closeOnSelect !== false) close();
+  runItemAction(item);
+}
+
+function adjustMenuPosition() {
+  if (!menuRef.value) return;
+  const rect = menuRef.value.getBoundingClientRect();
+  x.value = Math.max(8, Math.min(x.value, window.innerWidth - rect.width - 8));
+  y.value = Math.max(8, Math.min(y.value, window.innerHeight - rect.height - 8));
+}
+
+function runItemAction(item: ContextMenuItem) {
+  const revision = menuRevision;
+  const result = item.action?.() as unknown;
+  if (item.closeOnSelect !== false || !item.refreshItems) return;
+  const refresh = () => {
+    if (!show.value || revision !== menuRevision) return;
+    activeSubIndex.value = null;
+    subAnchorRect = null;
+    if (subCloseTimer) {
+      clearTimeout(subCloseTimer);
+      subCloseTimer = null;
+    }
+    activeItems.value = item.refreshItems!();
+    nextTick(() => {
+      if (!show.value || revision !== menuRevision) return;
+      adjustMenuPosition();
+      const button = [...(menuRef.value?.querySelectorAll<HTMLButtonElement>("button") ?? [])].find((entry) => entry.dataset.menuAction === item.sidebarActionId);
+      button?.focus({ preventScroll: true });
+      button?.scrollIntoView?.({ block: "nearest" });
+    });
+  };
+  if (result && typeof (result as PromiseLike<unknown>).then === "function") void Promise.resolve(result).then(refresh, refresh);
+  else refresh();
 }
 
 function onContextMenu(event: MouseEvent, itemsOverride?: ContextMenuItem[]) {
@@ -122,6 +172,8 @@ function onContextMenu(event: MouseEvent, itemsOverride?: ContextMenuItem[]) {
   // value before Vue has flushed the parent-to-child update.
   const items = itemsOverride ?? (typeof props.items === "function" ? props.items() : props.items);
   if (items.length === 0) return;
+  menuRevision += 1;
+  activeSubIndex.value = null;
   activeItems.value = items;
   event.preventDefault();
   event.stopPropagation();
@@ -130,14 +182,7 @@ function onContextMenu(event: MouseEvent, itemsOverride?: ContextMenuItem[]) {
   contextMenuRegistration?.activate();
   show.value = true;
   emit("open");
-  nextTick(() => {
-    if (!menuRef.value) return;
-    const rect = menuRef.value.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    if (rect.right > vw) x.value = Math.max(0, vw - rect.width - 8);
-    if (rect.bottom > vh) y.value = Math.max(0, vh - rect.height - 8);
-  });
+  nextTick(adjustMenuPosition);
 }
 
 // ---- submenu ----
@@ -145,6 +190,7 @@ function onContextMenu(event: MouseEvent, itemsOverride?: ContextMenuItem[]) {
 function onItemMouseEnter(index: number, event: MouseEvent) {
   lastMouseX = event.clientX;
   lastMouseY = event.clientY;
+  subGraceArea = null;
   const item = activeItems.value[index];
   if (!item?.children?.length || itemIsDisabled(item)) {
     // Moving to an item without children — close submenu immediately, no delay needed
@@ -164,15 +210,33 @@ function onItemMouseEnter(index: number, event: MouseEvent) {
   nextTick(() => adjustSubPosition());
 }
 
-function onItemMouseLeave() {
-  if (activeSubIndex.value !== null) {
-    scheduleSubClose();
-  }
+function onItemMouseLeave(event: MouseEvent) {
+  if (activeSubIndex.value === null) return;
+  subGraceArea = buildSubmenuGraceAreaForPointer(event.clientX, event.clientY);
+  scheduleSubClose();
 }
 
-// Last known mouse position (from hover events, without a global mousemove listener)
+// Last known pointer position. Updated by a document-level pointermove while the
+// menu is open; hover events alone are not enough, because the pointer spends the
+// trigger-to-submenu journey in the gap between the two panels, where nothing
+// fires.
 let lastMouseX = 0;
 let lastMouseY = 0;
+
+function buildSubmenuGraceAreaForPointer(x: number, y: number): GraceAreaPoint[] | null {
+  const sub = subRef.value?.getBoundingClientRect();
+  if (!sub) return null;
+  // The submenu's edge facing the trigger is its left edge when the panel opens
+  // to the right, and its right edge when it flips to the left. Comparing with
+  // the pointer picks the correct one without tracking the flip separately.
+  const nearEdgeX = x <= sub.left ? sub.left : sub.right;
+  return buildSubmenuGraceArea({
+    origin: { x, y },
+    nearEdgeX,
+    top: sub.top,
+    bottom: sub.bottom,
+  });
+}
 
 function isMouseOverSub(): boolean {
   if (!subRef.value) return false;
@@ -180,11 +244,28 @@ function isMouseOverSub(): boolean {
   return lastMouseX >= rect.left && lastMouseX <= rect.right && lastMouseY >= rect.top && lastMouseY <= rect.bottom;
 }
 
+function pointerIsHeadingToSubmenu(): boolean {
+  return isMouseOverSub() || isPointerInGraceArea({ x: lastMouseX, y: lastMouseY }, subGraceArea);
+}
+
+function onDocumentPointerMove(event: PointerEvent) {
+  lastMouseX = event.clientX;
+  lastMouseY = event.clientY;
+  // Cancel a pending close as soon as the pointer proves it is moving towards the
+  // submenu, rather than waiting for the timer and re-checking its position.
+  if (subCloseTimer && pointerIsHeadingToSubmenu()) {
+    clearTimeout(subCloseTimer);
+    subCloseTimer = null;
+  }
+}
+
 function scheduleSubClose() {
   if (subCloseTimer) clearTimeout(subCloseTimer);
   subCloseTimer = setTimeout(() => {
-    if (!isMouseOverSub()) {
+    subCloseTimer = null;
+    if (!pointerIsHeadingToSubmenu()) {
       activeSubIndex.value = null;
+      subGraceArea = null;
     }
   }, 150);
 }
@@ -198,6 +279,7 @@ function onSubMouseEnter() {
 
 function onSubMouseLeave() {
   activeSubIndex.value = null;
+  subGraceArea = null;
 }
 
 function adjustSubPosition() {
@@ -262,6 +344,7 @@ onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", onPointerDownOutside, true);
   document.removeEventListener("keydown", onKeydown, true);
   document.removeEventListener("scroll", onScroll, true);
+  document.removeEventListener("pointermove", onDocumentPointerMove, true);
   window.removeEventListener("resize", onResize);
 });
 </script>
@@ -274,20 +357,33 @@ onBeforeUnmount(() => {
       v-if="show"
       ref="menuRef"
       data-dbx-context-menu
-      :style="{ position: 'fixed', left: x + 'px', top: y + 'px', zIndex: 9999 }"
-      class="pointer-events-auto bg-popover text-popover-foreground min-w-40 w-max max-w-[calc(100vw-16px)] rounded-md p-1 overflow-y-auto ring-1 ring-foreground/10 shadow-lg"
+      :style="{ position: 'fixed', left: x + 'px', top: y + 'px', zIndex: 9999, maxHeight: 'calc(100vh - 16px)' }"
+      class="pointer-events-auto bg-popover text-popover-foreground min-w-40 w-max max-w-[calc(100vw-16px)] rounded-md p-1 overflow-y-auto overscroll-contain ring-1 ring-foreground/10 shadow-lg"
     >
-      <template v-for="(item, index) in activeItems" :key="index">
+      <template v-for="(item, index) in activeItems" :key="item.sidebarActionId ?? index">
         <template v-if="item.visible !== false">
           <div v-if="item.separator" class="-mx-1 my-1 flex items-center px-1">
             <div class="h-px flex-1 bg-border/70" />
           </div>
-          <button v-else :disabled="itemIsDisabled(item)" :title="item.title" :class="[...itemButtonClass(item.variant), activeSubmenuTriggerClass(item, index)]" @click="handleItemClick(item)" @mouseenter="(e) => onItemMouseEnter(index, e)" @mouseleave="onItemMouseLeave">
-            <span class="flex size-4 shrink-0 items-center justify-center">
+          <button
+            v-else
+            :disabled="itemIsDisabled(item)"
+            :aria-pressed="item.checkedStyle === 'switch' ? !!item.checked : undefined"
+            :title="item.title"
+            :data-menu-action="item.sidebarActionId"
+            :class="[...itemButtonClass(item.variant), activeSubmenuTriggerClass(item, index)]"
+            @click="(event) => handleItemClick(item, index, event)"
+            @mouseenter="(e) => onItemMouseEnter(index, e)"
+            @mouseleave="onItemMouseLeave"
+          >
+            <span v-if="item.checkedStyle !== 'switch'" class="flex size-4 shrink-0 items-center justify-center">
               <Check v-if="item.checked" class="size-4 text-primary" />
               <component :is="item.icon" v-else-if="item.icon" :class="['size-4', item.iconClass]" />
             </span>
             <span class="flex-1 whitespace-nowrap">{{ item.label }}</span>
+            <span v-if="item.checkedStyle === 'switch'" aria-hidden="true" class="ml-3 flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors" :class="item.checked ? 'bg-primary' : 'bg-input'">
+              <span class="size-2.5 rounded-full bg-primary-foreground shadow-xs transition-transform" :class="item.checked ? 'translate-x-2.5' : 'translate-x-0'" />
+            </span>
             <span v-if="item.shortcut" class="ml-8 inline-flex shrink-0 items-center gap-1 text-muted-foreground">
               <kbd v-for="key in shortcutKeys(item.shortcut)" :key="key" class="min-w-4 rounded border border-border/70 bg-muted/60 px-1 py-0.5 text-center font-mono text-[10px] leading-none text-muted-foreground shadow-xs">{{ key }}</kbd>
             </span>
@@ -313,12 +409,23 @@ onBeforeUnmount(() => {
           <div v-if="child.separator" class="-mx-1 my-1 flex items-center px-1">
             <div class="h-px flex-1 bg-border/70" />
           </div>
-          <button v-else :disabled="itemIsDisabled(child)" :title="child.title" :class="itemButtonClass(child.variant)" :style="{ paddingInlineStart: `${0.5 + (child.indentLevel ?? 0) * 0.75}rem` }" @click="handleSubItemClick(child)">
-            <span class="flex size-4 shrink-0 items-center justify-center">
+          <button
+            v-else
+            :disabled="itemIsDisabled(child)"
+            :aria-pressed="child.checkedStyle === 'switch' ? !!child.checked : undefined"
+            :title="child.title"
+            :class="itemButtonClass(child.variant)"
+            :style="{ paddingInlineStart: `${0.5 + (child.indentLevel ?? 0) * 0.75}rem` }"
+            @click="handleSubItemClick(child)"
+          >
+            <span v-if="child.checkedStyle !== 'switch'" class="flex size-4 shrink-0 items-center justify-center">
               <Check v-if="child.checked" class="size-4 text-primary" />
-              <component :is="child.icon" v-else-if="child.icon" :class="['size-4', child.iconClass]" />
+              <component :is="child.icon ?? activeItems[activeSubIndex]!.icon" v-else-if="child.icon || activeItems[activeSubIndex]!.icon" :class="['size-4', child.iconClass ?? (child.icon ? undefined : activeItems[activeSubIndex]!.iconClass)]" />
             </span>
             <span class="flex-1 whitespace-nowrap">{{ child.label }}</span>
+            <span v-if="child.checkedStyle === 'switch'" aria-hidden="true" class="ml-3 flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors" :class="child.checked ? 'bg-primary' : 'bg-input'">
+              <span class="size-2.5 rounded-full bg-primary-foreground shadow-xs transition-transform" :class="child.checked ? 'translate-x-2.5' : 'translate-x-0'" />
+            </span>
             <span v-if="child.shortcut" class="ml-8 inline-flex shrink-0 items-center gap-1 text-muted-foreground">
               <kbd v-for="key in shortcutKeys(child.shortcut)" :key="key" class="min-w-4 rounded border border-border/70 bg-muted/60 px-1 py-0.5 text-center font-mono text-[10px] leading-none text-muted-foreground shadow-xs">{{ key }}</kbd>
             </span>

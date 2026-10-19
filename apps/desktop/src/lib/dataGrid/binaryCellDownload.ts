@@ -117,6 +117,7 @@ const BINARY_STRING_TYPE_RE = /^(?:binary|varbinary)(?:\b|\()/i;
 const VARBINARY_TYPE_RE = /^varbinary(?:\b|\()/i;
 const BLOB_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob)(?:\b|\()/i;
 const MYSQL_FILE_IMPORT_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob|binary|varbinary)(?:\b|\()/i;
+const OPAQUE_AGG_STATE_TYPE_RE = /^agg_state\s*<\s*[^>\s][^>]*>$/i;
 
 function copyBytesForBlob(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   return new Uint8Array(bytes);
@@ -181,7 +182,23 @@ export function parseBinaryCellBytes(value: unknown, columnType?: string, databa
 
 export function isBinaryCellColumnType(columnType?: string): boolean {
   const type = (columnType ?? "").trim();
-  return !!type && BINARY_TYPE_RE.test(type);
+  return !!type && (BINARY_TYPE_RE.test(type) || OPAQUE_AGG_STATE_TYPE_RE.test(type));
+}
+
+export function isOpaqueAggregateStateColumnType(columnType?: string): boolean {
+  return OPAQUE_AGG_STATE_TYPE_RE.test((columnType ?? "").trim());
+}
+
+export function hasUnsafeOpaqueAggregateStatePredicate(columnTypes: readonly (string | undefined)[], row: readonly CellValue[]): boolean {
+  return columnTypes.some((columnType, index) => isOpaqueAggregateStateColumnType(columnType) && row[index] !== null);
+}
+
+export function mergeOpaqueReadonlyColumnIndexes(readonlyColumnIndexes: readonly number[] | undefined, columnTypes: readonly (string | undefined)[]): ReadonlySet<number> | undefined {
+  const merged = new Set(readonlyColumnIndexes ?? []);
+  columnTypes.forEach((columnType, index) => {
+    if (isOpaqueAggregateStateColumnType(columnType)) merged.add(index);
+  });
+  return merged.size ? merged : undefined;
 }
 
 export function isBlobCellColumnType(columnType?: string): boolean {
@@ -274,7 +291,13 @@ export function binaryCellTextPreview(value: unknown, encoding: BinaryCellTextEn
 // VARBINARY，避免改变 MySQL BINARY/BLOB、SQL Server VARBINARY、PostgreSQL BYTEA、
 // Oracle RAW 等现有语义。
 export function binaryCellClipboardText(value: unknown, columnType?: string, databaseType?: DatabaseType): string | null {
-  if (databaseType !== "mysql" || !VARBINARY_TYPE_RE.test((columnType ?? "").trim())) return null;
+  // 覆盖上方注释里「严格限于 VARBINARY」的旧范围（#12413）：网格已经对文本型 MySQL
+  // BLOB 显示文本预览（AES_DECRYPT 这类表达式的结果列常报成 BLOB），显示 `secret`
+  // 却复制出 hex 与预览自相矛盾，因此 BLOB 家族并入同一闸门；严格往返校验与 hex
+  // 回退保持不变，MySQL BINARY、非 MySQL 的 blob/bytea 等现有语义不受影响。
+  const blobColumn = isBlobCellColumnType(columnType);
+  const decodableType = VARBINARY_TYPE_RE.test((columnType ?? "").trim()) || blobColumn;
+  if (databaseType !== "mysql" || !decodableType) return null;
   // MySQL QueryResult 的 binary canonical form 是 `0x<hex>`；不要把普通的偶数长度
   // 文本（例如 "abcd"）猜测成 hex bytes。
   const bytes = typeof value === "string" ? parseBinaryCellHexValue(value) : null;
@@ -286,16 +309,23 @@ export function binaryCellClipboardText(value: unknown, columnType?: string, dat
     // 与 GBK 回退无关，沿用 hex。
     return encoded.length === bytes.length && encoded.every((byte, index) => byte === bytes[index]) ? text : null;
   }
+  // BLOB 家族与显示/编辑路径共用同一闸门：只解严格 UTF-8，不参与 GBK 回退。
+  if (blobColumn) return null;
   return printableGbkText(binaryPreviewBytes(bytes, columnType));
 }
 
-// MySQL BLOB 的文本预览必须与编辑写回路径（coerceMysqlBlobTextValue，仅 mysql）走同一闸门：
+export function isBlobTextPreviewDatabase(databaseType?: DatabaseType): boolean {
+  return databaseType === "mysql" || databaseType === "oracle" || databaseType === "oceanbase-oracle";
+}
+
+// MySQL 与 Oracle（含 OceanBase-Oracle）BLOB 的文本预览必须与编辑写回路径（coerceBlobTextValue）走同一闸门：
 // SQLite/DuckDB/H2/Firebird 等库同样暴露 `blob` 列，若一律按文本预览会出现
-// “显示是文本、编辑器却是十六进制”的不一致，故 blob 文本预览仅在 mysql 连接开启。
+// “显示是文本、编辑器却是十六进制”的不一致，故 blob 文本预览仅在支持的连接开启。
 // binary/varbinary 的文本预览早于该特性存在（如 TDengine BINARY 文本），保持全库通用。
 function isBinaryCellTextPreviewColumn(columnType: string | undefined, databaseType: DatabaseType | undefined): boolean {
+  if (isOpaqueAggregateStateColumnType(columnType)) return false;
   if (BINARY_STRING_TYPE_RE.test((columnType ?? "").trim())) return true;
-  return isBlobCellColumnType(columnType) && databaseType === "mysql";
+  return isBlobCellColumnType(columnType) && isBlobTextPreviewDatabase(databaseType);
 }
 
 // 显示/复制路径的解码链：先严格 UTF-8，仅 MySQL 连接的 binary/varbinary 再回退严格
@@ -367,6 +397,7 @@ function printableText(text: string): boolean {
 }
 
 function binaryCellDisplayLabel(columnType?: string): string {
+  if (isOpaqueAggregateStateColumnType(columnType)) return "AGG_STATE";
   const base = (columnType ?? "")
     .trim()
     .split(/[(:\s]/)[0]

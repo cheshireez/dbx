@@ -227,6 +227,21 @@ pub(crate) enum DumpClient {
 }
 
 impl DumpClient {
+    /// A dump reads documents through the agent's find cursor; gate it here, before any
+    /// work starts, so an outdated agent is refused rather than failing at the first
+    /// collection. Restore and preview never read a find cursor and stay ungated here.
+    async fn require_find_cursor(&self) -> Result<(), String> {
+        if let Self::Agent(client) = self {
+            if !client.lock().await.supports_capability(AgentCapability::MongoFindCursor) {
+                return Err(
+                    "MongoDB Legacy Agent does not support database dump; upgrade or reinstall the MongoDB Legacy driver"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn run_command(&self, database: &str, command: Document) -> Result<Document, String> {
         match self {
             Self::Native(client) => client.database(database).run_command(command).await.map_err(|e| e.to_string()),
@@ -263,7 +278,7 @@ impl DumpClient {
                     _ => None,
                 }));
             }
-            let id = cursor.get_i64("id").unwrap_or(0);
+            let id = command_cursor_id(cursor)?;
             if id == 0 {
                 return Ok(documents);
             }
@@ -378,16 +393,33 @@ impl DumpClient {
     }
 }
 
+/// A cursor id we cannot read must not look like "no more batches": that would end the listing
+/// early and produce a dump that is silently missing collections or indexes.
+fn command_cursor_id(cursor: &Document) -> Result<i64, String> {
+    match cursor.get("id") {
+        Some(mongodb::bson::Bson::Int64(id)) => Ok(*id),
+        Some(mongodb::bson::Bson::Int32(id)) => Ok(i64::from(*id)),
+        None => Err("Cursor id missing from command response".into()),
+        Some(other) => Err(format!("Unexpected cursor id in command response: {other:?}")),
+    }
+}
+
 async fn dump_client(state: &AppState, id: &str, database: &str) -> Result<DumpClient, String> {
     metadata::validate_database(database)?;
-    state.get_or_create_pool(id, Some(database)).await?;
-    match state.pool_handle(id).await {
-        Some(PoolKind::MongoDb(client)) => Ok(DumpClient::Native(client.clone())),
-        Some(PoolKind::Agent(client)) => {
+    // Propagate pool resolution errors (e.g. connection establishment failures) instead of
+    // swallowing them into the generic message below, so users see the real cause.
+    let pool = crate::mongodb_import_export::mongo_pool_for_database(state, id, database).await?;
+    match pool {
+        PoolKind::MongoDb(client) => Ok(DumpClient::Native(client.clone())),
+        PoolKind::Agent(client) => {
+            // Check what every dump, restore, or preview shares up front, so an outdated
+            // agent is refused before any work starts rather than mid-operation. The find
+            // cursor only the dump's BSON export relies on is gated on that path instead.
             let supported = {
                 let client = client.lock().await;
-                client.supports_capability(AgentCapability::MongoRunCommand)
-                    && client.supports_capability(AgentCapability::MongoInsertDocuments)
+                [AgentCapability::MongoRunCommand, AgentCapability::MongoInsertDocuments]
+                    .into_iter()
+                    .all(|capability| client.supports_capability(capability))
             };
             if !supported {
                 return Err("MongoDB Legacy Agent does not support database dump/restore; upgrade or reinstall the MongoDB Legacy driver".into());
@@ -548,6 +580,7 @@ where
             return Err("MongoDB dump/restore cancelled".into());
         }
         let client = dump_client(state, &request.connection_id, &request.database).await?;
+        client.require_find_cursor().await?;
         let mut entries = select_entries(&database_entries(&client, &request.database).await?, &request.collections)?;
         progress.collections_total = entries.len();
         let target = PathBuf::from(&request.file_path);
@@ -769,6 +802,17 @@ fn finish_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_cursor_id_accepts_integers_and_refuses_anything_else() {
+        assert_eq!(command_cursor_id(&doc! { "id": 0i64 }), Ok(0));
+        assert_eq!(command_cursor_id(&doc! { "id": 42i32 }), Ok(42));
+        assert_eq!(command_cursor_id(&doc! { "id": 1234567890123i64 }), Ok(1234567890123));
+        // Neither a missing id nor a non-integer one may be mistaken for an exhausted cursor.
+        assert!(command_cursor_id(&doc! {}).is_err());
+        assert!(command_cursor_id(&doc! { "id": "7" }).is_err());
+        assert!(command_cursor_id(&doc! { "id": 1.5 }).is_err());
+    }
 
     #[test]
     fn view_ordering_handles_deep_dependency_chains() {

@@ -13,7 +13,7 @@ export function supportsDatabaseSchemaQualifier(dbType?: DatabaseType): boolean 
 }
 
 export function supportsDatabaseNameCompletion(dbType?: DatabaseType): boolean {
-  return !!dbType && ((!isSchemaAware(dbType) && !isSingleDatabase(dbType)) || dbType === "sqlserver");
+  return !!dbType && ((!isSchemaAware(dbType) && !isSingleDatabase(dbType)) || dbType === "sqlserver" || dbType === "snowflake");
 }
 
 /**
@@ -116,7 +116,7 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
  * ZooKeeper has no query surface: its agent implements only kv_* operations,
  * so the sidebar "new query" flow would call list-databases and fail
  * (issue #8215). It is excluded alongside the other specialized surfaces
- * (nacos, consul, hbase) whose connection workbench replaces query tabs.
+ * (nacos, consul, hbase, etcd) whose connection workbench replaces query tabs.
  *
  * The message-queue surfaces (`mq` — Pulsar/Kafka/RocketMQ/RabbitMQ — and
  * `mqtt`) belong to the same group: brokers have no SQL engine, and their
@@ -128,7 +128,7 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
  * hidden there as well (issue #9609).
  */
 export function supportsConnectionQueryActions(dbType?: DatabaseType): boolean {
-  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "zookeeper" && dbType !== "plugin" && dbType !== "mq" && dbType !== "mqtt" && dbType !== "meilisearch";
+  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "etcd" && dbType !== "zookeeper" && dbType !== "plugin" && dbType !== "mq" && dbType !== "mqtt" && dbType !== "meilisearch" && dbType !== "salesforce";
 }
 
 /**
@@ -147,7 +147,7 @@ export function supportsQueryExecution(dbType?: DatabaseType): boolean {
  * that hierarchy, so they must not be offered by sidebar "Add to AI" actions.
  */
 export function supportsAiAssistantContext(dbType?: DatabaseType): boolean {
-  return supportsQueryExecution(dbType) && !usesConnectionOnlyQueryTarget(dbType);
+  return supportsQueryExecution(dbType) && !usesConnectionOnlyQueryTarget(dbType) && dbType !== "nebula";
 }
 
 export function supportsConnectionScopedQueryExecution(dbType?: DatabaseType): boolean {
@@ -182,7 +182,7 @@ export function supportsSqlFileExecution(dbType?: DatabaseType): boolean {
   return supportsDatabaseFeature(dbType, "sqlFileExecution");
 }
 
-const NON_SQL_IN_LIST_PASTE_TYPES = new Set<DatabaseType>(["neo4j"]);
+const NON_SQL_IN_LIST_PASTE_TYPES = new Set<DatabaseType>(["neo4j", "nebula"]);
 
 export function supportsSqlInListPaste(dbType?: DatabaseType): boolean {
   if (!dbType) return true;
@@ -196,6 +196,11 @@ export function supportsQueryEditorBlockComments(dbType?: DatabaseType): boolean
 
 export function supportsSchemaDiagram(dbType?: DatabaseType): boolean {
   return supportsDatabaseFeature(dbType, "diagram");
+}
+
+/** Relational engines that can list tables and columns. Independent of diagram support. */
+export function supportsDataDictionary(dbType?: DatabaseType): boolean {
+  return dbType !== "nebula" && supportsDatabaseFeature(dbType, "metadataBrowse");
 }
 
 export function supportsDatabaseSearch(dbType?: DatabaseType): boolean {
@@ -250,7 +255,22 @@ export function supportsObjectBrowserTreeNode(dbType: DatabaseType | undefined, 
 }
 
 export function supportsTableTruncate(dbType?: DatabaseType): boolean {
-  return !!dbType && dbType !== "impala" && dbType !== "sqlite" && dbType !== "rqlite" && dbType !== "turso" && dbType !== "cloudflare-d1" && dbType !== "duckdb" && dbType !== "influxdb" && dbType !== "influxdb3" && dbType !== "victoriametrics" && dbType !== "manticoresearch";
+  return (
+    !!dbType &&
+    dbType !== "impala" &&
+    dbType !== "sqlite" &&
+    dbType !== "rqlite" &&
+    dbType !== "turso" &&
+    dbType !== "cloudflare-d1" &&
+    dbType !== "duckdb" &&
+    dbType !== "influxdb" &&
+    dbType !== "influxdb3" &&
+    dbType !== "victoriametrics" &&
+    dbType !== "manticoresearch" &&
+    dbType !== "salesforce" &&
+    dbType !== "neo4j" &&
+    dbType !== "nebula"
+  );
 }
 
 export function supportsTableVacuum(dbType?: DatabaseType): boolean {
@@ -261,7 +281,7 @@ export function usesPostgresLikeStructureCopy(dbType?: DatabaseType): boolean {
   return !!dbType && PG_LIKE_STRUCTURE_TYPES.has(dbType);
 }
 
-const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "mysql", "oracle", "jdbc", "oceanbase-oracle", "dameng"];
+const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "gaussdb", "opengauss", "mysql", "oracle", "jdbc", "oceanbase-oracle", "dameng", "sqlserver"];
 
 /** Oracle-family databases, kept ONLY for the Oracle-specific ALTER SESSION SET
  *  CURRENT_SCHEMA compensation in queryStore. Do not use for toolbar/dirty-bit
@@ -274,9 +294,10 @@ const ORACLE_STICKY_TRANSACTION_TYPES: ReadonlySet<string> = new Set(["oracle", 
  *  (crates/dbx-core/src/query/mod.rs + sql_risk.rs `prove_read_only_for_database`).
  *  Every member must also be in TRANSACTION_SUPPORTED_TYPES above: a database
  *  cannot reach manual mode (and this UX) without explicit transaction control
- *  (#9018). Family members like doris/kingbase join only when their transaction
- *  support lands. */
-const PROVEN_READ_ONLY_STICKY_TYPES: ReadonlySet<string> = new Set(["oracle", "oceanbase-oracle", "mysql", "postgres"]);
+ *  (#9018). The PostgreSQL family (PostgreSQL, GaussDB, openGauss) and MySQL use
+ *  the strict `sql_risk` proof; Oracle keeps its lexical classifier. Family
+ *  members like doris/kingbase join only when their transaction support lands. */
+const PROVEN_READ_ONLY_STICKY_TYPES: ReadonlySet<string> = new Set(["oracle", "oceanbase-oracle", "mysql", "postgres", "gaussdb", "opengauss"]);
 
 /**
  * Returns true if the given database type supports explicit transaction control

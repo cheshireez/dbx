@@ -13,21 +13,43 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import { useToast } from "@/composables/useToast";
+import FailureDetailsList from "@/components/sql-file/FailureDetailsList.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useQueryStore } from "@/stores/queryStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { connectionIsEffectivelyReadOnly, ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
-import { supportsTransaction } from "@/lib/database/databaseFeatureSupport";
+import { supportsSqlFileExecution, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 import { formatError, isManualTransactionSessionExpired } from "@/lib/backend/errorUtils";
-import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
+import { fetchSqlFileTargetOptions, namespaceOptionsAreSchemas } from "@/composables/useDatabaseOptions";
 import { requiresSqlFileTargetDatabaseSelection, supportsConnectionLevelDatabaseBootstrap } from "@/lib/connection/connectionLevelDatabaseBootstrap";
-import { beginManualTransaction, commitManualTransaction, rollbackManualTransaction, cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
+import {
+  beginManualTransaction,
+  commitManualTransaction,
+  rollbackManualTransaction,
+  cancelSqlFileExecution,
+  executeSqlFiles,
+  refreshSqlFilePreview,
+  inspectSqlFileTables,
+  listenSqlFileProgress,
+  previewSqlFile,
+  type SqlFilePreview,
+  type SqlFileProgress,
+  type SqlFileStatus,
+  type SqlFileTable,
+} from "@/lib/backend/api";
+import { activeTabExternalSqlFileTarget, rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget, type ExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
+import type { SqlFileEncoding } from "@/lib/backend/tauri";
+import { TABLE_IMPORT_ENCODING_OPTIONS } from "@/lib/table/tableImport";
+import { isSqlFilePath } from "@/lib/sql/sqlFileOpen";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { parseSqlFilePathInput } from "./sqlFilePathInput";
+import { orderConnectionsForSidebarDisplay } from "@/lib/sidebar/connectionListSort";
 import SqlFileProgressIndicator from "./SqlFileProgressIndicator.vue";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
 import { translateBackendError } from "@/i18n/backend-errors";
-import { Check, CheckSquare, ChevronRight, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
+import { Check, CheckSquare, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -38,16 +60,24 @@ const open = defineModel<boolean>("open", { default: false });
 const props = defineProps<{
   prefillConnectionId?: string;
   prefillDatabase?: string;
+  prefillSchema?: string;
   prefillFilePath?: string;
+  prefillPreview?: SqlFilePreview;
 }>();
 
 const store = useConnectionStore();
+const queryStore = useQueryStore();
+const settingsStore = useSettingsStore();
 const productionSafetyStore = useProductionSafetyStore();
 // Tauri = real filesystem paths; Web = browser File.name (no path) + server temp paths.
 const isDesktopRuntime = isTauriRuntime();
 
 const fileInput = ref<HTMLInputElement | null>(null);
 const previews = ref<SqlFilePreview[]>([]);
+const encoding = ref<SqlFileEncoding>("auto");
+const previewError = ref("");
+let previewGeneration = 0;
+let selectedSources: Array<string | File> = [];
 const activePreviewPath = ref("");
 // Only the active file's preview body is mounted (reka-ui unmounts inactive
 // TabsContent), so switching files keeps the DOM small even with many files.
@@ -62,6 +92,7 @@ watch(previews, (list) => {
 const activePreview = computed<SqlFilePreview | null>(() => {
   return previews.value.find((item) => item.filePath === activePreviewPath.value) ?? previews.value[0] ?? null;
 });
+const activePreviewHtml = computed(() => (activePreview.value ? highlight(activePreview.value.preview) : ""));
 
 // Disambiguate files that share the same fileName.
 // Desktop: prepend parent directory segments until unique (e.g. migration/create.sql).
@@ -90,7 +121,7 @@ async function commitPathInput() {
     return;
   }
   const typed = pathInput.value;
-  await loadPreviews(paths);
+  await loadPreviews(paths, true);
   // Failed load: keep what was typed so the path can be corrected.
   pathInput.value = previews.value.length > 0 ? filePathDisplay.value : typed;
 }
@@ -111,9 +142,10 @@ function tooltipText(item: SqlFilePreview): string {
 const selectingFile = ref(false);
 const loadingPreview = ref(false);
 const connectionId = ref("");
-const database = ref("");
+const targetNamespace = ref("");
 const databaseOptions = ref<string[]>([]);
 const loadingDatabases = ref(false);
+const preferredTarget = ref<ExternalSqlFileTarget>();
 const continueOnError = ref(false);
 const skipRelationalConstraints = ref(false);
 const manualTransaction = ref(false);
@@ -158,6 +190,8 @@ interface PerFileSummary {
   failureCount: number;
   affectedRows: number;
 }
+type SqlFileExecutionTarget = { database: string; schema?: string };
+
 const perFileResults = ref<PerFileSummary[]>([]);
 const currentFileIndex = ref(-1);
 const currentFileName = ref("");
@@ -167,7 +201,7 @@ function resetPerFileState() {
   currentFileName.value = "";
 }
 
-const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
+const sqlConnections = computed(() => orderConnectionsForSidebarDisplay(store.connections, store.treeNodes, settingsStore.editorSettings.sidebarConnectionSortMode).filter((connection) => supportsSqlFileExecution(connection.db_type)));
 // Mirrors the core executor gate (`relational_constraint_bypass_kind` in
 // sql_file_import.rs): MySQL-family types use the session-scoped
 // FOREIGN_KEY_CHECKS toggle, PostgreSQL-family types use DISABLE/ENABLE
@@ -217,7 +251,16 @@ async function finishTransaction(commit: boolean) {
       terminalStatus.value = outcomeUnknown ? "error" : committed ? "done" : "cancelled";
       if (progress.value) updateSqlFileTask(executionId.value, { ...progress.value, status: terminalStatus.value });
     }
-    await refreshTargetAfterImport();
+    await refreshTargetAfterImport(sqlFileExecutionTarget());
+    if (committed && !outcomeUnknown) {
+      const failureCount = progress.value?.failureCount ?? 0;
+      if (failureCount > 0) {
+        toast(t("sqlFile.completedWithErrors", { succeeded: progress.value?.successCount ?? 0, failed: failureCount }), 5000);
+      } else {
+        toast(t("sqlFile.executeSuccess"), 3000);
+        open.value = false;
+      }
+    }
     return true;
   } catch (error: any) {
     toast(error?.message || String(error), 5000);
@@ -237,7 +280,9 @@ watch(canUseManualTransaction, (supported) => {
   if (!supported && !txnSessionId.value) manualTransaction.value = false;
 });
 onBeforeUnmount(() => {
+  ++previewGeneration;
   disposed = true;
+  if (!running.value) void releaseManagedPreviews();
   if (running.value && manualTransaction.value) {
     cancelRequested.value = true;
     if (executionStarted.value) void cancelSqlFileExecution(executionId.value).catch(() => {});
@@ -275,7 +320,7 @@ function toggleFilteredTables() {
   }
 }
 
-watch([restoreSelectedTables, canSelectTables, () => previews.value[0]?.filePath, connectionId, open], async () => {
+watch([restoreSelectedTables, canSelectTables, () => previews.value[0]?.filePath, encoding, connectionId, open], async () => {
   const generation = ++tableScanGeneration;
   backupTables.value = [];
   selectedTableKeys.value = new Set();
@@ -286,7 +331,7 @@ watch([restoreSelectedTables, canSelectTables, () => previews.value[0]?.filePath
   if (!open.value || !restoreSelectedTables.value || !canSelectTables.value) return;
   loadingTables.value = true;
   try {
-    const tables = await inspectSqlFileTables(previews.value[0]!.filePath);
+    const tables = await inspectSqlFileTables(previews.value[0]!.filePath, encoding.value);
     if (generation !== tableScanGeneration) return;
     backupTables.value = tables;
   } catch (error: any) {
@@ -298,7 +343,7 @@ watch([restoreSelectedTables, canSelectTables, () => previews.value[0]?.filePath
 
 const canStart = computed(() => {
   const connection = selectedConnection.value;
-  if (previews.value.length === 0 || !connection || executionLocked.value || loadingPreview.value || loadingDatabases.value) return false;
+  if (previewError.value || previews.value.length === 0 || !connection || executionLocked.value || loadingPreview.value || loadingDatabases.value) return false;
   if (restoreSelectedTables.value && (loadingTables.value || tableScanError.value || selectedTables.value.length === 0)) return false;
   let hasDatabaseContext = false;
   const canExecuteWithoutSelectedDatabase = previews.value.every((item) => {
@@ -306,7 +351,7 @@ const canStart = computed(() => {
     hasDatabaseContext ||= item.establishesDatabaseContext === true;
     return true;
   });
-  return !!database.value.trim() || !requiresSqlFileTargetDatabaseSelection(connection, canExecuteWithoutSelectedDatabase);
+  return !!targetNamespace.value.trim() || !requiresSqlFileTargetDatabaseSelection(connection, canExecuteWithoutSelectedDatabase);
 });
 
 const statusTone = computed(() => {
@@ -325,6 +370,10 @@ const statusIcon = computed(() => {
 });
 
 const sqlFileFailures = computed(() => activeExecutionTask.value?.sqlFileFailures ?? []);
+// Default name of an exported failure log: the executed script(s), so a log is
+// recognizable next to the file it came from.
+const failureLogFileNameHint = computed(() => previews.value.map((item) => displayFileNames.value.get(item.filePath) ?? item.fileName).join("-") || "sql-file");
+
 const sqlFileFailureCount = computed(() => sqlFileFailures.value.length + (activeExecutionTask.value?.sqlFileFailuresOmitted ?? 0));
 const unlistedTerminalError = computed(() => {
   const error = progress.value?.error || terminalError.value;
@@ -373,22 +422,77 @@ function statusLabel(status: SqlFileStatus | "idle") {
   return t(`sqlFile.status.${status}`);
 }
 
-function resolveInitialConnectionId() {
+function resolveInitialTarget(): ExternalSqlFileTarget {
   if (props.prefillConnectionId && sqlConnections.value.some((c) => c.id === props.prefillConnectionId)) {
-    return props.prefillConnectionId;
+    return {
+      connectionId: props.prefillConnectionId,
+      database: props.prefillDatabase ?? "",
+      schema: props.prefillSchema,
+    };
   }
-  if (props.prefillFilePath) return "";
-  return sqlConnections.value[0]?.id ?? "";
+  if (props.prefillFilePath) return { connectionId: "", database: "" };
+  return activeTabExternalSqlFileTarget(queryStore.tabs, queryStore.activeTabId, (connectionId) => store.getConfig(connectionId));
 }
 
-function chooseDatabase(names: string[], id: string) {
-  const configDatabase = store.getConfig(id)?.database ?? "";
+function normalizeTargetForConnection(target: ExternalSqlFileTarget): ExternalSqlFileTarget {
+  const connection = store.getConfig(target.connectionId);
+  if (!namespaceOptionsAreSchemas(connection)) return target;
+
+  const configuredDatabase = connection?.database?.trim() || "";
+  const requestedDatabase = target.database.trim();
+  const explicitSchema = target.schema?.trim() || undefined;
+  const legacySchema = explicitSchema || (requestedDatabase && requestedDatabase !== configuredDatabase ? requestedDatabase : undefined);
+  return {
+    ...target,
+    database: configuredDatabase,
+    ...(legacySchema ? { schema: legacySchema } : { schema: undefined }),
+  };
+}
+
+function applyTarget(target: ExternalSqlFileTarget) {
+  const normalizedTarget = normalizeTargetForConnection(target);
+  preferredTarget.value = normalizedTarget;
+  connectionId.value = normalizedTarget.connectionId;
+  targetNamespace.value = namespaceOptionsAreSchemas(store.getConfig(normalizedTarget.connectionId)) ? (normalizedTarget.schema ?? "") : normalizedTarget.database;
+}
+
+function chooseNamespace(names: string[], id: string) {
+  const connection = store.getConfig(id);
+  const optionsAreSchemas = namespaceOptionsAreSchemas(connection);
+  const preferred = preferredTarget.value?.connectionId === id ? preferredTarget.value : undefined;
+  const preferredNamespace = preferred ? (optionsAreSchemas ? preferred.schema : preferred.database) : optionsAreSchemas ? (id === props.prefillConnectionId ? props.prefillSchema : undefined) : props.prefillDatabase;
+  const configuredNamespace = optionsAreSchemas ? (connection?.default_schema ?? "") : (connection?.database ?? "");
+  const currentNamespace = targetNamespace.value.trim();
+  if (currentNamespace && connectionId.value === id && names.includes(currentNamespace)) return currentNamespace;
   if (names.length > 0) {
-    if (props.prefillDatabase && names.includes(props.prefillDatabase)) return props.prefillDatabase;
-    if (configDatabase && names.includes(configDatabase)) return configDatabase;
+    if (preferredNamespace && names.includes(preferredNamespace)) return preferredNamespace;
+    if (configuredNamespace && names.includes(configuredNamespace)) return configuredNamespace;
     return names.length === 1 ? names[0] : "";
   }
-  return props.prefillDatabase ?? configDatabase;
+  return preferredNamespace ?? configuredNamespace;
+}
+
+watch(targetNamespace, (namespace) => {
+  if (!connectionId.value) return;
+  const connection = store.getConfig(connectionId.value);
+  const optionsAreSchemas = namespaceOptionsAreSchemas(connection);
+  preferredTarget.value = {
+    connectionId: connectionId.value,
+    database: optionsAreSchemas ? connection?.database?.trim() || "" : namespace.trim(),
+    ...(optionsAreSchemas ? { schema: namespace.trim() } : {}),
+  };
+});
+
+function sqlFileExecutionTarget(): SqlFileExecutionTarget {
+  const namespace = targetNamespace.value.trim();
+  const connection = store.getConfig(connectionId.value);
+  if (namespaceOptionsAreSchemas(connection)) {
+    return {
+      database: connection?.database?.trim() || "",
+      ...(namespace ? { schema: namespace } : {}),
+    };
+  }
+  return { database: namespace };
 }
 
 function resetExecution() {
@@ -407,11 +511,15 @@ function resetExecution() {
 }
 
 function resetState() {
+  ++previewGeneration;
+  selectedSources = [];
+  previewError.value = "";
+  const initialTarget = resolveInitialTarget();
   previews.value = [];
+  encoding.value = "auto";
   selectingFile.value = false;
   loadingPreview.value = false;
-  connectionId.value = resolveInitialConnectionId();
-  database.value = "";
+  applyTarget(initialTarget);
   databaseOptions.value = [];
   loadingDatabases.value = false;
   continueOnError.value = false;
@@ -429,7 +537,7 @@ async function loadDatabasesForConnection(id: string) {
   databaseOptions.value = [];
 
   if (!sqlConnections.value.some((c) => c.id === id)) {
-    database.value = "";
+    targetNamespace.value = "";
     return;
   }
 
@@ -441,11 +549,11 @@ async function loadDatabasesForConnection(id: string) {
     const names = await fetchSqlFileTargetOptions(id, connection);
     if (token !== databaseLoadToken) return;
     databaseOptions.value = names;
-    database.value = chooseDatabase(names, id);
+    targetNamespace.value = chooseNamespace(names, id);
   } catch {
     if (token !== databaseLoadToken) return;
     databaseOptions.value = [];
-    database.value = chooseDatabase([], id);
+    targetNamespace.value = chooseNamespace([], id);
   } finally {
     if (token === databaseLoadToken) {
       loadingDatabases.value = false;
@@ -453,9 +561,9 @@ async function loadDatabasesForConnection(id: string) {
   }
 }
 
-async function previewSelectedSqlFile(fileOrPath: string | File) {
+async function previewSelectedSqlFile(fileOrPath: string | File, selectedEncoding: SqlFileEncoding) {
   if (isTauriRuntime()) {
-    return previewSqlFile(fileOrPath as string);
+    return previewSqlFile(fileOrPath as string, selectedEncoding);
   }
   const file = fileOrPath as File;
   const uploadLimit = webSqlFileUploadMaxBytes.value;
@@ -463,24 +571,85 @@ async function previewSelectedSqlFile(fileOrPath: string | File) {
     throw new Error(`File too large: ${file.size} bytes (max ${uploadLimit} bytes)`);
   }
   const { previewSqlFile: previewWebSqlFile } = await import("@/lib/backend/http");
-  return previewWebSqlFile(file);
+  return previewWebSqlFile(file, selectedEncoding);
 }
 
-async function loadPreviews(filesOrPaths: Array<string | File>) {
+async function loadPreviews(filesOrPaths: Array<string | File>, resolveSelectedFileTarget = false) {
   if (executionLocked.value) return;
+  selectedSources = [...filesOrPaths];
+  const generation = ++previewGeneration;
+  const selectedEncoding = encoding.value;
+  previewError.value = "";
   loadingPreview.value = true;
+  await releaseManagedPreviews();
+  if (generation !== previewGeneration) return;
   previews.value = [];
   resetExecution();
   try {
     const nextPreviews: SqlFilePreview[] = [];
     for (const fileOrPath of filesOrPaths) {
-      nextPreviews.push(await previewSelectedSqlFile(fileOrPath));
+      nextPreviews.push(await previewSelectedSqlFile(fileOrPath, selectedEncoding));
     }
+    if (generation !== previewGeneration) return;
     previews.value = nextPreviews;
+    if (resolveSelectedFileTarget && !props.prefillConnectionId) {
+      const firstPath = typeof filesOrPaths[0] === "string" && isSqlFilePath(filesOrPaths[0]) ? filesOrPaths[0] : undefined;
+      const remembered = firstPath ? resolveExternalSqlFileTarget(firstPath, (id) => sqlConnections.value.some((c) => c.id === id), unassociatedExternalSqlFileTarget()) : undefined;
+      if (remembered?.connectionId) {
+        applyTarget(remembered);
+      } else if (!connectionId.value) {
+        applyTarget(activeTabExternalSqlFileTarget(queryStore.tabs, queryStore.activeTabId, (connectionId) => store.getConfig(connectionId)));
+      }
+    }
   } catch (e: any) {
-    toast(e?.message || String(e), 5000);
+    if (generation !== previewGeneration) return;
+    previewError.value = e?.message || String(e);
+    toast(previewError.value, 5000);
   } finally {
-    loadingPreview.value = false;
+    if (generation === previewGeneration) loadingPreview.value = false;
+  }
+}
+
+watch(
+  encoding,
+  async () => {
+    if (!open.value || executionLocked.value) return;
+    if (!previews.value.length) {
+      if (selectedSources.length) await loadPreviews(selectedSources);
+      return;
+    }
+    const generation = ++previewGeneration;
+    const selectedEncoding = encoding.value;
+    const current = [...previews.value];
+    previewError.value = "";
+    loadingPreview.value = true;
+    resetExecution();
+    try {
+      const refreshed = await Promise.all(
+        current.map(async (item) => ({
+          ...item,
+          ...(await refreshSqlFilePreview(item.packageFilePaths?.[0] ?? item.filePath, selectedEncoding)),
+        })),
+      );
+      if (generation === previewGeneration) previews.value = refreshed;
+    } catch (error: any) {
+      if (generation === previewGeneration) previewError.value = error?.message || String(error);
+    } finally {
+      if (generation === previewGeneration) loadingPreview.value = false;
+    }
+  },
+  { flush: "sync" },
+);
+
+async function releaseManagedPreviews() {
+  const tokens = previews.value.flatMap((preview) => (preview.cleanupToken ? [preview.cleanupToken] : []));
+  if (!tokens.length) return;
+  previews.value = previews.value.filter((preview) => !preview.cleanupToken);
+  try {
+    const { releaseSqlFilePreview } = await import("@/lib/backend/api");
+    await Promise.all(tokens.map((token) => releaseSqlFilePreview(token)));
+  } catch (error: any) {
+    toast(error?.message || String(error), 5000);
   }
 }
 
@@ -499,7 +668,7 @@ async function selectFile() {
     });
     const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
     if (paths.length > 0) {
-      await loadPreviews(paths);
+      await loadPreviews(paths, true);
     }
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
@@ -515,7 +684,7 @@ async function handleFileInputChange(event: Event) {
   if (files.length === 0 || executionLocked.value) return;
   selectingFile.value = true;
   try {
-    await loadPreviews(files);
+    await loadPreviews(files, true);
   } finally {
     selectingFile.value = false;
   }
@@ -533,11 +702,15 @@ function isTerminalProgress(status: SqlFileStatus): boolean {
   return status === "done" || status === "error" || status === "cancelled";
 }
 
-async function refreshTargetAfterImport() {
+async function refreshTargetAfterImport(target: SqlFileExecutionTarget) {
   if (refreshedTarget.value) return;
   refreshedTarget.value = true;
   try {
-    await store.refreshDatabaseTreeNode(connectionId.value, database.value.trim());
+    if (target.schema) {
+      await store.refreshObjectListTreeNode(connectionId.value, target.database, target.schema);
+    } else {
+      await store.refreshDatabaseTreeNode(connectionId.value, target.database);
+    }
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
   }
@@ -545,13 +718,15 @@ async function refreshTargetAfterImport() {
 
 async function startExecution() {
   if (!canStart.value || previews.value.length === 0) return;
+  const generation = previewGeneration;
+  const target = sqlFileExecutionTarget();
   // Await the unlock guard only when it can actually prompt/block (effectively
   // read-only); writable or already-unlocked connections stay synchronous so
   // the running state flips in the same tick as the click.
   if (connectionIsEffectivelyReadOnly(selectedConnection.value)) {
     if (!(await ensureReadOnlyWriteAccess({ connection: selectedConnection.value, source: t("readOnlyUnlock.sourceSqlFile"), treatAsMutation: true }))) return;
   }
-  const productionContext = productionContextForDatabase(selectedConnection.value, database.value);
+  const productionContext = productionContextForDatabase(selectedConnection.value, target.database);
   if (productionContext.active) {
     // File previews are truncated, so production file execution is always reviewed instead of inferring safety from a partial preview.
     const confirmed = await productionSafetyStore.requestConfirmation({
@@ -560,13 +735,15 @@ async function startExecution() {
         .join("\n\n")
         .slice(0, 20_000),
       connectionName: selectedConnection.value?.name,
-      database: database.value,
+      database: target.database,
       productionDatabases: productionContext.databases,
       source: t("production.sourceSqlFile"),
     });
     if (!confirmed) return;
   }
 
+  // A confirmation may have yielded while the file or encoding changed.
+  if (!canStart.value || generation !== previewGeneration) return;
   resetPerFileState();
   refreshedTarget.value = false;
   const batchId = uuid();
@@ -583,6 +760,7 @@ async function startExecution() {
   const taskLabel = previews.value.length === 1 ? previews.value[0]!.fileName : `${previews.value[0]!.fileName} (+${previews.value.length - 1})`;
   activeExecutionTask.value = addSqlFileTask(batchId, taskLabel, filePathDisplay.value);
   let completedSuccessfully = false;
+  let terminal: SqlFileProgress | null = null;
 
   try {
     await store.ensureConnected(connectionId.value);
@@ -592,7 +770,7 @@ async function startExecution() {
     }
 
     if (manualTransaction.value) {
-      const sessionId = await beginManualTransaction(connectionId.value, database.value.trim());
+      const sessionId = target.schema ? await beginManualTransaction(connectionId.value, target.database, target.schema) : await beginManualTransaction(connectionId.value, target.database);
       txnSessionId.value = sessionId;
       commitUncertain.value = false;
       if (disposed || cancelRequested.value) {
@@ -668,8 +846,10 @@ async function startExecution() {
         {
           executionId: batchId,
           connectionId: connectionId.value,
-          database: database.value.trim(),
+          database: target.database,
+          ...(target.schema ? { schema: target.schema } : {}),
           filePath: executionPaths[0]!,
+          encoding: encoding.value,
           continueOnError: continueOnError.value,
           ...(txnSessionId.value ? { txnSessionId: txnSessionId.value } : {}),
           ...(restoreSelectedTables.value ? { selectedTables: selectedTables.value.map((table) => ({ ...table })) } : {}),
@@ -678,7 +858,8 @@ async function startExecution() {
         },
         executionPaths,
       );
-      const terminal = await terminalProgress;
+      terminal = await terminalProgress;
+      progress.value = terminal;
       if (terminal.status === "error") {
         throw new Error(terminal.error || "SQL file execution failed");
       }
@@ -691,7 +872,30 @@ async function startExecution() {
       unlisten();
     }
 
-    if (completedSuccessfully && !txnSessionId.value) await refreshTargetAfterImport();
+    if (completedSuccessfully) {
+      if (isDesktopRuntime) {
+        for (const item of previews.value) {
+          if (item.filePath) {
+            rememberExternalSqlFileTarget(item.filePath, {
+              connectionId: connectionId.value,
+              database: target.database,
+              schema: target.schema,
+            });
+          }
+        }
+      }
+      if (!txnSessionId.value) {
+        await refreshTargetAfterImport(target);
+        const finalProgress = terminal ?? progress.value;
+        const failureCount = finalProgress?.failureCount ?? 0;
+        if (failureCount > 0) {
+          toast(t("sqlFile.completedWithErrors", { succeeded: finalProgress?.successCount ?? 0, failed: failureCount }), 5000);
+        } else {
+          toast(t("sqlFile.executeSuccess"), 3000);
+          open.value = false;
+        }
+      }
+    }
   } catch (e: any) {
     terminalStatus.value = cancelRequested.value ? "cancelled" : "error";
     terminalError.value = e?.message || String(e);
@@ -720,6 +924,7 @@ async function startExecution() {
     running.value = false;
     cancelling.value = false;
     executionStarted.value = false;
+    await releaseManagedPreviews();
   }
 }
 
@@ -755,13 +960,15 @@ watch(connectionId, (id) => {
 
 watch(sqlConnections, () => {
   if (!open.value || executionLocked.value || selectedConnection.value) return;
-  connectionId.value = resolveInitialConnectionId();
+  applyTarget(resolveInitialTarget());
 });
 
 watch(
   open,
   (value) => {
     if (!value) {
+      ++previewGeneration;
+      if (!running.value) void releaseManagedPreviews();
       if (manualTransaction.value && running.value) void cancelExecution();
       else if (txnSessionId.value) void finishTransaction(false);
       return;
@@ -773,7 +980,9 @@ watch(
     }
     // When opened from the SQL Files panel with a pre-selected file, load its
     // preview automatically so the user can review statements before running.
-    if (props.prefillFilePath) {
+    if (props.prefillPreview) {
+      previews.value = [props.prefillPreview];
+    } else if (props.prefillFilePath) {
       void loadPreviews([props.prefillFilePath]);
     }
   },
@@ -807,6 +1016,18 @@ watch(
               <FolderOpen v-else class="w-3.5 h-3.5 mr-1.5" />
               {{ t("sqlFile.browse") }}
             </Button>
+          </div>
+
+          <div class="space-y-1.5">
+            <Label for="sql-file-encoding" class="text-xs">{{ t("tableImport.encoding") }}</Label>
+            <Select v-model="encoding" :disabled="executionLocked || selectingFile || loadingPreview">
+              <SelectTrigger id="sql-file-encoding" class="h-8 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="option in TABLE_IMPORT_ENCODING_OPTIONS" :key="option.value" :value="option.value">{{ t(option.labelKey) }}</SelectItem>
+              </SelectContent>
+            </Select>
+            <p class="text-xs text-muted-foreground">{{ t("sqlFile.encodingHint") }}</p>
+            <p v-if="previewError" class="break-words text-xs text-destructive" role="alert">{{ previewError }}</p>
           </div>
 
           <div v-if="previews.length" class="flex min-w-0 gap-3">
@@ -847,7 +1068,7 @@ watch(
                 <div class="sticky left-0 z-10 select-none border-r bg-background/95 px-2 py-3 text-right font-mono leading-5 text-muted-foreground/70">
                   <div v-for="n in previewLineCount(activePreview)" :key="n">{{ n }}</div>
                 </div>
-                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="highlight(activePreview.preview)"></pre>
+                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="activePreviewHtml"></pre>
               </div>
             </div>
           </div>
@@ -861,7 +1082,7 @@ watch(
           <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div class="space-y-1.5">
               <Label class="text-xs">{{ t("sqlFile.connection") }}</Label>
-              <Select v-model="connectionId" :disabled="executionLocked">
+              <Select v-model="connectionId" :disabled="executionLocked" data-sql-file-connection>
                 <SelectTrigger class="h-8 text-xs">
                   <div v-if="connectionId" class="flex items-center gap-1.5 min-w-0">
                     <DatabaseIcon :db-type="connectionIconType(connectionId)" class="w-3.5 h-3.5 shrink-0" />
@@ -883,7 +1104,7 @@ watch(
 
             <div class="space-y-1.5">
               <Label class="text-xs">{{ t("sqlFile.database") }}</Label>
-              <Select v-if="databaseOptions.length" v-model="database" :disabled="executionLocked || loadingDatabases">
+              <Select v-if="databaseOptions.length" v-model="targetNamespace" :disabled="executionLocked || loadingDatabases">
                 <SelectTrigger class="h-8 text-xs">
                   <SelectValue :placeholder="t('sqlFile.selectDatabase')" />
                 </SelectTrigger>
@@ -892,7 +1113,7 @@ watch(
                 </SelectContent>
               </Select>
               <div v-else class="relative">
-                <Input v-model="database" class="h-8 text-xs" :disabled="executionLocked || loadingDatabases" :placeholder="t('sqlFile.databasePlaceholder')" />
+                <Input v-model="targetNamespace" class="h-8 text-xs" :disabled="executionLocked || loadingDatabases" :placeholder="t('sqlFile.databasePlaceholder')" />
                 <Loader2 v-if="loadingDatabases" class="absolute right-2 top-2 w-3.5 h-3.5 animate-spin text-muted-foreground" />
               </div>
             </div>
@@ -1044,26 +1265,18 @@ watch(
             </div>
           </div>
 
-          <div v-if="sqlFileFailureCount > 0" class="min-w-0 space-y-1.5">
-            <button type="button" class="flex items-center gap-1 text-xs font-medium text-foreground hover:text-primary" :aria-expanded="failureDetailsExpanded" @click="failureDetailsExpanded = !failureDetailsExpanded">
-              <ChevronRight class="h-3.5 w-3.5 shrink-0 transition-transform" :class="{ 'rotate-90': failureDetailsExpanded }" />
-              {{ failureDetailsExpanded ? t("exportProgress.hideFailureDetails") : t("exportProgress.showFailureDetails", { count: sqlFileFailureCount }) }}
-            </button>
-            <div v-if="failureDetailsExpanded" class="max-h-[min(30vh,280px)] min-w-0 overflow-y-auto rounded-md border border-destructive/20 bg-destructive/5 text-xs">
-              <div v-for="failure in sqlFileFailures" :key="`${failure.fileIndex ?? -1}:${failure.statementIndex}`" class="border-b border-destructive/15 p-2.5 last:border-b-0">
-                <div class="flex min-w-0 items-center gap-1.5 font-medium text-foreground">
-                  <span class="shrink-0">#{{ failure.statementIndex }}</span>
-                  <span v-if="failure.fileName" class="truncate text-muted-foreground" :title="failure.fileName">{{ failure.fileName }}</span>
-                </div>
-                <div v-if="failure.statementSummary" class="mt-1 max-w-full overflow-auto font-mono whitespace-pre-wrap break-words text-foreground">{{ failure.statementSummary }}</div>
-                <div class="mt-1 select-text whitespace-pre-wrap break-words text-destructive">{{ translateBackendError(t, failure.error) }}</div>
-                <div v-if="failure.truncated" class="mt-1 text-muted-foreground">{{ t("exportProgress.failureDetailTruncated") }}</div>
-              </div>
-              <div v-if="activeExecutionTask?.sqlFileFailuresOmitted" class="p-2.5 text-muted-foreground">
-                {{ t("exportProgress.failureDetailsOmitted", { count: activeExecutionTask.sqlFileFailuresOmitted }) }}
-              </div>
-            </div>
-          </div>
+          <!-- The list is capped in memory while the backend log keeps every
+               failed statement, so the export/copy actions live in the shared
+               component that also renders these rows (dbx#11619). -->
+          <FailureDetailsList
+            v-if="sqlFileFailureCount > 0"
+            v-model:expanded="failureDetailsExpanded"
+            :execution-id="executionId || activeExecutionTask?.exportId || undefined"
+            :failures="sqlFileFailures"
+            :omitted="activeExecutionTask?.sqlFileFailuresOmitted ?? 0"
+            :file-name-hint="failureLogFileNameHint"
+            variant="dialog"
+          />
 
           <div v-if="unlistedTerminalError" class="max-w-full overflow-auto rounded-md border bg-destructive/5 p-2 text-xs text-destructive whitespace-pre-wrap">
             {{ translateBackendError(t, unlistedTerminalError) }}

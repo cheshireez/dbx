@@ -30,6 +30,7 @@ function semanticCompletion(markedSql: string, input: Partial<SqlCompletionProvi
     databaseType: options.databaseType,
     keywordCase: input.keywordCase,
     autoAliasTables: input.autoAliasTables,
+    tableCompletionSchemaQualification: input.tableCompletionSchemaQualification,
   });
   return { sql, cursor, model, context, items };
 }
@@ -67,6 +68,7 @@ describe("semantic SQL completion candidates", () => {
 
     const nickname = items.find((item) => item.type === "column" && item.label === "nickname");
     expect(nickname?.detail).toContain("-- 用户昵称");
+    expect(nickname?.comment).toBe("用户昵称");
   });
 
   it("ignores line-comment semicolons after a real statement boundary", () => {
@@ -202,6 +204,24 @@ describe("semantic SQL completion candidates", () => {
 
     expect(context.suggestKeywords).toBe(false);
     expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: expectedKeyword, type: "keyword" })]));
+  });
+
+  it.each([
+    ["UPDATE", "update|", "sqlserver"],
+    ["FROM", "select * from|", "mysql"],
+    ["JOIN", "select * from t1 join|", "mysql"],
+  ] as const)("keeps a fully typed table introducer keyword (%s) in the candidate list", (keyword, sql, databaseType) => {
+    const { context, items } = semanticCompletion(sql, {}, { databaseType });
+
+    expect(context.suggestKeywords).toBe(true);
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: keyword, type: "keyword" })]));
+  });
+
+  it("offers tables once a table introducer keyword is committed with whitespace", () => {
+    const { context, items } = semanticCompletion("update |", { tables: [{ name: "orders" }] }, { databaseType: "sqlserver" });
+
+    expect(context.exclusiveTableSuggestions).toBe(true);
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "orders", type: "table" })]));
   });
 
   it("does not offer keyword continuations for qualified column prefixes", () => {

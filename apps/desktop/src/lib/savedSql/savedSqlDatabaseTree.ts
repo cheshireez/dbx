@@ -11,6 +11,7 @@ function savedSqlCopySortKey(name: string): { base: string; copyIndex: number } 
 }
 
 function compareSavedSqlFiles(left: SavedSqlFile, right: SavedSqlFile): number {
+  if (!!left.isDefaultQuery !== !!right.isDefaultQuery) return left.isDefaultQuery ? -1 : 1;
   const leftKey = savedSqlCopySortKey(left.name);
   const rightKey = savedSqlCopySortKey(right.name);
   return savedSqlNameCollator.compare(leftKey.base, rightKey.base) || leftKey.copyIndex - rightKey.copyIndex || savedSqlNameCollator.compare(left.name, right.name) || left.id.localeCompare(right.id);
@@ -60,7 +61,7 @@ function savedSqlFileNode(rootId: string, file: SavedSqlFile): TreeNode {
   };
 }
 
-export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database">, source: SavedSqlDatabaseSource, existingRoot?: TreeNode): TreeNode | null {
+export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database" | "schema">, source: SavedSqlDatabaseSource, existingRoot?: TreeNode): TreeNode | null {
   if (!databaseNode.connectionId || databaseNode.database === undefined) return null;
 
   const id = `${databaseNode.id}:__queries`;
@@ -71,6 +72,7 @@ export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" 
     connectionId: databaseNode.connectionId,
     catalog: databaseNode.catalog,
     database: databaseNode.database,
+    schema: databaseNode.schema,
     // Default collapsed: opening a connection should not expand the Queries
     // node until the user asks for it; an existing node's state is preserved.
     isExpanded: existingRoot?.isExpanded ?? false,
@@ -82,7 +84,7 @@ export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" 
   };
 }
 
-export function withDatabaseSavedSqlRoot(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database" | "children">, children: readonly TreeNode[], source: SavedSqlDatabaseSource): TreeNode[] {
+export function withDatabaseSavedSqlRoot(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database" | "schema" | "children">, children: readonly TreeNode[], source: SavedSqlDatabaseSource): TreeNode[] {
   const existingRoot = databaseNode.children?.find((child) => child.type === "saved-sql-root");
   const existingMetadataChildren = databaseNode.children?.filter((child) => child.type !== "saved-sql-root") ?? [];
   const metadataChildren = children.filter((child) => child.type !== "saved-sql-root");

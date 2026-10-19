@@ -210,19 +210,47 @@ describe("FrontendPluginRegistry", () => {
     expect(registry.findUiContribution("com.example.plugin", "example.graph")).toBeUndefined();
   });
 
+  it("keeps declarative context-menu actions as context-menu metadata, not commands", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "workbench", id: "example.main", label: "Example Workbench" },
+        {
+          type: "context-menu",
+          id: "example.open",
+          label: "Open Example",
+          menu: "connection",
+          action: { type: "open-workbench", workbench: "example.main" },
+        },
+      ]),
+    ]);
+
+    const item = registry.listContextMenuItems("connection")[0];
+    expect(item?.contribution.action).toEqual({ type: "open-workbench", workbench: "example.main" });
+    expect(registry.findWorkbench("com.example.plugin", "example.main")?.contribution.id).toBe("example.main");
+    expect(registry.findCommand("com.example.plugin", "example.open")).toBeUndefined();
+    expect(registry.listCommands()).toHaveLength(0);
+  });
+
   it("indexes context-menu contributions per menu surface", () => {
     const registry = createFrontendPluginRegistry([
       installedPlugin("com.example.plugin", [
         { type: "context-menu", id: "example.inspect", label: "Inspect endpoint", menu: "connection" },
-        { type: "context-menu", id: "example.other", label: "Wrong surface", menu: "tree" },
+        { type: "context-menu", id: "example.inspect-table", label: "Inspect table", menu: "table" },
       ]),
     ]);
 
-    const items = registry.listContextMenuItems("connection");
-    expect(items).toHaveLength(1);
-    expect(items[0]?.contribution.id).toBe("example.inspect");
-    expect(items[0]?.plugin.manifest.id).toBe("com.example.plugin");
-    expect(registry.listContextMenuItems("tree")).toHaveLength(1);
+    const connectionItems = registry.listContextMenuItems("connection");
+    expect(connectionItems).toHaveLength(1);
+    expect(connectionItems[0]?.contribution.id).toBe("example.inspect");
+    expect(connectionItems[0]?.contribution.action).toBeUndefined();
+    expect(connectionItems[0]?.plugin.manifest.id).toBe("com.example.plugin");
+
+    const tableItems = registry.listContextMenuItems("table");
+    expect(tableItems).toHaveLength(1);
+    expect(tableItems[0]?.contribution.id).toBe("example.inspect-table");
+
+    const emptyRegistry = createFrontendPluginRegistry([installedPlugin("com.example.empty")]);
+    expect(emptyRegistry.listContextMenuItems("table")).toHaveLength(0);
     expect(registry.listContextMenuItems("missing")).toHaveLength(0);
   });
 

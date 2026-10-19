@@ -6,6 +6,11 @@ use crate::connection::{AppState, PoolKind};
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query_execution_sql::{is_safe_dameng_autotrace_sql, is_safe_explain_sql_for_database};
 
+/// Acquires an estimated plan for an agent-backed connection.
+///
+/// `timeout_secs` overrides the connection's own query timeout for this call
+/// (`None` keeps the connection default). Overrides are host-owned: the plugin
+/// Host plan API clamps the value before it gets here.
 pub async fn get_agent_explain_info_core(
     state: &AppState,
     connection_id: &str,
@@ -13,21 +18,84 @@ pub async fn get_agent_explain_info_core(
     schema: Option<&str>,
     sql: &str,
     mode: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<String, String> {
+    get_agent_explain_info_core_with_execution_id(state, connection_id, database, schema, sql, mode, timeout_secs, None)
+        .await
+}
+
+/// DB2 estimated plans run in an isolated session, with optional UI cancellation.
+/// Other dialects retain their existing native acquisition contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn get_agent_explain_info_core_with_execution_id(
+    state: &AppState,
+    connection_id: &str,
+    database: Option<&str>,
+    schema: Option<&str>,
+    sql: &str,
+    mode: Option<&str>,
+    timeout_secs: Option<u64>,
+    execution_id: Option<&str>,
 ) -> Result<String, String> {
     let mode = mode.unwrap_or("explain");
     let (database_type, timeout_secs) = {
         let configs = state.configs.read().await;
         let config = configs.get(connection_id).ok_or_else(|| "Connection config not found".to_string())?.clone();
         let database_type = explain_database_type(&config);
-        let timeout_secs = config.effective_query_timeout_secs();
+        let timeout_secs = timeout_secs.unwrap_or_else(|| config.effective_query_timeout_secs());
         (database_type, timeout_secs)
     };
     if !is_safe_agent_explain_sql(sql, mode, database_type) {
         return Err("unsafe".to_string());
     }
 
+    if database_type == DatabaseType::Db2 && !mode.eq_ignore_ascii_case("explain") {
+        return Err("DB2 supports estimated execution plans only".to_string());
+    }
     let database_for_pool = database.filter(|value| !value.trim().is_empty());
-    let pool_key = state.get_or_create_pool(connection_id, database_for_pool).await?;
+    let client_session_id =
+        (database_type == DatabaseType::Db2).then(|| format!("db2-plan-{}:explain", uuid::Uuid::new_v4()));
+    // Install before pool creation: cancellation must also reclaim a late install.
+    let _cleanup_guard = match client_session_id.as_deref() {
+        Some(session_id) => Some(
+            state
+                .workload_session_pool_cleanup_guard(connection_id, database_for_pool, session_id)
+                .await
+                .ok_or_else(|| "DB2 execution plans require an isolated session".to_string())?,
+        ),
+        None => None,
+    };
+    let execution_id = if database_type == DatabaseType::Db2 {
+        execution_id.filter(|id| !id.trim().is_empty()).or(client_session_id.as_deref())
+    } else {
+        None
+    };
+    let registered = execution_id.map(|id| {
+        state.running_queries.register_task(
+            id.to_string(),
+            crate::query_cancel::RunningTaskMetadata {
+                kind: crate::query_cancel::RunningTaskKind::Explain,
+                connection_id: Some(connection_id.to_string()),
+                database: database_for_pool.map(str::to_string),
+                client_session_id: client_session_id.clone(),
+                ..Default::default()
+            },
+        )
+    });
+    let cancel_token = registered.as_ref().map(|registration| registration.token());
+    let pool_creation =
+        state.get_or_create_pool_for_session(connection_id, database_for_pool, client_session_id.as_deref());
+    let pool_key = match cancel_token.as_ref() {
+        Some(token) => tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err("Query canceled".to_string()),
+            result = pool_creation => result?,
+        },
+        None => pool_creation.await?,
+    };
+    if let Some(id) = execution_id {
+        state.running_queries.set_pool_key(id, pool_key.clone());
+    }
 
     enum ExplainTarget {
         Agent(std::sync::Arc<crate::db::agent_driver::PooledAgentClient>),
@@ -57,7 +125,22 @@ pub async fn get_agent_explain_info_core(
         "mode": mode,
     });
     let result: Value = match target {
-        ExplainTarget::Agent(client) => client.lock().await.get_explain_info(params).await?,
+        ExplainTarget::Agent(client) => {
+            let mut client = match cancel_token.as_ref() {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err("Query canceled".to_string()),
+                    guard = client.lock() => guard,
+                },
+                None => client.lock().await,
+            };
+            if database_type == DatabaseType::Db2 {
+                let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+                client.get_explain_info_with_timeout_and_cancel(params, timeout, cancel_token).await?
+            } else {
+                client.get_explain_info(params).await?
+            }
+        }
         ExplainTarget::External { config, session } => {
             let mut params = params;
             params["connection"] = serde_json::to_value(config.as_ref()).map_err(|error| error.to_string())?;
@@ -68,7 +151,16 @@ pub async fn get_agent_explain_info_core(
     decode_agent_explain_result(result)
 }
 
-fn explain_database_type(config: &ConnectionConfig) -> DatabaseType {
+/// Resolves the dialect an EXPLAIN must be generated for. Doris' MySQL-based
+/// connection profiles are Doris dialects, not MySQL. A custom JDBC connection
+/// is only known to be Oracle when its configuration says so; every other
+/// custom JDBC connection stays `Jdbc` and therefore gets no plan acquisition.
+/// Shared with the plugin Host plan API so both paths agree on which dialects
+/// are treatable.
+pub(crate) fn explain_database_type(config: &ConnectionConfig) -> DatabaseType {
+    if crate::db::doris::is_config(config) {
+        return DatabaseType::Doris;
+    }
     if config.db_type != DatabaseType::Jdbc {
         return config.db_type;
     }
@@ -118,6 +210,7 @@ mod tests {
     use crate::plugins::{
         InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
     };
+    use crate::query_execution_sql::{build_explain_sql, ExplainSqlOptions};
     #[cfg(unix)]
     use std::sync::Arc;
 
@@ -140,6 +233,41 @@ mod tests {
             "object plan"
         );
         assert!(decode_agent_explain_result(serde_json::json!(["unexpected"])).is_err());
+    }
+
+    #[test]
+    fn resolves_doris_profiles_to_doris_explain_sql_without_changing_mysql() {
+        let cases = [
+            (DatabaseType::Doris, None, DatabaseType::Doris, "EXPLAIN SELECT 1"),
+            (DatabaseType::Mysql, Some("doris"), DatabaseType::Doris, "EXPLAIN SELECT 1"),
+            (DatabaseType::Mysql, Some("selectdb"), DatabaseType::Doris, "EXPLAIN SELECT 1"),
+            (DatabaseType::Mysql, None, DatabaseType::Mysql, "EXPLAIN FORMAT=JSON SELECT 1"),
+            (DatabaseType::Mysql, Some("mysql"), DatabaseType::Mysql, "EXPLAIN FORMAT=JSON SELECT 1"),
+        ];
+
+        for (raw_type, driver_profile, expected_type, expected_sql) in cases {
+            let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+                "id": "dialect-test",
+                "name": "Dialect test",
+                "db_type": raw_type.as_str(),
+                "driver_profile": driver_profile,
+                "host": "127.0.0.1",
+                "port": 9030,
+                "username": "user",
+                "password": "secret"
+            }))
+            .unwrap();
+
+            let resolved_type = explain_database_type(&config);
+            assert_eq!(resolved_type, expected_type, "{raw_type:?} + {driver_profile:?}");
+            let explain = build_explain_sql(ExplainSqlOptions {
+                database_type: Some(resolved_type),
+                format: None,
+                analyze: None,
+                sql: "SELECT 1".to_string(),
+            });
+            assert_eq!(explain.sql.as_deref(), Some(expected_sql), "{raw_type:?} + {driver_profile:?}");
+        }
     }
 
     #[test]
@@ -225,7 +353,7 @@ mod tests {
             "query_timeout_secs": 30
         }))
         .unwrap();
-        let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         state.configs.write().await.insert(config.id.clone(), config.clone());
         state
@@ -248,12 +376,13 @@ mod tests {
             Some("SYSTEM"),
             "UPDATE T SET C = 1",
             Some("explain"),
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(plan, "TABLE ACCESS FULL DUAL");
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         drop(state);
         std::fs::remove_dir_all(dir).unwrap();
     }

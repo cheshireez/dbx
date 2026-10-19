@@ -5,14 +5,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fs2::FileExt;
-use futures::StreamExt;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::installer::{validate_key_id, PluginPackageExpectation};
+use super::installer::{ensure_update_continuity, validate_key_id, PluginPackageExpectation};
 use super::manifest::{parse_host_network_permission, MAX_PLUGIN_NETWORK_ORIGINS};
 use super::{
     current_plugin_target, PluginInstallPolicy, PluginInstallResult, PluginPackageInstaller, PluginTrustStore,
@@ -155,6 +154,10 @@ pub struct PluginMarketplaceInstallRequest {
     pub plugin_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Set after the user explicitly confirmed a changed update source (repository / publisher /
+    /// signing key) or an intentional downgrade; the install is rejected without it.
+    #[serde(default)]
+    pub allow_source_change: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -360,7 +363,7 @@ impl PluginMarketplace {
         validate_repository(repository)?;
         let primary_url = repository_catalog_url(repository)?;
         let (raw, catalog_url) = match self
-            .download_limited(primary_url.clone(), MAX_PLUGIN_CATALOG_BYTES, "Plugin catalog")
+            .download_limited(primary_url.clone(), MAX_PLUGIN_CATALOG_BYTES, "Plugin catalog", |_, _| {})
             .await
         {
             Ok(raw) => (raw, primary_url),
@@ -368,7 +371,7 @@ impl PluginMarketplace {
                 let fallback_url =
                     Url::parse(OFFICIAL_CATALOG_FALLBACK_URL).expect("built-in catalog fallback URL is valid");
                 let raw = self
-                    .download_limited(fallback_url.clone(), MAX_PLUGIN_CATALOG_BYTES, "Plugin catalog")
+                    .download_limited(fallback_url.clone(), MAX_PLUGIN_CATALOG_BYTES, "Plugin catalog", |_, _| {})
                     .await
                     .map_err(|fallback_error| {
                         format!(
@@ -408,14 +411,32 @@ impl PluginMarketplace {
         let artifact = select_marketplace_artifact(version, &target).ok_or_else(|| {
             format!("Plugin '{}' version '{}' does not support target '{}'", plugin.id, version.version, target)
         })?;
+        // Read-only provenance pre-flight: reject a source-changed or downgraded update before any
+        // download or runtime teardown happens. install_bytes_locked re-checks under the lock.
+        let allow_source_change = request.allow_source_change;
+        if let Some(identity) = super::installer::read_install_identity(&self.root_dir, &request.plugin_id)? {
+            if let Some(provenance) = &identity.provenance {
+                ensure_update_continuity(
+                    provenance,
+                    &identity.version,
+                    Some(&repository.id),
+                    &plugin.publisher,
+                    &artifact.signing_key_id,
+                    requested_version,
+                    allow_source_change,
+                )?;
+            }
+        }
         let artifact_url =
             Url::parse(&artifact.url).map_err(|error| format!("Invalid plugin artifact URL: {error}"))?;
-        let package = self.download_limited(artifact_url, MAX_PLUGIN_PACKAGE_BYTES, "Plugin package").await?;
+        let package =
+            self.download_limited(artifact_url, MAX_PLUGIN_PACKAGE_BYTES, "Plugin package", |_, _| {}).await?;
         verify_artifact_bytes(artifact, &package)?;
         let trust_store = marketplace_trust_store(&self.root_dir, repository.kind)?;
         let expectation = PluginPackageExpectation {
             id: plugin.id.clone(),
             version: version.version.clone(),
+            repository_id: Some(repository.id.clone()),
             publisher: plugin.publisher.clone(),
             permissions: plugin.permissions.iter().cloned().collect(),
             signing_key_id: artifact.signing_key_id.clone(),
@@ -425,7 +446,7 @@ impl PluginMarketplace {
             self.app_version.clone(),
             trust_store,
         ))
-        .install_marketplace_bytes(&package, &expectation)
+        .install_marketplace_bytes(&package, &expectation, allow_source_change)
     }
 
     /// Downloads a .dbxp package from a direct http(s) URL and installs it with
@@ -443,56 +464,32 @@ impl PluginMarketplace {
         F: FnMut(u64, Option<u64>),
     {
         let url = parse_http_url(url.trim(), "Plugin package URL")?;
-        let response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|error| format!("Failed to download Plugin package from {url}: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("Failed to download Plugin package from {url}: HTTP {}", response.status()));
-        }
-        if response.content_length().is_some_and(|length| length > MAX_PLUGIN_PACKAGE_BYTES as u64) {
-            return Err(format!("Plugin package exceeds {MAX_PLUGIN_PACKAGE_BYTES} bytes"));
-        }
-        let total = response.content_length();
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| format!("Failed to read Plugin package from {url}: {error}"))?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_PLUGIN_PACKAGE_BYTES {
-                return Err(format!("Plugin package exceeds {MAX_PLUGIN_PACKAGE_BYTES} bytes"));
-            }
-            bytes.extend_from_slice(&chunk);
-            on_progress(bytes.len() as u64, total);
-        }
+        let package = self.download_limited(url, MAX_PLUGIN_PACKAGE_BYTES, "Plugin package", &mut on_progress).await?;
         self.guard_installer(PluginPackageInstaller::new(self.root_dir.clone(), self.app_version.clone())?)
-            .install_bytes(&bytes, policy)
+            .install_bytes_with_expectation(&package, policy, None, super::installer::PluginInstallSource::Url, false)
     }
 
-    async fn download_limited(&self, url: Url, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
-        let response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|error| format!("Failed to download {label} from {url}: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("Failed to download {label} from {url}: HTTP {}", response.status()));
-        }
-        if response.content_length().is_some_and(|length| length > max_bytes as u64) {
-            return Err(format!("{label} exceeds {max_bytes} bytes"));
-        }
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| format!("Failed to read {label} from {url}: {error}"))?;
-            if bytes.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(format!("{label} exceeds {max_bytes} bytes"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+    /// Thin wrapper over the shared resilient download layer: retries transient
+    /// mid-body connection drops (the historical flaky "error decoding response
+    /// body" install failures) and resumes from partial bytes via Range requests.
+    /// Integrity remains caller-side (size + SHA-256 + signature), so a bad
+    /// resume can never be installed.
+    async fn download_limited(
+        &self,
+        url: Url,
+        max_bytes: usize,
+        label: &str,
+        on_progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, String> {
+        dbx_platform::download::resilient_download_bytes(
+            &self.client,
+            url,
+            label,
+            max_bytes,
+            dbx_platform::download::RESILIENT_DOWNLOAD_ATTEMPTS,
+            on_progress,
+        )
+        .await
     }
 }
 
@@ -800,10 +797,10 @@ fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
     file.write_all(&serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|error| error.to_string())?;
-    }
-    std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    // std::fs::rename atomically replaces an existing destination on POSIX
+    // and Windows alike; remove-then-rename could lose the repository
+    // document to a crash between the two calls.
+    crate::plugins::installer::rename_with_transient_lock_retry(&temporary, path).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1166,6 +1163,7 @@ mod tests {
                 repository_id: repository.id,
                 plugin_id: "marketplace.install".to_string(),
                 version: None,
+                allow_source_change: false,
             })
             .await
             .unwrap();
@@ -1336,6 +1334,7 @@ mod tests {
                 repository_id: "not-configured".to_string(),
                 plugin_id: "marketplace.install".to_string(),
                 version: None,
+                allow_source_change: false,
             })
             .await
             .unwrap_err();

@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
-import { structurePreviewHasOceanBase } from "./sidebarTreeDialogState";
+import OracleViewRenamePreview from "@/components/objects/OracleViewRenamePreview.vue";
+import OracleRoutineRenamePreview from "@/components/objects/OracleRoutineRenamePreview.vue";
+import OracleTableRenamePreview from "@/components/objects/OracleTableRenamePreview.vue";
+import OraclePackageSaveAsDialog from "@/components/objects/OraclePackageSaveAsDialog.vue";
+import { structurePreviewDdlStorageType } from "./sidebarTreeDialogState";
 import { computed, toRefs, watch } from "vue";
 import { AlertTriangle, Check, Loader2, Clipboard, Plus, Trash2, Upload } from "@lucide/vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -36,6 +40,38 @@ const {
   renameObjectPreviewSql,
   renameObjectError,
   confirmRenameObject,
+  viewRenamePlan,
+  viewRenameDrafts,
+  routineRenamePlan,
+  routineRenameDrafts,
+  tableRenamePlan,
+  tableRenameDrafts,
+  packageSaveAsOpen,
+  packageSaveAsTarget,
+  packageSaveAsName,
+  packageSaveAsPlan,
+  packageSaveAsDrafts,
+  packageSaveAsLoading,
+  packageSaveAsValidating,
+  packageSaveAsExecuting,
+  packageSaveAsError,
+  packageSaveAsDiagnostic,
+  confirmPackageSaveAs,
+  editPackageSaveAsDraft,
+  validatePackageSaveAsDrafts,
+  viewRenameLoading,
+  viewRenameValidating,
+  viewRenameExecuting,
+  isOracleViewRename,
+  isOracleRoutineRename,
+  isOracleTableRename,
+  editSidebarViewRenameDraft,
+  editSidebarRoutineRenameDraft,
+  editSidebarTableRenameDraft,
+  validateSidebarViewRenameDrafts,
+  validateSidebarRoutineRenameDrafts,
+  validateSidebarTableRenameDrafts,
+  refreshRenameObjectPreviewSql,
   showStructurePreviewDialog,
   structurePreviewTitle,
   isLoadingStructurePreview,
@@ -54,6 +90,7 @@ const {
   showPasteDialog,
   pasteTableEntries,
   pasteTableMode,
+  pasteTableFromClipboard,
   pasteTableDataCopySupported,
   confirmPasteTable,
   showCreateDatabaseDialog,
@@ -285,19 +322,73 @@ watch(
     </DialogContent>
   </Dialog>
 
+  <OraclePackageSaveAsDialog
+    :open="packageSaveAsOpen"
+    :old-name="packageSaveAsTarget?.objectName || packageSaveAsTarget?.label || ''"
+    :new-name="packageSaveAsName"
+    :plan="packageSaveAsPlan || null"
+    :drafts="packageSaveAsDrafts"
+    :error="packageSaveAsError"
+    :diagnostic="packageSaveAsDiagnostic"
+    :loading="packageSaveAsLoading"
+    :validating="packageSaveAsValidating"
+    :executing="packageSaveAsExecuting"
+    @update:open="packageSaveAsOpen = $event"
+    @update:new-name="packageSaveAsName = $event"
+    @edit="editPackageSaveAsDraft"
+    @validate="validatePackageSaveAsDrafts"
+    @reload="validatePackageSaveAsDrafts"
+    @confirm="confirmPackageSaveAs"
+  />
   <Dialog v-model:open="showRenameObjectDialog">
-    <DialogContent class="sm:max-w-[420px]">
+    <DialogContent :class="isOracleViewRename || isOracleRoutineRename || isOracleTableRename ? 'sm:max-w-[min(90vw,900px)]' : 'sm:max-w-[420px]'">
       <DialogHeader>
         <DialogTitle>{{ renameObjectDialogTitle }}</DialogTitle>
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameObjectName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" @keydown.enter.prevent="confirmRenameObject" />
-        <pre v-if="renameObjectPreviewSql" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
+        <OracleViewRenamePreview
+          v-if="isOracleViewRename"
+          :plan="viewRenamePlan || null"
+          :drafts="viewRenameDrafts"
+          :loading="viewRenameLoading"
+          :validating="viewRenameValidating"
+          :executing="viewRenameExecuting"
+          @edit="editSidebarViewRenameDraft"
+          @validate="validateSidebarViewRenameDrafts()"
+          @reload="validateSidebarViewRenameDrafts()"
+        />
+        <OracleRoutineRenamePreview
+          v-else-if="isOracleRoutineRename"
+          :plan="routineRenamePlan || null"
+          :drafts="routineRenameDrafts"
+          :loading="viewRenameLoading"
+          :validating="viewRenameValidating"
+          :executing="viewRenameExecuting"
+          @edit="editSidebarRoutineRenameDraft"
+          @validate="validateSidebarRoutineRenameDrafts"
+          @reload="refreshRenameObjectPreviewSql()"
+        />
+        <OracleTableRenamePreview
+          v-else-if="isOracleTableRename"
+          :plan="tableRenamePlan || null"
+          :drafts="tableRenameDrafts"
+          :loading="viewRenameLoading"
+          :validating="viewRenameValidating"
+          :executing="viewRenameExecuting"
+          @edit="editSidebarTableRenameDraft"
+          @validate="validateSidebarTableRenameDrafts()"
+          @reload="validateSidebarTableRenameDrafts()"
+        />
+        <pre v-else-if="renameObjectPreviewSql" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
         <p v-if="renameObjectError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameObjectError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" @click="showRenameObjectDialog = false">{{ t("dangerDialog.cancel") }}</Button>
-        <Button :disabled="!renameObjectName.trim() || renameObjectName.trim() === node.label" @click="confirmRenameObject">
+        <Button
+          :disabled="!renameObjectName.trim() || renameObjectName.trim() === node.label || viewRenameExecuting || (isOracleViewRename && !viewRenamePlan?.executable) || (isOracleRoutineRename && !routineRenamePlan?.executable) || (isOracleTableRename && !tableRenamePlan?.executable)"
+          @click="confirmRenameObject"
+        >
           {{ t("contextMenu.renameObject") }}
         </Button>
       </DialogFooter>
@@ -413,7 +504,7 @@ watch(
       <DialogHeader>
         <DialogTitle>{{ t("meilisearch.createIndex") }}</DialogTitle>
       </DialogHeader>
-      <div class="grid gap-3">
+      <div class="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
         <label class="grid gap-1.5 text-sm font-medium">
           {{ t("meilisearch.createIndexUid") }}
           <Input v-model="meilisearchCreateIndexUid" :disabled="meilisearchCreateIndexLoading" :placeholder="t('meilisearch.createIndexUidPlaceholder')" @keydown.enter.prevent="confirmCreateMeilisearchIndex" />
@@ -423,7 +514,7 @@ watch(
           <Input v-model="meilisearchCreateIndexPrimaryKey" :disabled="meilisearchCreateIndexLoading" :placeholder="t('meilisearch.createIndexPrimaryKeyPlaceholder')" />
           <span class="text-xs font-normal text-muted-foreground">{{ t("meilisearch.createIndexPrimaryKeyHelp") }}</span>
         </label>
-        <p v-if="meilisearchCreateIndexError" class="text-sm text-destructive">{{ meilisearchCreateIndexError }}</p>
+        <p v-if="meilisearchCreateIndexError" class="min-w-0 max-w-full whitespace-pre-wrap break-all text-sm text-destructive">{{ meilisearchCreateIndexError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" :disabled="meilisearchCreateIndexLoading" @click="showCreateMeilisearchIndexDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -469,7 +560,7 @@ watch(
         <pre v-else class="max-h-[56vh] min-h-64 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(structurePreviewSql)"></pre>
       </div>
       <DialogFooter>
-        <DdlStorageToggle :database-type="structurePreviewHasOceanBase ? 'oceanbase-oracle' : undefined" :disabled="isLoadingStructurePreview || !!structurePreviewError" class="mr-auto" />
+        <DdlStorageToggle :database-type="structurePreviewDdlStorageType" :disabled="isLoadingStructurePreview || !!structurePreviewError" class="mr-auto" />
         <Button variant="outline" @click="showStructurePreviewDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button variant="outline" :disabled="isLoadingStructurePreview || !structurePreviewSql" @click="copyStructurePreview">
           <Clipboard class="h-4 w-4" />
@@ -518,7 +609,7 @@ watch(
   <Dialog v-model:open="showPasteDialog">
     <DialogContent class="sm:max-w-[500px]">
       <DialogHeader>
-        <DialogTitle>{{ pasteTableEntries.length > 1 ? t("contextMenu.batchPasteTitle") : t("contextMenu.pasteTableConfirmTitle") }}</DialogTitle>
+        <DialogTitle>{{ pasteTableFromClipboard ? (pasteTableEntries.length > 1 ? t("contextMenu.batchPasteTitle") : t("contextMenu.pasteTableConfirmTitle")) : t("contextMenu.duplicateNameTitle") }}</DialogTitle>
       </DialogHeader>
       <div class="space-y-4">
         <div class="flex gap-2">

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { createApp, nextTick } from "vue";
+import { createApp, nextTick, ref } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,14 +8,25 @@ vi.mock("@/components/ui/CustomContextMenu.vue", () => ({
   default: {
     name: "CustomContextMenuStub",
     props: ["items"],
+    mounted() {
+      (this.$el as any).__ctxMenuItems = this.items;
+    },
+    updated() {
+      (this.$el as any).__ctxMenuItems = this.items;
+    },
     template: `<div class="ctx-menu-stub" :data-menu-items="JSON.stringify(items.map((item) => ({ label: item.label, disabled: item.disabled === true, visible: item.visible })))"><slot /></div>`,
   },
 }));
 
 vi.mock("@/components/ui/tooltip", () => ({
-  Tooltip: { name: "TooltipStub", template: `<div><slot /></div>` },
+  Tooltip: {
+    name: "TooltipStub",
+    props: ["open"],
+    emits: ["update:open"],
+    template: `<div class="tooltip-stub" :data-open="open === true" @mouseover="$emit('update:open', true)"><slot /></div>`,
+  },
   TooltipTrigger: { name: "TooltipTriggerStub", template: `<div><slot /></div>` },
-  TooltipContent: { name: "TooltipContentStub", template: `<div><slot /></div>` },
+  TooltipContent: { name: "TooltipContentStub", template: `<div class="tooltip-content-stub"><slot /></div>` },
 }));
 
 vi.mock("@/components/ui/popover", () => ({
@@ -37,7 +48,11 @@ vi.mock("@/components/icons/DatabaseIcon.vue", () => ({
 }));
 
 import EditorGroupTabBar from "../EditorGroupTabBar.vue";
+import { createNoopEditorToolbarActions, EDITOR_TOOLBAR_ACTIONS, type EditorToolbarActions } from "../editorToolbarActions";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
+import { useSettingsStore } from "@/stores/settingsStore";
+import type { ConnectionConfig } from "@/types/database";
 
 function createHost(): HTMLDivElement {
   const host = document.createElement("div");
@@ -50,7 +65,16 @@ interface Mounted {
   host: HTMLDivElement;
 }
 
-function mountBar(groupId: string, tabs: string[], activeTabId: string | null, activePinia: ReturnType<typeof createPinia>, onActivateTab?: (tabId: string) => void): Mounted {
+function mountBar(
+  groupId: string,
+  tabs: string[],
+  activeTabId: string | null,
+  activePinia: ReturnType<typeof createPinia>,
+  onActivateTab?: (tabId: string) => void,
+  specialPageTabs?: { settingsOpen: boolean; settingsActive: boolean; driverStoreOpen: boolean; driverStoreActive: boolean; pluginCenterOpen: boolean; pluginCenterActive: boolean; driverUpdateCount: number },
+  toolbarActions?: EditorToolbarActions,
+  onSaveAllTabs?: () => void,
+): Mounted {
   const store = useQueryStore();
   const host = createHost();
   const app = createApp(EditorGroupTabBar, {
@@ -58,17 +82,28 @@ function mountBar(groupId: string, tabs: string[], activeTabId: string | null, a
     tabs: tabs.map((id) => store.tabs.find((candidate) => candidate.id === id)!),
     activeTabId,
     "onActivate-tab": onActivateTab,
+    "onSave-all-tabs": onSaveAllTabs,
+    specialPageTabs,
   });
   // Reuse the active pinia so the component's internal store is the same
   // instance the test drives — otherwise drag validation runs against an
   // empty store and silently early-returns.
   app.use(activePinia);
+  if (toolbarActions) app.provide(EDITOR_TOOLBAR_ACTIONS, toolbarActions);
   app.use(
     createI18n({
       legacy: false,
       locale: "en",
       messages: {
         en: {
+          toolbar: { pluginCenter: "Plugin Center" },
+          common: { close: "Close" },
+          connectionGroup: { ungroupedLabel: "Ungrouped" },
+          tabs: {
+            tooltipConnection: "Connection:",
+            tooltipGroup: "Group:",
+            tooltipDatabase: "Database:",
+          },
           contextMenu: {
             splitRight: "Split right",
             splitDown: "Split down",
@@ -78,10 +113,12 @@ function mountBar(groupId: string, tabs: string[], activeTabId: string | null, a
             duplicateTab: "Duplicate",
             copyName: "Copy name",
             closeTab: "Close",
+            reopenClosedTab: "Reopen closed tab",
             closeOtherTabs: "Close other tabs",
             closeLeftTabs: "Close left tabs",
             closeRightTabs: "Close right tabs",
             closeAllTabs: "Close all tabs",
+            saveAllTabs: "Save all tabs",
             pinTab: "Pin",
             unpinTab: "Unpin",
             fullTabTitle: "Full title",
@@ -144,6 +181,39 @@ describe("EditorGroupTabBar behavior", () => {
     setActivePinia(pinia);
   });
 
+  it("opens a new query through the app action for this editor group", async () => {
+    const store = useQueryStore();
+    const id = store.createTab("pg-1", "app", "users", "data", "public");
+    const actions = createNoopEditorToolbarActions();
+    actions.canNewQuery = ref(true);
+    actions.newQuery = vi.fn();
+    const { app, host } = mountBar(store.groups[0].id, [id], id, pinia, undefined, undefined, actions);
+    await settle();
+    const buttons = host.querySelectorAll<HTMLButtonElement>("[data-new-query-tab]");
+    expect(buttons).toHaveLength(1);
+    buttons[0].click();
+    expect(actions.newQuery).toHaveBeenCalledExactlyOnceWith(store.groups[0].id);
+    actions.canNewQuery.value = false;
+    await settle();
+    expect(host.querySelector("[data-new-query-tab]")).toBeNull();
+    app.unmount();
+    host.remove();
+  });
+
+  it("offers duplicate without rename on a data tab", async () => {
+    const store = useQueryStore();
+    const id = store.createTab("pg-1", "app", "users", "data", "public");
+    const { app, host } = mountBar(store.groups[0].id, [id], id, pinia);
+    await settle();
+
+    const menu = JSON.parse(host.querySelector<HTMLElement>("[data-menu-items]")!.dataset.menuItems!);
+    expect(menu).toContainEqual(expect.objectContaining({ label: "Duplicate", visible: true }));
+    expect(menu).not.toContainEqual(expect.objectContaining({ label: "Rename" }));
+
+    app.unmount();
+    host.remove();
+  });
+
   it("activates a tab on plain click", async () => {
     const store = useQueryStore();
     const firstId = store.createTab("pg-1", "app", "Query 1", "query");
@@ -157,6 +227,117 @@ describe("EditorGroupTabBar behavior", () => {
     await settle();
 
     expect(activated).toEqual([secondId]);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps a focus-return click on tab-strip whitespace out of native window dragging", async () => {
+    const store = useQueryStore();
+    const firstId = store.createTab("pg-1", "app", "Query 1", "query");
+    const secondId = store.createTab("pg-1", "app", "Query 2", "query");
+    const mainGroup = store.groups[0];
+    const activated: string[] = [];
+    const { app, host } = mountBar(mainGroup.id, [firstId, secondId], firstId, pinia, (tabId) => activated.push(tabId));
+    await settle();
+
+    const tabTail = host.querySelector<HTMLElement>('[data-tauri-drag-region="false"]');
+    expect(tabTail).not.toBeNull();
+
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+    tabTail!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, detail: 1 }));
+    tabTail!.click();
+    await settle();
+    expect(activated).toEqual([]);
+
+    tabPill(host, secondId).click();
+    await settle();
+    expect(activated).toEqual([secondId]);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("closes a tab tooltip when the pointer leaves the tab", async () => {
+    const store = useQueryStore();
+    const tabId = store.createTab("pg-1", "app", "Plugin", "query");
+    const mainGroup = store.groups[0];
+    const { app, host } = mountBar(mainGroup.id, [tabId], tabId, pinia);
+    await settle();
+
+    const pill = tabPill(host, tabId);
+    pill.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    await settle();
+    expect(host.querySelector<HTMLElement>(".tooltip-stub")?.dataset.open).toBe("true");
+
+    pill.dispatchEvent(new MouseEvent("mouseleave"));
+    await settle();
+    expect(host.querySelector<HTMLElement>(".tooltip-stub")?.dataset.open).toBe("false");
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("shows a concise DBX tooltip for a connectionless plugin tab", async () => {
+    const store = useQueryStore();
+    const tabId = store.openPluginWorkbench("com.example.toolbox", "toolbox");
+    const mainGroup = store.groups[0];
+    const { app, host } = mountBar(mainGroup.id, [tabId], tabId, pinia);
+    await settle();
+
+    const tooltip = host.querySelector<HTMLElement>(".tooltip-stub")!;
+    tabPill(host, tabId).dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    await settle();
+
+    expect(tooltip.dataset.open).toBe("true");
+    expect(host.querySelector<HTMLElement>("[data-plugin-title-tooltip]")?.textContent?.trim()).toBe("toolbox");
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps the tooltip for a connection-bound plugin tab", async () => {
+    const store = useQueryStore();
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "plugin-1", name: "SSH server", db_type: "plugin" } as ConnectionConfig];
+    connectionStore.sidebarLayout = { groups: [], order: [{ type: "connection", id: "plugin-1" }] };
+    const tabId = store.openPluginWorkbench("com.example.toolbox", "toolbox", { connectionId: "plugin-1" });
+    const mainGroup = store.groups[0];
+    const { app, host } = mountBar(mainGroup.id, [tabId], tabId, pinia);
+    await settle();
+
+    const tooltip = host.querySelector<HTMLElement>(".tooltip-stub")!;
+    tabPill(host, tabId).dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    await settle();
+
+    expect(tooltip.dataset.open).toBe("true");
+    expect(host.querySelector("[data-plugin-title-tooltip]")).toBeNull();
+    expect(host.querySelector<HTMLElement>(".tooltip-content-stub")?.textContent).toContain("SSH server");
+    expect(host.querySelector<HTMLElement>(".tooltip-content-stub")?.textContent).not.toContain("Database:");
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("uses the DBX tooltip for the Plugin Center tab", async () => {
+    const store = useQueryStore();
+    const mainGroup = store.groups[0];
+    const specialPageTabs = { settingsOpen: false, settingsActive: false, driverStoreOpen: false, driverStoreActive: false, pluginCenterOpen: true, pluginCenterActive: true, driverUpdateCount: 0 };
+    const { app, host } = mountBar(mainGroup.id, [], null, pinia, undefined, specialPageTabs);
+    await settle();
+
+    const tab = host.querySelector<HTMLElement>("[data-plugin-center-tab]")!;
+    expect(tab.getAttribute("title")).toBeNull();
+
+    tab.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    await settle();
+    expect(host.querySelector<HTMLElement>(".tooltip-stub")?.dataset.open).toBe("true");
+    expect(host.querySelector<HTMLElement>(".tooltip-content-stub")?.textContent?.trim()).toBe("Plugin Center");
+
+    tab.dispatchEvent(new MouseEvent("mouseleave"));
+    await settle();
+    expect(host.querySelector<HTMLElement>(".tooltip-stub")?.dataset.open).toBe("false");
 
     app.unmount();
     host.remove();
@@ -480,6 +661,48 @@ describe("EditorGroupTabBar behavior", () => {
     host.remove();
   });
 
+  it("offers save all tabs in tab context menu, disabled when clean and enabled when dirty", async () => {
+    const store = useQueryStore();
+    const firstId = store.createTab("pg-1", "app", "Query 1", "query");
+    const mainGroup = store.groups[0];
+    const actions = createNoopEditorToolbarActions();
+    actions.saveAllTabs = vi.fn();
+    const onSaveAllTabs = vi.fn(() => actions.saveAllTabs());
+    const { app, host } = mountBar(mainGroup.id, [firstId], firstId, pinia, undefined, undefined, actions, onSaveAllTabs);
+    await settle();
+
+    const menuFor = (tabId: string) => {
+      const pill = tabPill(host, tabId);
+      const stub = pill.closest<HTMLElement>(".ctx-menu-stub");
+      return JSON.parse(stub!.dataset.menuItems ?? "[]");
+    };
+
+    const rawMenuFor = (tabId: string) => {
+      const pill = tabPill(host, tabId);
+      const stub = pill.closest<HTMLElement>(".ctx-menu-stub") as any;
+      return (stub?.__ctxMenuItems ?? []) as Array<{ label: string; action?: () => void; disabled?: boolean }>;
+    };
+
+    // Clean tab -> save all tabs is disabled
+    expect(menuFor(firstId).find((item: { label: string }) => item.label === "Save all tabs")).toMatchObject({ disabled: true });
+
+    // Mark tab dirty -> save all tabs is enabled
+    store.tabs[0].sql = "SELECT 1;";
+    await settle();
+    expect(menuFor(firstId).find((item: { label: string }) => item.label === "Save all tabs")).toMatchObject({ disabled: false });
+
+    // Clicking save all tabs menu item emits save-all-tabs once and forwards to toolbar.saveAllTabs once
+    const saveAllItem = rawMenuFor(firstId).find((item) => item.label === "Save all tabs");
+    expect(saveAllItem).toBeDefined();
+    saveAllItem?.action?.();
+
+    expect(onSaveAllTabs).toHaveBeenCalledTimes(1);
+    expect(actions.saveAllTabs).toHaveBeenCalledTimes(1);
+
+    app.unmount();
+    host.remove();
+  });
+
   it("flushes pending grid edits via before-tab-switch before activating another tab", async () => {
     const store = useQueryStore();
     const firstId = store.createTab("pg-1", "app", "Query 1", "query");
@@ -555,6 +778,29 @@ describe("EditorGroupTabBar behavior", () => {
     await settle();
 
     expect(sourcePill.style.opacity).toBe("");
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("applies --tab-max-width and data-has-max-tab-width when tabMaxWidth is configured", async () => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    settings.editorSettings.tabMaxWidth = 240;
+    const firstId = store.createTab("pg-1", "app", "Query 1", "query");
+    const mainGroup = store.groups[0];
+    const { app, host } = mountBar(mainGroup.id, [firstId], firstId, pinia);
+    await settle();
+
+    const bar = host.querySelector<HTMLElement>(".app-tab-bar")!;
+    expect(bar.dataset.hasMaxTabWidth).toBe("true");
+    expect(bar.style.getPropertyValue("--tab-max-width")).toBe("240px");
+
+    // Setting tabMaxWidth to 0 removes the limit
+    settings.editorSettings.tabMaxWidth = 0;
+    await settle();
+    expect(bar.dataset.hasMaxTabWidth).toBe("false");
+    expect(bar.style.getPropertyValue("--tab-max-width")).toBe("");
 
     app.unmount();
     host.remove();

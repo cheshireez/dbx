@@ -3,6 +3,12 @@
 export type MqSystemKind = "pulsar" | "kafka" | "rocketmq" | "rabbitmq";
 
 export interface MqCapabilities {
+  supportsListTopics?: boolean;
+  supportsCreateTopic?: boolean;
+  supportsDeleteTopic?: boolean;
+  supportsTopicStats?: boolean;
+  supportsBrokerAdmin?: boolean;
+  supportsProducerListing?: boolean;
   supportsTenants: boolean;
   supportsNamespaces: boolean;
   supportsPartitionedTopics: boolean;
@@ -184,6 +190,26 @@ export interface TopicInfo {
 
 export interface ListTopicsOpts {
   includeNonPersistent?: boolean;
+}
+
+export type MqListSort = "name" | "messagesReady";
+
+export interface MqListPageRequest {
+  /** One-based page number. */
+  page: number;
+  pageSize: number;
+  search?: string;
+  sort?: MqListSort;
+  sortDescending?: boolean;
+}
+
+export interface MqListPage<T> {
+  items: T[];
+  page: number;
+  pageSize: number;
+  /** Number of items matching the current search across all pages. */
+  totalCount: number;
+  hasMore: boolean;
 }
 
 export interface TopicStats {
@@ -563,7 +589,8 @@ export interface SendMessageRequest {
 
 export interface SendMessageResponse {
   topic: string;
-  partition: number;
+  /** Absent when the transport does not report the actual physical queue. */
+  partition?: number | null;
   offset: number;
   timestamp?: string;
 }

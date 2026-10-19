@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use chrono::Utc;
@@ -24,6 +25,10 @@ const MAX_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const INSTALL_LOCK_FILE: &str = ".install.lock";
+/// Where a logically uninstalled plugin container waits for its physical delete. The directory is
+/// no plugin container of its own (no manifest, no activations), so installed plugin discovery
+/// skips it, and `validate_plugin_id` rejects a leading dot, so no plugin id can collide with it.
+pub(super) const PLUGIN_TRASH_DIR: &str = ".trash";
 const VERSIONS_DIR: &str = "versions";
 const ACTIVATIONS_DIR: &str = "activations";
 const TRUST_DIR: &str = ".trust";
@@ -123,6 +128,41 @@ struct PluginPackageSignature {
     signature: String,
 }
 
+/// Where an installed plugin came from. Recorded with every activation so an update can detect a
+/// changed repository / publisher / signing key instead of silently replacing the plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(default)]
+    pub source: PluginInstallSource,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginInstallSource {
+    Marketplace,
+    Url,
+    File,
+    #[default]
+    Unknown,
+}
+
+/// The active installation of one plugin id: the semver activation version plus whatever
+/// provenance was recorded when it was installed. Provenance is `None` for installs made before
+/// provenance existed (and for legacy migrated containers); those stay unconstrained until the
+/// next install records fresh provenance.
+#[derive(Debug, Clone)]
+pub(crate) struct PluginInstallIdentity {
+    pub version: String,
+    pub provenance: Option<PluginInstallProvenance>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginActivationRecord {
@@ -132,6 +172,8 @@ struct PluginActivationRecord {
     previous_version: Option<String>,
     package_sha256: String,
     activated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<PluginInstallProvenance>,
 }
 
 pub struct PluginPackageInstaller {
@@ -145,9 +187,54 @@ pub struct PluginPackageInstaller {
 pub(super) struct PluginPackageExpectation {
     pub id: String,
     pub version: String,
+    pub repository_id: Option<String>,
     pub publisher: String,
     pub permissions: BTreeSet<String>,
     pub signing_key_id: String,
+}
+
+/// Read-only identity lookup for one plugin id under the store root: the activation version plus
+/// the recorded provenance. Free function so the marketplace pre-flight can call it without
+/// constructing an installer (which would load the user trust store as a side effect).
+pub(crate) fn read_install_identity(root_dir: &Path, plugin_id: &str) -> Result<Option<PluginInstallIdentity>, String> {
+    validate_plugin_id(plugin_id)?;
+    let Some(record) = read_latest_activation(&root_dir.join(plugin_id))? else { return Ok(None) };
+    Ok(Some(PluginInstallIdentity { version: record.version, provenance: record.provenance }))
+}
+
+/// Rejects an update whose repository / publisher / signing key differs from the recorded
+/// provenance, or that would downgrade below the active version, unless `allow` is set (the
+/// user confirmed the change in the UI). The marketplace pre-flight calls this before any
+/// download; `install_bytes_locked` re-checks under the store lock.
+pub(crate) fn ensure_update_continuity(
+    provenance: &PluginInstallProvenance,
+    active_version: &str,
+    repository_id: Option<&str>,
+    publisher: &str,
+    signing_key_id: &str,
+    candidate_version: &str,
+    allow: bool,
+) -> Result<(), String> {
+    // Compare against the activation version (always semver); a legacy manifest version string
+    // that fails to parse simply skips the downgrade check.
+    if let (Ok(active), Ok(candidate)) = (Version::parse(active_version), Version::parse(candidate_version)) {
+        if candidate < active && !allow {
+            return Err(format!(
+                "Plugin downgrade to version {candidate_version} is not allowed (installed {active_version})"
+            ));
+        }
+    }
+    let repository_changed =
+        provenance.repository_id.as_deref().is_some_and(|recorded| Some(recorded) != repository_id);
+    let publisher_changed = provenance.publisher.as_deref().is_some_and(|recorded| recorded != publisher);
+    let key_changed = provenance.signing_key_id.as_deref().is_some_and(|recorded| recorded != signing_key_id);
+    if (repository_changed || publisher_changed || key_changed) && !allow {
+        return Err(
+            "Plugin update source change requires confirmation: the offering repository, publisher, or signing key differs from the recorded install"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 impl PluginTrustStore {
@@ -291,22 +378,33 @@ impl PluginPackageInstaller {
     }
 
     pub fn install_bytes(&self, package: &[u8], policy: PluginInstallPolicy) -> Result<PluginInstallResult, String> {
-        self.install_bytes_with_expectation(package, policy, None)
+        self.install_bytes_with_expectation(package, policy, None, PluginInstallSource::File, false)
     }
 
     pub(super) fn install_marketplace_bytes(
         &self,
         package: &[u8],
         expectation: &PluginPackageExpectation,
+        allow_source_change: bool,
     ) -> Result<PluginInstallResult, String> {
-        self.install_bytes_with_expectation(package, PluginInstallPolicy::LocalSigned, Some(expectation))
+        self.install_bytes_with_expectation(
+            package,
+            PluginInstallPolicy::LocalSigned,
+            Some(expectation),
+            PluginInstallSource::Marketplace,
+            allow_source_change,
+        )
     }
 
-    fn install_bytes_with_expectation(
+    /// Shared entry point for every install path: `PluginPackageExpectation` (and therefore this
+    /// signature) stays inside the `plugins` module, exactly like the expectation type.
+    pub(super) fn install_bytes_with_expectation(
         &self,
         package: &[u8],
         policy: PluginInstallPolicy,
         expectation: Option<&PluginPackageExpectation>,
+        source: PluginInstallSource,
+        allow_source_change: bool,
     ) -> Result<PluginInstallResult, String> {
         if package.len() > MAX_PLUGIN_PACKAGE_BYTES {
             return Err(format!("Plugin package exceeds {MAX_PLUGIN_PACKAGE_BYTES} bytes"));
@@ -314,7 +412,11 @@ impl PluginPackageInstaller {
         std::fs::create_dir_all(&self.root_dir).map_err(|error| error.to_string())?;
         let lock = open_install_lock(&self.root_dir)?;
         lock.lock_exclusive().map_err(|error| format!("Failed to lock plugin store: {error}"))?;
-        let result = self.install_bytes_locked(package, policy, expectation);
+        let result = self.install_bytes_locked(package, policy, expectation, source, allow_source_change);
+        if result.is_ok() {
+            // Opportunistic cleanup of tombstones an earlier uninstall could not delete yet.
+            self.sweep_plugin_trash(&TRANSIENT_LOCK_RETRY_DELAYS, |path: &Path| std::fs::remove_dir_all(path));
+        }
         let _ = FileExt::unlock(&lock);
         result
     }
@@ -329,18 +431,98 @@ impl PluginPackageInstaller {
         result
     }
 
+    /// Store-level logical uninstall: the official `plugins/<plugin_id>` container is renamed into
+    /// `.trash` (that rename *is* the commit) and only then physically deleted. `remove_dir_all` is
+    /// not atomic, so deleting the container in place could leave a partially deleted tree behind;
+    /// a failed rename instead leaves the container exactly as it was and reports a clean failure.
     pub fn uninstall(&self, plugin_id: &str) -> Result<(), String> {
+        self.uninstall_with_ops(
+            plugin_id,
+            &TRANSIENT_LOCK_RETRY_DELAYS,
+            |src: &Path, dst: &Path| std::fs::rename(src, dst),
+            |path: &Path| std::fs::remove_dir_all(path),
+        )
+    }
+
+    /// The uninstall body, parameterised for tests: `delays` is the transient Windows lock retry
+    /// window, and the two filesystem primitives are injected so error 5 / 32 failures can be
+    /// reproduced deterministically on every platform instead of depending on a real scanner.
+    fn uninstall_with_ops(
+        &self,
+        plugin_id: &str,
+        delays: &[Duration],
+        mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+        mut remove_dir_all: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<(), String> {
         validate_plugin_id(plugin_id)?;
         let lock = open_install_lock(&self.root_dir)?;
         lock.lock_exclusive().map_err(|error| format!("Failed to lock plugin store: {error}"))?;
-        let plugin_dir = self.root_dir.join(plugin_id);
-        let result = match std::fs::remove_dir_all(&plugin_dir) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("Failed to uninstall plugin '{plugin_id}': {error}")),
-        };
+        let result = (|| {
+            let plugin_dir = self.root_dir.join(plugin_id);
+            if plugin_dir.exists() {
+                let trash_dir = self.root_dir.join(PLUGIN_TRASH_DIR);
+                std::fs::create_dir_all(&trash_dir)
+                    .map_err(|error| format!("Failed to prepare plugin trash '{}': {error}", trash_dir.display()))?;
+                let tombstone = unique_plugin_tombstone(&trash_dir, plugin_id);
+                // From here on the plugin is uninstalled: the container is out of the store root
+                // and discovery does not see it any more. An antivirus scanner holding a freshly
+                // extracted binary may fail this rename with error 5 / 32, hence the retry, and a
+                // rename that keeps failing leaves the container untouched for a clean failure.
+                retry_transient_lock(delays, || {
+                    let res = rename(&plugin_dir, &tombstone);
+                    if let Err(ref err) = res {
+                        if cfg!(windows) && err.raw_os_error() == Some(5) {
+                            ensure_tree_writable(&plugin_dir);
+                        }
+                    }
+                    res
+                })
+                .map_err(|error| format!("Failed to uninstall plugin '{plugin_id}': {error}"))?;
+            }
+            self.sweep_plugin_trash(delays, &mut remove_dir_all);
+            Ok(())
+        })();
         let _ = FileExt::unlock(&lock);
         result
+    }
+
+    /// Best-effort physical delete of every `.trash` tombstone: the one the caller just committed
+    /// plus leftovers from an earlier uninstall whose delete failed. Callers hold `.install.lock`,
+    /// every entry in there is already logically uninstalled, and a tombstone that still cannot be
+    /// removed only logs a warning — the plugin is uninstalled either way, and a later install or
+    /// uninstall sweeps it again.
+    fn sweep_plugin_trash(&self, delays: &[Duration], mut remove_dir_all: impl FnMut(&Path) -> std::io::Result<()>) {
+        let trash_dir = self.root_dir.join(PLUGIN_TRASH_DIR);
+        let entries = match std::fs::read_dir(&trash_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                log::warn!("Failed to scan plugin trash '{}': {error}", trash_dir.display());
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let tombstone = entry.path();
+            let removed = retry_transient_lock(delays, || match remove_dir_all(&tombstone) {
+                // Already gone (or not a directory): nothing left to clean up.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    if cfg!(windows) && error.raw_os_error() == Some(5) {
+                        ensure_tree_writable(&tombstone);
+                    }
+                    Err(error)
+                }
+                result => result,
+            });
+            if let Err(error) = removed {
+                log::warn!("Failed to remove plugin tombstone '{}': {error}", tombstone.display());
+            }
+        }
+    }
+
+    /// Recorded provenance of one container's active installation, if any.
+    pub(super) fn read_container_provenance(container_dir: &Path) -> Result<Option<PluginInstallProvenance>, String> {
+        Ok(read_latest_activation(container_dir)?.and_then(|record| record.provenance))
     }
 
     fn install_bytes_locked(
@@ -348,6 +530,8 @@ impl PluginPackageInstaller {
         package: &[u8],
         policy: PluginInstallPolicy,
         expectation: Option<&PluginPackageExpectation>,
+        source: PluginInstallSource,
+        allow_source_change: bool,
     ) -> Result<PluginInstallResult, String> {
         let package_sha256 = sha256_hex(package);
         let staging = tempfile::Builder::new()
@@ -384,6 +568,9 @@ impl PluginPackageInstaller {
         make_backend_executable(&compatibility.backend_executable)?;
 
         let update_guard = self.lifecycle.as_ref().map(|lifecycle| lifecycle.begin_update(&manifest.id)).transpose()?;
+        if let Some(guard) = &update_guard {
+            guard.drain_runtimes()?;
+        }
         let container_dir = self.root_dir.join(&manifest.id);
         migrate_legacy_container(&container_dir)?;
         let versions_dir = container_dir.join(VERSIONS_DIR);
@@ -393,6 +580,26 @@ impl PluginPackageInstaller {
         let version_string = version.to_string();
         let version_dir = versions_dir.join(&version_string);
         let current = read_latest_activation(&container_dir)?;
+        // Update continuity (crate::plugins::installer::ensure_update_continuity): a marketplace
+        // update whose recorded repository / publisher / signing key differs from the offering one,
+        // or that would downgrade the active version, is rejected unless the user explicitly
+        // confirmed. Installs without recorded provenance stay unconstrained until the next
+        // install records fresh provenance.
+        if let (Some(expectation), Some(record)) = (expectation, current.as_ref()) {
+            if !matches!(policy, PluginInstallPolicy::LocalDevelopment) {
+                if let Some(provenance) = &record.provenance {
+                    ensure_update_continuity(
+                        provenance,
+                        &record.version,
+                        expectation.repository_id.as_deref(),
+                        &expectation.publisher,
+                        &expectation.signing_key_id,
+                        &version_string,
+                        allow_source_change,
+                    )?;
+                }
+            }
+        }
         // Only the version the newest activation record resolves to *and* that is still a usable
         // install counts as "already installed". Directory existence alone is not enough: rollback
         // deliberately retains the version it replaces as the next rollback target, so an
@@ -434,28 +641,53 @@ impl PluginPackageInstaller {
         } else {
             None
         };
-        if let Err(error) = std::fs::rename(&package_dir, &version_dir) {
+        if let Err(error) = rename_with_transient_lock_retry(&package_dir, &version_dir) {
             let mut message = format!("Failed to store plugin '{}' version {}: {error}", manifest.id, version);
             if let Some(backup) = &replaced_version_dir {
-                if let Err(restore) = std::fs::rename(backup, &version_dir) {
+                if let Err(restore) = rename_with_transient_lock_retry(backup, &version_dir) {
                     message.push_str(&format!("; previous copy kept at {}: {restore}", backup.display()));
                 }
             }
             return Err(message);
         }
 
+        let provenance = match expectation {
+            Some(expectation) => PluginInstallProvenance {
+                repository_id: expectation.repository_id.clone(),
+                publisher: Some(expectation.publisher.clone()),
+                signing_key_id: Some(expectation.signing_key_id.clone()),
+                source: PluginInstallSource::Marketplace,
+            },
+            None => {
+                let previous = current.as_ref().and_then(|record| record.provenance.as_ref());
+                PluginInstallProvenance {
+                    // A file/URL replacement carries the recorded repository forward so a
+                    // non-marketplace overwrite cannot silently erase a marketplace install's
+                    // source identity; publisher and signing key record what is actually
+                    // being installed now.
+                    repository_id: previous.and_then(|provenance| provenance.repository_id.clone()),
+                    publisher: Some(manifest.publisher.clone()),
+                    signing_key_id: match &signature {
+                        PluginSignatureStatus::Trusted { key_id } => Some(key_id.clone()),
+                        PluginSignatureStatus::Unsigned => None,
+                    },
+                    source,
+                }
+            }
+        };
         let activation = PluginActivationRecord {
             sequence: current.as_ref().map_or(1, |record| record.sequence.saturating_add(1)),
             version: version_string,
             previous_version: previous_version.clone(),
             package_sha256: package_sha256.clone(),
             activated_at: Utc::now().to_rfc3339(),
+            provenance: Some(provenance),
         };
         if let Err(error) = write_activation_record(&container_dir, &activation) {
             let _ = std::fs::remove_dir_all(&version_dir);
             let mut message = error;
             if let Some(backup) = &replaced_version_dir {
-                if let Err(restore) = std::fs::rename(backup, &version_dir) {
+                if let Err(restore) = rename_with_transient_lock_retry(backup, &version_dir) {
                     message.push_str(&format!("; previous copy kept at {}: {restore}", backup.display()));
                 }
             }
@@ -469,12 +701,16 @@ impl PluginPackageInstaller {
         if let Err(error) = prune_plugin_history(&container_dir, &activation) {
             log::warn!("Failed to prune plugin '{}' install history: {error}", manifest.id);
         }
-        let plugin = InstalledPlugin::new(manifest, version_dir, &self.app_version);
+        let plugin = InstalledPlugin::new(manifest, version_dir, &self.app_version)
+            .with_provenance(activation.provenance.clone());
         Ok(PluginInstallResult { plugin, previous_version, package_sha256, signature, _update_guard: update_guard })
     }
 
     fn rollback_locked(&self, plugin_id: &str) -> Result<PluginRollbackResult, String> {
         let update_guard = self.lifecycle.as_ref().map(|lifecycle| lifecycle.begin_update(plugin_id)).transpose()?;
+        if let Some(guard) = &update_guard {
+            guard.drain_runtimes()?;
+        }
         let container_dir = self.root_dir.join(plugin_id);
         let current = read_latest_activation(&container_dir)?
             .ok_or_else(|| format!("Plugin '{plugin_id}' does not have an active version"))?;
@@ -500,13 +736,18 @@ impl PluginPackageInstaller {
             ));
         }
         let target_record = read_latest_activation_for_version(&container_dir, &previous_version)?;
+        let plugin = plugin.with_provenance(target_record.as_ref().and_then(|record| record.provenance.clone()));
         let activation = PluginActivationRecord {
             sequence: current.sequence.saturating_add(1),
             version: previous_version.clone(),
             previous_version: Some(current.version),
             package_sha256: target_record
-                .map_or_else(|| "legacy-unmanaged".to_string(), |record| record.package_sha256),
+                .as_ref()
+                .map_or_else(|| "legacy-unmanaged".to_string(), |record| record.package_sha256.clone()),
             activated_at: Utc::now().to_rfc3339(),
+            // Roll the target version's own provenance forward: a rollback re-activates that
+            // version, so its recorded source identity is the truthful one to keep guarding with.
+            provenance: target_record.as_ref().and_then(|record| record.provenance.clone()),
         };
         write_activation_record(&container_dir, &activation)?;
         if let Err(error) = prune_plugin_history(&container_dir, &activation) {
@@ -844,7 +1085,11 @@ fn migrate_legacy_container(container_dir: &Path) -> Result<(), String> {
     let migration = (|| {
         std::fs::create_dir_all(&versions_dir).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&activations_dir).map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, &version_dir).map_err(|error| error.to_string())?;
+        // Write the activation record before moving the payload into place:
+        // the rollback below wipes container_dir, so the container must only
+        // ever hold empty scaffolding while a step can still fail. The old
+        // order moved the payload first — a failed activation record then
+        // rolled back by deleting the only copy of the legacy plugin.
         write_activation_record(
             container_dir,
             &PluginActivationRecord {
@@ -853,8 +1098,10 @@ fn migrate_legacy_container(container_dir: &Path) -> Result<(), String> {
                 previous_version: None,
                 package_sha256: "legacy-unmanaged".to_string(),
                 activated_at: Utc::now().to_rfc3339(),
+                provenance: None,
             },
-        )
+        )?;
+        rename_with_transient_lock_retry(&temporary, &version_dir).map_err(|error| error.to_string())
     })();
     if let Err(error) = migration {
         let _ = std::fs::remove_dir_all(container_dir);
@@ -889,10 +1136,11 @@ fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
     file.write_all(&serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|error| error.to_string())?;
-    }
-    std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    // std::fs::rename atomically replaces an existing destination on POSIX
+    // and Windows alike. The previous remove-then-rename opened a window
+    // where a crash between the two calls lost the document (trust keys,
+    // repository metadata) entirely — exactly what "atomically" must not do.
+    rename_with_transient_lock_retry(&temporary, path).map_err(|error| error.to_string())?;
     sync_directory(parent)
 }
 
@@ -905,6 +1153,77 @@ fn open_install_lock(root_dir: &Path) -> Result<File, String> {
         .truncate(false)
         .open(root_dir.join(INSTALL_LOCK_FILE))
         .map_err(|error| error.to_string())
+}
+
+// Antivirus scanners briefly hold handles on freshly extracted plugin binaries, which fails
+// directory renames with ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32); the scan
+// normally finishes well inside this retry window.
+const TRANSIENT_LOCK_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_millis(1500),
+    Duration::from_millis(2000),
+];
+
+pub(crate) fn rename_with_transient_lock_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
+    retry_transient_lock(&TRANSIENT_LOCK_RETRY_DELAYS, || std::fs::rename(src, dst))
+}
+
+fn retry_transient_lock<T>(
+    delays: &[Duration],
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for delay in delays {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if cfg!(windows) && is_windows_lock_error(&error) => {
+                // If a file in the directory has the read-only attribute set on Windows,
+                // renames and removals fail with ERROR_ACCESS_DENIED (5). Ensure write permissions.
+                std::thread::sleep(*delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
+
+fn is_windows_lock_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32))
+}
+
+#[allow(clippy::permissions_set_readonly_false)]
+fn ensure_tree_writable(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                ensure_tree_writable(&entry.path());
+            }
+        }
+    }
+}
+
+/// Tombstone path for one logical uninstall: `.trash/<plugin id>`, or `.trash/<plugin id>-<n>`, the
+/// same suffix convention `install_bytes_locked` uses for replaced versions, when an earlier
+/// tombstone of that plugin is still waiting for its physical delete.
+fn unique_plugin_tombstone(trash_dir: &Path, plugin_id: &str) -> PathBuf {
+    let mut candidate = trash_dir.join(plugin_id);
+    let mut suffix = 0u32;
+    while candidate.exists() {
+        suffix = suffix.saturating_add(1);
+        candidate = trash_dir.join(format!("{plugin_id}-{suffix}"));
+    }
+    candidate
 }
 
 fn make_backend_executable(path: &Option<PathBuf>) -> Result<(), String> {
@@ -1017,16 +1336,18 @@ fn sync_directory(_path: &Path) -> Result<(), String> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use zip::write::SimpleFileOptions;
 
     use super::{
-        is_activation_record_file, sha256_hex, validate_package_expectation, PluginInstallPolicy,
-        PluginPackageExpectation, PluginPackageInstaller, PluginSignatureStatus, PluginTrustStore, ACTIVATIONS_DIR,
-        PLUGIN_CHECKSUMS_FILE, PLUGIN_SIGNATURE_FILE, VERSIONS_DIR,
+        ensure_tree_writable, is_activation_record_file, read_install_identity, retry_transient_lock, sha256_hex,
+        validate_package_expectation, write_json_atomically, PluginInstallPolicy, PluginPackageExpectation,
+        PluginPackageInstaller, PluginSignatureStatus, PluginTrustStore, ACTIVATIONS_DIR, INSTALL_LOCK_FILE,
+        PLUGIN_CHECKSUMS_FILE, PLUGIN_SIGNATURE_FILE, PLUGIN_TRASH_DIR, VERSIONS_DIR,
     };
     use crate::plugins::{PluginManifest, PluginRegistry};
 
@@ -1092,15 +1413,19 @@ mod tests {
             .unwrap_err()
             .contains("active operations"));
         let expectation = PluginPackageExpectation {
+            repository_id: None,
             id: "sample.hello".to_string(),
             version: "1.1.0".to_string(),
             publisher: "sample".to_string(),
             permissions: BTreeSet::from(["host.events".to_string()]),
             signing_key_id: "test".to_string(),
         };
-        assert!(installer.install_marketplace_bytes(&bytes, &expectation).unwrap_err().contains("active operations"));
+        assert!(installer
+            .install_marketplace_bytes(&bytes, &expectation, false)
+            .unwrap_err()
+            .contains("active operations"));
         drop(operation);
-        installer.install_marketplace_bytes(&bytes, &expectation).unwrap();
+        installer.install_marketplace_bytes(&bytes, &expectation, false).unwrap();
         assert_eq!(registry.find_plugin("sample.hello").unwrap().unwrap().manifest.version, "1.1.0");
     }
 
@@ -1276,6 +1601,29 @@ mod tests {
     }
 
     #[test]
+    fn atomic_json_writes_replace_in_place_without_temp_litter() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested").join("doc.json");
+
+        #[derive(serde::Serialize)]
+        struct Doc {
+            value: u32,
+        }
+
+        write_json_atomically(&path, &Doc { value: 1 }).unwrap();
+        write_json_atomically(&path, &Doc { value: 2 }).unwrap();
+
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["value"], 2);
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+    }
+
+    #[test]
     fn strict_policy_requires_and_verifies_trusted_signature() {
         let root = tempfile::tempdir().unwrap();
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1287,6 +1635,7 @@ mod tests {
         let trust = PluginTrustStore::from_base64_keys(keys).unwrap();
         let installer = PluginPackageInstaller::with_trust_store(root.path().to_path_buf(), "0.5.67", trust);
         let expectation = PluginPackageExpectation {
+            repository_id: None,
             id: "sample.hello".to_string(),
             version: "1.0.0".to_string(),
             publisher: "sample".to_string(),
@@ -1294,10 +1643,10 @@ mod tests {
             signing_key_id: "sample-key".to_string(),
         };
         let unsigned = package("1.0.0", None, false);
-        assert!(installer.install_marketplace_bytes(&unsigned, &expectation).is_err());
+        assert!(installer.install_marketplace_bytes(&unsigned, &expectation, false).is_err());
 
         let signed = package("1.0.0", Some((&signing_key, "sample-key")), false);
-        let result = installer.install_marketplace_bytes(&signed, &expectation).unwrap();
+        let result = installer.install_marketplace_bytes(&signed, &expectation, false).unwrap();
         assert_eq!(result.signature, PluginSignatureStatus::Trusted { key_id: "sample-key".to_string() });
     }
 
@@ -1410,6 +1759,7 @@ mod tests {
         .unwrap();
         let signature = PluginSignatureStatus::Trusted { key_id: "sample-key".to_string() };
         let expectation = PluginPackageExpectation {
+            repository_id: None,
             id: "sample.hello".to_string(),
             version: "1.0.0".to_string(),
             publisher: "sample".to_string(),
@@ -1490,6 +1840,146 @@ mod tests {
         (installer, signing_key)
     }
 
+    #[test]
+    fn rejects_source_changed_update_unless_confirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let (installer, signing_key) = signed_installer(root.path(), [21u8; 32]);
+        let signed = |version: &str| package(version, Some((&signing_key, "sample-key")), false);
+        let expectation = |repository: &str, version: &str| PluginPackageExpectation {
+            id: "sample.hello".to_string(),
+            version: version.to_string(),
+            repository_id: Some(repository.to_string()),
+            publisher: "sample".to_string(),
+            permissions: BTreeSet::from(["host.events".to_string()]),
+            signing_key_id: "sample-key".to_string(),
+        };
+
+        installer.install_marketplace_bytes(&signed("1.0.0"), &expectation("repo-a", "1.0.0"), false).unwrap();
+
+        // The recorded install came from repo-a; a repo-b update needs the explicit confirmation.
+        let rejected =
+            installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("repo-b", "1.1.0"), false).unwrap_err();
+        assert!(rejected.contains("source change requires confirmation"), "{rejected}");
+        assert_eq!(read_install_identity(root.path(), "sample.hello").unwrap().unwrap().version, "1.0.0");
+
+        let confirmed =
+            installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("repo-b", "1.1.0"), true).unwrap();
+        assert_eq!(
+            confirmed.plugin.provenance.as_ref().and_then(|provenance| provenance.repository_id.clone()).as_deref(),
+            Some("repo-b")
+        );
+
+        // A downgrade below the confirmed active version needs the same explicit confirmation.
+        let downgraded =
+            installer.install_marketplace_bytes(&signed("1.0.5"), &expectation("repo-b", "1.0.5"), false).unwrap_err();
+        assert!(downgraded.contains("downgrade"), "{downgraded}");
+    }
+
+    #[test]
+    fn rollback_carries_the_target_versions_provenance_forward() {
+        let root = tempfile::tempdir().unwrap();
+        let (installer, signing_key) = signed_installer(root.path(), [22u8; 32]);
+        let signed = |version: &str| package(version, Some((&signing_key, "sample-key")), false);
+        let expectation = |repository: &str, version: &str| PluginPackageExpectation {
+            id: "sample.hello".to_string(),
+            version: version.to_string(),
+            repository_id: Some(repository.to_string()),
+            publisher: "sample".to_string(),
+            permissions: BTreeSet::from(["host.events".to_string()]),
+            signing_key_id: "sample-key".to_string(),
+        };
+
+        installer.install_marketplace_bytes(&signed("1.0.0"), &expectation("repo-a", "1.0.0"), false).unwrap();
+        installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("repo-b", "1.1.0"), true).unwrap();
+        assert_eq!(installer.rollback("sample.hello").unwrap().previous_version, "1.0.0");
+
+        // After rolling back to the repo-a version, the recorded provenance is repo-a again, so a
+        // repo-a update proceeds without confirmation while repo-b still requires one.
+        let identity = read_install_identity(root.path(), "sample.hello").unwrap().unwrap();
+        assert_eq!(identity.version, "1.0.0");
+        assert_eq!(identity.provenance.and_then(|provenance| provenance.repository_id), Some("repo-a".to_string()));
+        installer.install_marketplace_bytes(&signed("1.2.0"), &expectation("repo-a", "1.2.0"), false).unwrap();
+        let rejected =
+            installer.install_marketplace_bytes(&signed("1.3.0"), &expectation("repo-b", "1.3.0"), false).unwrap_err();
+        assert!(rejected.contains("source change requires confirmation"), "{rejected}");
+    }
+
+    /// Rewrites the newest activation record without its `provenance` field: the on-disk shape an
+    /// activation written by a build that predates provenance has.
+    fn strip_latest_activation_provenance(container: &Path) {
+        let mut records = std::fs::read_dir(container.join(ACTIVATIONS_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| is_activation_record_file(path))
+            .collect::<Vec<_>>();
+        records.sort();
+        let path = records.pop().expect("activation record");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("provenance").is_some());
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_pre_provenance_activation_stays_unconstrained_until_the_next_install() {
+        let root = tempfile::tempdir().unwrap();
+        let (installer, signing_key) = signed_installer(root.path(), [23u8; 32]);
+        let signed = |version: &str| package(version, Some((&signing_key, "sample-key")), false);
+        let expectation = |repository: &str, version: &str| PluginPackageExpectation {
+            id: "sample.hello".to_string(),
+            version: version.to_string(),
+            repository_id: Some(repository.to_string()),
+            publisher: "sample".to_string(),
+            permissions: BTreeSet::from(["host.events".to_string()]),
+            signing_key_id: "sample-key".to_string(),
+        };
+
+        installer.install_marketplace_bytes(&signed("1.0.0"), &expectation("repo-a", "1.0.0"), false).unwrap();
+        strip_latest_activation_provenance(&root.path().join("sample.hello"));
+
+        // An activation record without provenance still parses (serde default) and records no source.
+        let identity = read_install_identity(root.path(), "sample.hello").unwrap().unwrap();
+        assert_eq!(identity.version, "1.0.0");
+        assert!(identity.provenance.is_none());
+
+        // Nothing was recorded, so the next install from any repository proceeds without a
+        // confirmation and starts recording provenance again.
+        let updated =
+            installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("repo-b", "1.1.0"), false).unwrap();
+        assert_eq!(
+            updated.plugin.provenance.and_then(|provenance| provenance.repository_id).as_deref(),
+            Some("repo-b")
+        );
+    }
+
+    #[test]
+    fn updating_a_plugin_leaves_its_data_directory_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        // The registry root sits beside plugin-data/, exactly like the app layout, so
+        // `PluginRegistry::plugin_data_dir("sample.hello")` resolves to the path below.
+        let plugins_root = root.path().join("plugins");
+        let (installer, signing_key) = signed_installer(&plugins_root, [24u8; 32]);
+        let signed = |version: &str| package(version, Some((&signing_key, "sample-key")), false);
+        let expectation = |repository: &str, version: &str| PluginPackageExpectation {
+            id: "sample.hello".to_string(),
+            version: version.to_string(),
+            repository_id: Some(repository.to_string()),
+            publisher: "sample".to_string(),
+            permissions: BTreeSet::from(["host.events".to_string()]),
+            signing_key_id: "sample-key".to_string(),
+        };
+
+        installer.install_marketplace_bytes(&signed("1.0.0"), &expectation("repo-a", "1.0.0"), false).unwrap();
+        let data_dir = root.path().join("plugin-data").join("sample.hello");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("state.json"), b"{\"rows\":1}").unwrap();
+
+        installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("repo-a", "1.1.0"), false).unwrap();
+        installer.rollback("sample.hello").unwrap();
+
+        // Plugin user data lives outside the versioned container and must survive update + rollback.
+        assert_eq!(std::fs::read(data_dir.join("state.json")).unwrap(), b"{\"rows\":1}");
+    }
+
     fn activation_record_count(container: &Path) -> usize {
         std::fs::read_dir(container.join(ACTIVATIONS_DIR))
             .unwrap()
@@ -1512,6 +2002,7 @@ mod tests {
         let (installer, signing_key) = signed_installer(root.path(), [13u8; 32]);
         let signed = |version: &str| package(version, Some((&signing_key, "sample-key")), false);
         let expectation = |version: &str| PluginPackageExpectation {
+            repository_id: None,
             id: "sample.hello".to_string(),
             version: version.to_string(),
             publisher: "sample".to_string(),
@@ -1519,13 +2010,13 @@ mod tests {
             signing_key_id: "sample-key".to_string(),
         };
 
-        installer.install_marketplace_bytes(&signed("1.0.0"), &expectation("1.0.0")).unwrap();
-        installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("1.1.0")).unwrap();
+        installer.install_marketplace_bytes(&signed("1.0.0"), &expectation("1.0.0"), false).unwrap();
+        installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("1.1.0"), false).unwrap();
         assert_eq!(installer.rollback("sample.hello").unwrap().previous_version, "1.0.0");
 
         // 1.1.0 is installed but inactive after the rollback: reinstalling it has to replace the
         // retained directory instead of failing with "already installed".
-        let reinstalled = installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("1.1.0")).unwrap();
+        let reinstalled = installer.install_marketplace_bytes(&signed("1.1.0"), &expectation("1.1.0"), false).unwrap();
 
         assert_eq!(reinstalled.previous_version.as_deref(), Some("1.0.0"));
         let container = root.path().join("sample.hello");
@@ -1701,5 +2192,248 @@ mod tests {
             zip.finish().unwrap();
         }
         output.into_inner()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn transient_lock_retry_recovers_from_windows_lock_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for code in [5, 32] {
+            let attempts = AtomicUsize::new(0);
+            let result = retry_transient_lock(&[Duration::ZERO, Duration::ZERO, Duration::ZERO], || {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(std::io::Error::from_raw_os_error(code))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_ok());
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn transient_lock_retry_returns_last_error_after_exhausting_delays() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let result: std::io::Result<()> = retry_transient_lock(&[Duration::ZERO], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn transient_lock_retry_does_not_retry_other_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let result: std::io::Result<()> = retry_transient_lock(&[Duration::ZERO; 3], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from_raw_os_error(2))
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(2));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transient_lock_retry_treats_windows_lock_codes_as_final_on_unix() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Raw code 5 on Unix is EIO, not a Windows lock error, so the retry gate must leave it final.
+        let attempts = AtomicUsize::new(0);
+        let result: std::io::Result<()> = retry_transient_lock(&[Duration::ZERO; 3], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+    }
+
+    /// Sorted `.trash` entries, so tombstone assertions are deterministic.
+    fn trash_entries(root: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(root.join(PLUGIN_TRASH_DIR))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Installs `sample.hello` into a store rooted at `<temp>/plugins`, so `<temp>/plugin-data`
+    /// sits next to it exactly like the real registry layout does.
+    fn uninstall_fixture(temp: &tempfile::TempDir, version: &str) -> (PluginPackageInstaller, PathBuf) {
+        let root = temp.path().join("plugins");
+        let installer = PluginPackageInstaller::with_trust_store(root.clone(), "0.5.67", PluginTrustStore::default());
+        installer.install_bytes(&package(version, None, false), PluginInstallPolicy::LocalDevelopment).unwrap();
+        (installer, root)
+    }
+
+    #[test]
+    fn uninstall_commits_logically_and_sweeps_its_own_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let (installer, root) = uninstall_fixture(&temp, "1.0.0");
+        let plugin_data = temp.path().join("plugin-data").join("sample.hello");
+        std::fs::create_dir_all(&plugin_data).unwrap();
+        std::fs::write(plugin_data.join("preferences.json"), "{}").unwrap();
+        let container = root.join("sample.hello");
+        assert!(container.join(VERSIONS_DIR).join("1.0.0").join("manifest.json").is_file());
+
+        installer.uninstall("sample.hello").unwrap();
+
+        assert!(!container.exists(), "the official container must be gone");
+        assert!(trash_entries(&root).is_empty(), "a successful uninstall sweeps its own tombstone");
+        assert!(root.join(INSTALL_LOCK_FILE).is_file(), "the store lock file stays in place");
+        assert!(plugin_data.join("preferences.json").is_file(), "plugin data survives an uninstall");
+        let registry = PluginRegistry::new_with_app_version(root, "0.5.67");
+        assert!(registry.list_installed().unwrap().is_empty());
+        assert!(registry.find_plugin("sample.hello").unwrap().is_none());
+
+        // Uninstalling a plugin that is already gone stays idempotent.
+        installer.uninstall("sample.hello").unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn uninstall_retries_transient_windows_locks_on_the_commit_rename() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (installer, root) = uninstall_fixture(&temp, "1.0.0");
+        let attempts = AtomicUsize::new(0);
+        installer
+            .uninstall_with_ops(
+                "sample.hello",
+                &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+                |src: &Path, dst: &Path| match attempts.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(std::io::Error::from_raw_os_error(5)),
+                    1 => Err(std::io::Error::from_raw_os_error(32)),
+                    _ => std::fs::rename(src, dst),
+                },
+                |path: &Path| std::fs::remove_dir_all(path),
+            )
+            .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "two lock errors then one successful rename");
+        assert!(!root.join("sample.hello").exists());
+        assert!(trash_entries(&root).is_empty());
+    }
+
+    #[test]
+    fn uninstall_reports_a_clean_failure_and_keeps_the_container_when_the_rename_keeps_failing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (installer, root) = uninstall_fixture(&temp, "1.0.0");
+        let container = root.join("sample.hello");
+        let attempts = AtomicUsize::new(0);
+        let error = installer
+            .uninstall_with_ops(
+                "sample.hello",
+                &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+                |_: &Path, _: &Path| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::Error::from_raw_os_error(32))
+                },
+                |path: &Path| std::fs::remove_dir_all(path),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("Failed to uninstall plugin 'sample.hello'"), "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), if cfg!(windows) { 4 } else { 1 });
+        // A failed logical commit must leave the container exactly as it was: the plugin has to
+        // stay installed, discoverable, and loadable after a restart.
+        assert!(container.join(VERSIONS_DIR).join("1.0.0").join("manifest.json").is_file());
+        assert_eq!(activation_record_count(&container), 1);
+        assert!(trash_entries(&root).is_empty(), "a failed commit must not leave a tombstone behind");
+        let registry = PluginRegistry::new_with_app_version(root, "0.5.67");
+        assert_eq!(registry.list_installed().unwrap().len(), 1);
+        assert_eq!(registry.find_plugin("sample.hello").unwrap().unwrap().manifest.version, "1.0.0");
+    }
+
+    #[test]
+    fn uninstall_stays_a_logical_success_when_the_tombstone_cannot_be_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (installer, root) = uninstall_fixture(&temp, "1.0.0");
+
+        installer
+            .uninstall_with_ops(
+                "sample.hello",
+                &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+                |src: &Path, dst: &Path| std::fs::rename(src, dst),
+                |_: &Path| Err(std::io::Error::from_raw_os_error(32)),
+            )
+            .unwrap();
+
+        assert!(!root.join("sample.hello").exists());
+        assert_eq!(trash_entries(&root), vec!["sample.hello".to_string()]);
+        let registry = PluginRegistry::new_with_app_version(root, "0.5.67");
+        assert!(registry.list_installed().unwrap().is_empty());
+        assert!(registry.find_plugin("sample.hello").unwrap().is_none());
+    }
+
+    #[test]
+    fn install_and_uninstall_sweep_tombstones_left_by_an_earlier_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (installer, root) = uninstall_fixture(&temp, "1.0.0");
+        let stale = root.join(PLUGIN_TRASH_DIR).join("sample.hello");
+        std::fs::create_dir_all(stale.join(VERSIONS_DIR).join("1.0.0")).unwrap();
+        std::fs::write(stale.join(VERSIONS_DIR).join("1.0.0").join("manifest.json"), "{}").unwrap();
+
+        installer.install_bytes(&package("1.1.0", None, false), PluginInstallPolicy::LocalDevelopment).unwrap();
+        assert!(!stale.exists(), "an install sweeps leftovers of an earlier uninstall");
+
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("leftover.bin"), b"still locked").unwrap();
+        installer.uninstall("sample.hello").unwrap();
+        assert!(!root.join("sample.hello").exists());
+        assert!(!stale.exists(), "an uninstall sweeps old tombstones as well");
+    }
+
+    #[test]
+    fn tombstone_containers_are_never_discovered_as_installed_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let (installer, root) = uninstall_fixture(&temp, "1.0.0");
+        let tombstone = root.join(PLUGIN_TRASH_DIR).join("sample.hello");
+        std::fs::create_dir_all(root.join(PLUGIN_TRASH_DIR)).unwrap();
+        std::fs::rename(root.join("sample.hello"), &tombstone).unwrap();
+        // The tombstone still holds a complete container: versions/, activations/, manifest.json.
+        assert!(tombstone.join(VERSIONS_DIR).join("1.0.0").join("manifest.json").is_file());
+        assert_eq!(activation_record_count(&tombstone), 1);
+
+        let registry = PluginRegistry::new_with_app_version(root.clone(), "0.5.67");
+        assert!(registry.list_installed().unwrap().is_empty());
+        assert!(registry.find_plugin("sample.hello").unwrap().is_none());
+
+        // The store stays usable: a reinstall does not collide with the pending tombstone.
+        installer.install_bytes(&package("1.0.0", None, false), PluginInstallPolicy::LocalDevelopment).unwrap();
+        assert_eq!(registry.list_installed().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_tree_writable_clears_readonly_flags_recursively() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("readonly_dir");
+        let sub = dir.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("binary.exe");
+        std::fs::write(&file, b"test").unwrap();
+
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().permissions().readonly());
+
+        ensure_tree_writable(&dir);
+        assert!(!std::fs::metadata(&file).unwrap().permissions().readonly());
     }
 }

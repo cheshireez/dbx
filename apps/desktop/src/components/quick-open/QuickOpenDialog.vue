@@ -1,13 +1,18 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from "vue";
+import { computed, defineAsyncComponent, ref, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { Command, FileCode, FileText, Search, FolderPlus, SlidersHorizontal, X } from "@lucide/vue";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import PluginIcon from "@/components/plugins/PluginIcon.vue";
 import { useQuickOpen, type QuickOpenItem } from "@/composables/useQuickOpen";
+import { usePluginCommandPalette } from "@/lib/plugins/pluginCommandPalette";
+import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { getGlobalSearchRoots, saveGlobalSearchRoots, getGlobalSearchExtensions, saveGlobalSearchExtensions } from "@/lib/globalSearch/globalSearchSettings";
+
+const QuickOpenFilePreview = defineAsyncComponent(() => import("./QuickOpenFilePreview.vue"));
 
 const props = defineProps<{
   open: boolean;
@@ -21,8 +26,46 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
-const { searchQuery, filteredItems, selectedIndex, selectedItem, selectNext, selectPrevious, setQuery, loadExternalSqlFiles, contentMode, contentGroups, contentSelectedItem, contentSearching, setContentMode } = useQuickOpen();
-const inputRef = ref<HTMLInputElement | null>(null);
+// Plugin commandPalette commands (HOST_PLUGIN_UI_SPEC §5): injected as extra quick-open entries;
+// list refresh is driven by dbx:plugins-changed / focus / locale change, with a fallback refresh when the dialog opens.
+const pluginPalette = usePluginCommandPalette();
+const { toast } = useToast();
+const {
+  searchQuery,
+  filteredItems,
+  selectedIndex,
+  selectedItem,
+  selectNext,
+  selectPrevious,
+  setQuery,
+  loadExternalSqlFiles,
+  loadPluginWorkbenches,
+  contentMode,
+  contentGroups,
+  contentSelectedItem,
+  contentSearching,
+  setContentMode: setSearchContentMode,
+} = useQuickOpen({ extraItems: pluginPalette.items });
+const previewEditing = ref(false);
+const pinnedPreviewItem = ref<QuickOpenItem | null>(null);
+const previewItem = computed(() => (previewEditing.value ? pinnedPreviewItem.value : contentSelectedItem.value));
+
+function handlePreviewEditing(value: boolean): void {
+  if (value) pinnedPreviewItem.value = contentSelectedItem.value ? { ...contentSelectedItem.value } : null;
+  if (value) searchSettingsOpen.value = false;
+  previewEditing.value = value;
+}
+
+function canLeavePreview(): boolean {
+  if (!previewEditing.value) return true;
+  toast(t("quickOpen.finishEditing"));
+  return false;
+}
+
+function setContentMode(value: boolean): void {
+  if (canLeavePreview()) setSearchContentMode(value);
+}
+const inputRef = ref<InstanceType<typeof Input> | null>(null);
 const listRef = ref<HTMLElement | null>(null);
 const settingsStore = useSettingsStore();
 const globalSearchShortcut = computed(() => formatShortcutDisplay(settingsStore.editorSettings.shortcuts.globalSearch || "Mod+Shift+F"));
@@ -105,10 +148,13 @@ function getHighlightedLineParts(item: QuickOpenItem): Array<{ text: string; hig
 
 const dialogOpen = computed({
   get: () => props.open,
-  set: (value) => emit("update:open", value),
+  set: (value) => {
+    if (value || canLeavePreview()) emit("update:open", value);
+  },
 });
 
 function handleKeyDown(e: KeyboardEvent): void {
+  if (previewEditing.value) return;
   if (e.key === "ArrowDown") {
     e.preventDefault();
     selectNext();
@@ -127,7 +173,27 @@ function handleKeyDown(e: KeyboardEvent): void {
   }
 }
 
+function handlePreviewNavigate(direction: -1 | 1): void {
+  if (previewEditing.value) return;
+  if (direction === 1) selectNext();
+  else selectPrevious();
+  inputRef.value?.$el.focus();
+}
+
+function openPreviewMatch(): void {
+  if (contentSelectedItem.value) handleSelect(contentSelectedItem.value);
+}
+
 function handleSelect(item: QuickOpenItem): void {
+  if (!canLeavePreview()) return;
+  // Plugin commands execute inside this component: they are NOT dispatched to App.vue object navigation (that chain
+  // connectionId-based connection/expand logic is meaningless for command entries); execution errors surface via the existing toast.
+  if (item.type === "plugin_command") {
+    const result = pluginPalette.open(item);
+    if (result.error) toast(result.error, 5000);
+    dialogOpen.value = false;
+    return;
+  }
   emit("select", item);
   dialogOpen.value = false;
 }
@@ -198,6 +264,8 @@ function getTypeLabel(type: string): string {
       return t("quickOpen.sqlFile");
     case "sql_library_file":
       return t("quickOpen.sqlLibraryFile");
+    case "plugin_workbench":
+      return t("quickOpen.pluginWorkbench");
     default:
       return type;
   }
@@ -209,6 +277,12 @@ function getItemIcon(type: string) {
   return null;
 }
 
+/** Right badge copy: plugin commands show the source plugin name as provenance; others keep the type label. */
+function getTypeBadge(item: QuickOpenItem): string {
+  if (item.type === "plugin_command") return item.pluginName || item.pluginId || "";
+  return getTypeLabel(item.type);
+}
+
 watch(
   () => props.open,
   (newOpen) => {
@@ -217,10 +291,14 @@ watch(
       setContentMode(props.initialContentMode === true);
       searchSettingsOpen.value = false;
       refreshSearchSettings();
+      // Fallback refresh of the plugin command list on open (regular refresh is event-driven via dbx:plugins-changed).
+      void pluginPalette.refresh();
       // Eagerly load external SQL files so they appear in the initial list
       void loadExternalSqlFiles();
+      // Refresh plugin workbench entries so installs/uninstalls show up without a restart
+      void loadPluginWorkbenches();
       nextTick(() => {
-        inputRef.value?.focus();
+        inputRef.value?.$el.focus();
       });
     }
   },
@@ -247,13 +325,14 @@ watch(selectedIndex, async () => {
 <template>
   <Dialog :open="dialogOpen" @update:open="dialogOpen = $event">
     <DialogContent class="max-w-2xl p-0 gap-0 rounded-lg overflow-hidden">
-      <div class="flex flex-col bg-background">
+      <div class="flex max-h-[calc(var(--dbx-viewport-height)-2rem)] min-h-0 flex-col bg-background">
         <!-- Search Input -->
-        <div class="flex items-center gap-3 px-4 pr-12 py-3 border-b">
+        <div class="flex shrink-0 items-center gap-3 px-4 pr-12 py-3 border-b">
           <Command class="h-5 w-5 text-muted-foreground" />
           <Input
             ref="inputRef"
             v-model="searchQuery"
+            :disabled="previewEditing"
             type="text"
             :placeholder="contentMode ? t('quickOpen.contentPlaceholder') : t('quickOpen.placeholder')"
             class="flex-1 border-0 bg-transparent p-0 placeholder:text-muted-foreground focus-visible:ring-0 focus-visible:outline-none"
@@ -262,22 +341,28 @@ watch(selectedIndex, async () => {
           <div class="flex items-center gap-1 shrink-0">
             <!-- Object/file ⇄ file content mode toggle -->
             <div class="flex items-center rounded-md bg-muted p-0.5 text-muted-foreground">
-              <button class="flex h-7 w-7 items-center justify-center rounded" :class="contentMode ? 'hover:bg-muted-foreground/10' : 'bg-background text-foreground shadow-sm'" :title="t('quickOpen.modeObjects')" @click="setContentMode(false)">
+              <button :disabled="previewEditing" class="flex h-7 w-7 items-center justify-center rounded disabled:opacity-50" :class="contentMode ? 'hover:bg-muted-foreground/10' : 'bg-background text-foreground shadow-sm'" :title="t('quickOpen.modeObjects')" @click="setContentMode(false)">
                 <FileCode class="h-4 w-4" />
               </button>
-              <button class="flex h-7 w-7 items-center justify-center rounded" :class="contentMode ? 'bg-background text-foreground shadow-sm' : 'hover:bg-muted-foreground/10'" :title="t('quickOpen.modeContent')" @click="setContentMode(true)">
+              <button :disabled="previewEditing" class="flex h-7 w-7 items-center justify-center rounded disabled:opacity-50" :class="contentMode ? 'bg-background text-foreground shadow-sm' : 'hover:bg-muted-foreground/10'" :title="t('quickOpen.modeContent')" @click="setContentMode(true)">
                 <Search class="h-4 w-4" />
               </button>
             </div>
             <!-- Search settings (roots & extensions) -->
-            <button class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :class="searchSettingsOpen ? 'bg-muted text-foreground' : ''" :title="t('quickOpen.searchSettings')" @click="searchSettingsOpen = !searchSettingsOpen">
+            <button
+              :disabled="previewEditing"
+              class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+              :class="searchSettingsOpen ? 'bg-muted text-foreground' : ''"
+              :title="t('quickOpen.searchSettings')"
+              @click="searchSettingsOpen = !searchSettingsOpen"
+            >
               <SlidersHorizontal class="h-4 w-4" />
             </button>
           </div>
         </div>
 
         <!-- Search settings panel -->
-        <div v-if="searchSettingsOpen" class="space-y-3 border-b bg-muted/30 px-4 py-3 text-sm">
+        <div v-if="searchSettingsOpen" class="max-h-[30vh] shrink-0 space-y-3 overflow-y-auto border-b bg-muted/30 px-4 py-3 text-sm">
           <div>
             <div class="mb-1.5 flex items-center justify-between">
               <span class="text-xs text-muted-foreground">{{ t("quickOpen.searchRoots") }}</span>
@@ -305,7 +390,7 @@ watch(selectedIndex, async () => {
         </div>
 
         <!-- Results List -->
-        <div ref="listRef" class="max-h-[400px] overflow-y-auto">
+        <div ref="listRef" class="min-h-0 overflow-y-auto" :class="contentMode ? 'max-h-[min(36vh,320px)]' : 'max-h-[400px]'">
           <!-- Content search mode: group matches by file (DataGrip-style) -->
           <template v-if="contentMode">
             <div v-if="contentSearching" class="px-4 py-8 text-center text-muted-foreground">
@@ -326,7 +411,7 @@ watch(selectedIndex, async () => {
                   <span class="text-xs text-muted-foreground whitespace-nowrap">{{ row.count }}</span>
                 </div>
                 <!-- Match line -->
-                <div v-else class="px-4 py-1.5 cursor-pointer" :data-selected="row.flatIndex === selectedIndex" :class="[row.flatIndex === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(row.item!)" @mouseenter="selectedIndex = row.flatIndex">
+                <div v-else class="px-4 py-1.5 cursor-pointer" :data-selected="row.flatIndex === selectedIndex" :class="[row.flatIndex === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(row.item!)" @mouseenter="!previewEditing && (selectedIndex = row.flatIndex)">
                   <!-- Filename-only match (no content hit): show highlighted file name -->
                   <div v-if="row.item!.line === 0" class="flex items-center gap-2 min-w-0">
                     <FileText class="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -362,6 +447,7 @@ watch(selectedIndex, async () => {
             <div v-for="(item, index) in filteredItems" :key="item.id" :data-selected="index === selectedIndex" :class="['px-4 py-2 cursor-pointer', index === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(item)" @mouseenter="selectedIndex = index">
               <div class="flex items-center justify-between gap-3">
                 <div class="flex items-center gap-2 flex-1 min-w-0">
+                  <PluginIcon v-if="item.type === 'plugin_workbench' && item.pluginId" :plugin-id="item.pluginId" :icon="item.pluginIcon" :contribution-id="item.contributionId" class="h-4 w-4 shrink-0" />
                   <component v-if="getItemIcon(item.type)" :is="getItemIcon(item.type)" class="h-4 w-4 shrink-0 text-muted-foreground" />
                   <div class="flex-1 min-w-0">
                     <div class="text-sm font-medium truncate">
@@ -378,17 +464,20 @@ watch(selectedIndex, async () => {
                   </div>
                 </div>
                 <div class="text-xs px-2 py-1 rounded bg-muted text-muted-foreground whitespace-nowrap">
-                  {{ getTypeLabel(item.type) }}
+                  {{ getTypeBadge(item) }}
                 </div>
               </div>
             </div>
           </div>
         </div>
 
+        <QuickOpenFilePreview v-if="previewItem && (previewEditing || (contentMode && !contentSearching))" :item="previewItem" class="h-[min(32vh,280px)] shrink-0" @editing="handlePreviewEditing" @navigate="handlePreviewNavigate" @open="openPreviewMatch" @close="dialogOpen = false" />
+
         <!-- Footer -->
-        <div class="px-4 py-2 border-t text-xs text-muted-foreground flex justify-between">
+        <div class="shrink-0 flex flex-wrap justify-between gap-2 px-4 py-2 border-t text-xs text-muted-foreground">
           <div>{{ contentMode ? contentMatchCount : filteredItems.length }} {{ t("quickOpen.results") }}</div>
-          <div class="flex gap-4">
+          <div v-if="previewEditing" role="status">{{ t("quickOpen.finishEditing") }}</div>
+          <div v-else class="flex gap-4">
             <span><kbd class="px-2 py-1 rounded bg-muted">↑↓</kbd> {{ t("quickOpen.navigate") }}</span>
             <span><kbd class="px-2 py-1 rounded bg-muted">⏎</kbd> {{ t("quickOpen.select") }}</span>
             <span><kbd class="px-2 py-1 rounded bg-muted">ESC</kbd> {{ t("quickOpen.close") }}</span>

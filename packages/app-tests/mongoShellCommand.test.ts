@@ -33,12 +33,13 @@ import {
   parseMongoGetIndexesCommand,
   parseMongoVersionCommand,
   planMongoFindPagination,
+  mongoFindPageCoversLogicalLimit,
   parseMongoWriteCommand,
   splitMongoCommands,
   splitMongoCommandRanges,
 } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
 import type { MongoWriteCommand } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
-import { buildMongoUpdateDocument as buildMongoDocumentUpdate, formatMongoShellLiteral as formatMongoDocumentShellLiteral } from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
+import { buildMongoUpdateDocument as buildMongoDocumentUpdate, formatMongoShellLiteral as formatMongoDocumentShellLiteral, mongoDocumentGridDisplayText, mongoDocumentGridEditorText, mongoDocumentGridValue } from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
 import { normalizeJsonArgument } from "../mongo-shell/src/json.ts";
 
 test("parseMongoFindCommand parses db collection find with an empty JSON filter", () => {
@@ -255,6 +256,23 @@ test("planMongoFindPagination preserves explicit skip and limit bounds", () => {
   assert.equal(mongoFindLogicalTotal(824, plan!), 150);
 });
 
+test("mongoFindPageCoversLogicalLimit only skips counting when the first page holds every limited row", () => {
+  const plan = (source: string, pageOffset: number, pageLimit = 100) => {
+    const command = parseMongoFindCommand(source);
+    assert.ok(command);
+    const result = planMongoFindPagination(source, command, pageOffset, pageLimit);
+    assert.ok(result);
+    return result;
+  };
+
+  assert.equal(mongoFindPageCoversLogicalLimit(plan("db.events.find({ type: 0 }).sort({ eventTime: -1 }).limit(50)", 0)), true);
+  assert.equal(mongoFindPageCoversLogicalLimit(plan("db.events.find({}).skip(20).limit(100)", 0)), true);
+  assert.equal(mongoFindPageCoversLogicalLimit(plan("db.events.find({}).limit(150)", 0)), false);
+  assert.equal(mongoFindPageCoversLogicalLimit(plan("db.events.find({}).limit(150)", 100)), false);
+  assert.equal(mongoFindPageCoversLogicalLimit(plan("db.events.find({})", 0)), false);
+  assert.equal(mongoFindPageCoversLogicalLimit(plan("db.events.find({}).limit(0)", 0)), false);
+});
+
 test("parseMongoFindCommand accepts line breaks before find and chained calls", () => {
   const command = parseMongoFindCommand(`db.getCollection("accounting_reconciliations")
 .find({
@@ -343,6 +361,34 @@ test("parseMongoFindCommand rewrites epoch-millisecond and numeric BSON construc
     qty: { $numberInt: "3" },
     total: { $numberDecimal: "12.34" },
   });
+});
+
+test("parseMongoCommand accepts the mongosh Int32, Long, Double and Decimal128 constructors", () => {
+  const insert = parseMongoCommand('db.getCollection("issue_demo").insert({\n    name: "demo",\n    coins: Int32("15000"),\n    amount: Decimal128("100")\n});');
+  assert.equal(insert?.command.kind, "insert");
+  assert.deepEqual(JSON.parse((insert!.command as { docsJson: string }).docsJson), {
+    name: "demo",
+    coins: { $numberInt: "15000" },
+    amount: { $numberDecimal: "100" },
+  });
+
+  const command = parseMongoFindCommand('db.orders.find({a: Int32(3), b: new Int32(-4), c: Long("9223372036854775807"), d: Long(5), e: Double(1.5), f: Double("2"), g: Decimal128("12.34")})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), {
+    a: { $numberInt: "3" },
+    b: { $numberInt: "-4" },
+    c: { $numberLong: "9223372036854775807" },
+    d: { $numberLong: "5" },
+    e: { $numberDouble: "1.5" },
+    f: { $numberDouble: "2" },
+    g: { $numberDecimal: "12.34" },
+  });
+
+  for (const source of ["db.orders.find({a: Int32(2147483648)})", 'db.orders.find({a: Long("x")})', 'db.orders.find({a: Double("abc")})', "db.orders.find({a: Decimal128()})", "db.orders.find({a: myLong(1)})"]) {
+    assert.equal(parseMongoFindCommand(source), null, source);
+  }
+  assert.match(describeMongoCommandParseFailure("db.orders.find({a: myLong(1)})"), /Unsupported value myLong\(\.\.\.\)/);
+  assert.match(describeMongoCommandParseFailure("db.orders.find({a: Foo(1)})"), /Int32, Long, Double, Decimal128/);
 });
 
 test("parseMongoFindCommand rejects out-of-range integer constructor arguments", () => {
@@ -914,6 +960,31 @@ test("parseMongoWriteCommand unwraps EJSON.deserialize values", () => {
   });
 });
 
+test("parseMongoWriteCommand accepts the copied insert form that wraps BSON values in EJSON.deserialize", () => {
+  // "Copy -> SQL Inserts" formats values extended JSON cannot spell directly
+  // through `EJSON.deserialize({...})`. The statement is re-parsed by the Rust
+  // parser before execution, so both parsers must accept this exact shape
+  // (#11666).
+  assert.deepEqual(
+    parseMongoWriteCommand(`db.getCollection("test").insert({
+  "type": EJSON.deserialize({
+    "$numberInt": "999999"
+  }),
+  "refid": "27507"
+})`),
+    {
+      kind: "insert",
+      collection: "test",
+      docsJson: `{
+  "type": {
+    "$numberInt": "999999"
+  },
+  "refid": "27507"
+}`,
+    },
+  );
+});
+
 test("parseMongoWriteCommand accepts legacy insert commands", () => {
   assert.deepEqual(
     parseMongoWriteCommand(`db.getCollection("accounting_reconciliations").insert({
@@ -1431,6 +1502,64 @@ test("parseMongoRunCommand reads db.dropDatabase() and db.createCollection() as 
   }
 });
 
+test("parseMongoRunCommand reads db.createView() as a create command with viewOn and pipeline", () => {
+  assert.deepEqual(JSON.parse(parseMongoRunCommand('db.createView("active_users", "users", [{ $match: { active: true } }])')!.commandJson), {
+    create: "active_users",
+    viewOn: "users",
+    pipeline: [{ $match: { active: true } }],
+  });
+  assert.deepEqual(JSON.parse(parseMongoRunCommand("db.createView('v', 'users', [], { collation: { locale: 'fr' } });")!.commandJson), {
+    create: "v",
+    viewOn: "users",
+    pipeline: [],
+    collation: { locale: "fr" },
+  });
+  assert.equal(parseMongoCommand('db.createView("v", "users", [])')?.command.kind, "runCommand");
+
+  for (const [source, expected] of [
+    ['db.createView("v", "users")', /createView\(\) expects a view name, a source collection name, a pipeline/],
+    ['db.createView("v", "users", {})', /createView\(\) expects/],
+    ['db.createView("v", 1, [])', /createView\(\) expects/],
+    ['db.createView("v", "users", [], { viewOn: "other" })', /createView\(\) expects/],
+    ['db.createView("v", "users", [{ $match: { a: Foo() } }])', /Unsupported value Foo\(\.\.\.\) in the pipeline argument of createView\(\)/],
+  ] as const) {
+    assert.equal(parseMongoCommand(source), null, source);
+    assert.match(describeMongoCommandParseFailure(source), expected, source);
+  }
+});
+
+test("parseMongoRunCommand reads user and role helpers as usersInfo and rolesInfo", () => {
+  for (const [source, expected] of [
+    ["show users", { usersInfo: 1 }],
+    ["SHOW ROLES;", { rolesInfo: 1 }],
+    ["db.getUsers()", { usersInfo: 1 }],
+    ["db.getUsers({ showCredentials: false, filter: { roles: { $size: 0 } } })", { usersInfo: 1, showCredentials: false, filter: { roles: { $size: 0 } } }],
+    ['db.getUser("app")', { usersInfo: "app" }],
+    ["db.getUser('app', { showPrivileges: true })", { usersInfo: "app", showPrivileges: true }],
+    ["db.getRoles({ showBuiltinRoles: true })", { rolesInfo: 1, showBuiltinRoles: true }],
+    ['db.getRole("reader")', { rolesInfo: "reader" }],
+  ] as const) {
+    assert.deepEqual(JSON.parse(parseMongoRunCommand(source)?.commandJson ?? "null"), expected, source);
+    assert.equal(parseMongoCommand(source)?.command.kind, "runCommand", source);
+  }
+
+  for (const [source, expected] of [
+    ["db.getUser()", /getUser\(\) expects a user name/],
+    ["db.getUser(1)", /getUser\(\) expects a user name/],
+    ["db.getUsers({ usersInfo: 2 })", /getUsers\(\) expects optional options/],
+    ["db.getRoles({}, {})", /getRoles\(\) expects optional options/],
+    ['db.getRole("a").x()', /Unexpected text after getRole/],
+  ] as const) {
+    assert.equal(parseMongoCommand(source), null, source);
+    assert.match(describeMongoCommandParseFailure(source), expected, source);
+  }
+  assert.equal(parseMongoCommand("show users extra"), null);
+  assert.deepEqual(
+    splitMongoCommands("use admin\nshow users\nshow roles").map(({ command }) => command.kind),
+    ["use", "runCommand", "runCommand"],
+  );
+});
+
 test("parseMongoRunCommand reads db.stats() and db.serverStatus() as run commands", () => {
   assert.deepEqual(parseMongoRunCommand("db.stats()"), { commandJson: '{"dbStats":1}' });
   assert.deepEqual(parseMongoRunCommand("db . serverStatus ( ) ;"), { commandJson: '{"serverStatus":1}' });
@@ -1751,7 +1880,7 @@ test("mongoDocumentsToQueryResult turns mongo documents into grid rows", () => {
 
   assert.deepEqual(result.columns, ["_id", "name", "profile", "active"]);
   assert.deepEqual(result.rows, [
-    ["1", "Ada", '{"role":"admin"}', null],
+    ["1", "Ada", mongoDocumentGridValue({ role: "admin" }), null],
     ["2", "Lin", null, true],
   ]);
   assert.deepEqual(result.mongo_documents, [
@@ -1761,6 +1890,19 @@ test("mongoDocumentsToQueryResult turns mongo documents into grid rows", () => {
   assert.equal(result.affected_rows, 12);
   assert.equal(result.execution_time_ms, 5);
   assert.equal(result.truncated, true);
+});
+
+test("mongoDocumentsToQueryResult displays array structures with shell-style BSON literals", () => {
+  const document = {
+    _id: "1",
+    history: [{ at: 'ISODate("2026-06-10T13:59:31.287Z")', by: { $oid: "507f1f77bcf86cd799439011" } }],
+  };
+  const result = mongoDocumentsToQueryResult([document], 5, 1);
+  const historyCell = result.rows[0]?.[1];
+
+  assert.equal(typeof historyCell, "string");
+  assert.equal(mongoDocumentGridDisplayText(historyCell), '[{"at": ISODate("2026-06-10T13:59:31.287Z"), "by": ObjectId("507f1f77bcf86cd799439011")}]');
+  assert.equal(mongoDocumentGridEditorText(historyCell), JSON.stringify(document.history));
 });
 
 test("mongoDocumentsToQueryResult keeps aligned extended documents for copying", () => {

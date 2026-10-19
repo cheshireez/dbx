@@ -129,6 +129,8 @@ function completedSession(): DataCompareSession {
         targetRowCount: 0,
         sourceTruncated: false,
         targetTruncated: false,
+        rowBudget: 100_000,
+        syncEligible: true,
         databaseType: "oracle",
         diff: {
           added: [
@@ -484,5 +486,53 @@ describe("DataCompareDialog session restore", () => {
     expect(session.batchResults[0]?.diff.added[0]?.selected).toBe(false);
     expect(session.syncPlan.syncStatements).toEqual(["INSERT 2"]);
     expect(session.syncPlan.syncSql).toBe("INSERT 2;");
+  });
+});
+
+describe("DataCompareDialog results layout", () => {
+  it("scrolls results in a plain container so the footer cannot overlap them", async () => {
+    // Chromium cannot scroll or clip a <fieldset> that owns `overflow-auto`
+    // (see issue #9839), so the scroll region must be a plain element and the
+    // fieldset may only stay in the tree as the disabled-state provider.
+    mountSessionDialog(completedSession());
+    await flushAsyncSetup();
+
+    const fieldset = document.querySelector("fieldset");
+    expect(fieldset).not.toBeNull();
+    expect(fieldset?.className).not.toContain("overflow-auto");
+
+    const scroller = fieldset?.parentElement;
+    expect(scroller?.tagName).toBe("DIV");
+    expect(scroller?.className).toContain("overflow-auto");
+    expect(scroller?.className).toContain("min-h-0");
+
+    const dialogFooter = document.querySelector('[data-slot="dialog-footer"]');
+    expect(dialogFooter).not.toBeNull();
+    expect(scroller?.contains(dialogFooter)).toBe(false);
+  });
+});
+
+describe("DataCompareDialog truncation warning", () => {
+  it("warns that a table larger than the row budget was only partially compared", async () => {
+    const session = completedSession();
+    const result = session.batchResults[0]!;
+    result.sourceTruncated = true;
+    result.sourceRowCount = 4_000_000;
+    result.rowBudget = 100_000;
+
+    mountSessionDialog(session);
+    await flushAsyncSetup();
+
+    const text = document.body.textContent ?? "";
+    expect(text).toContain(i18n.global.t("dataCompare.truncatedTitle"));
+    expect(text).toContain(i18n.global.t("dataCompare.truncatedBadge", { budget: 100_000 }));
+    expect(text).toContain(i18n.global.t("dataCompare.truncatedTable", { table: "ORDERS", source: 4_000_000, target: 0, budget: 100_000 }));
+  });
+
+  it("keeps the warning out of the results when every table fit the budget", async () => {
+    mountSessionDialog(completedSession());
+    await flushAsyncSetup();
+
+    expect(document.body.textContent ?? "").not.toContain(i18n.global.t("dataCompare.truncatedTitle"));
   });
 });

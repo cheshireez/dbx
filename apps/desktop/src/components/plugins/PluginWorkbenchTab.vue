@@ -5,13 +5,14 @@ import PluginWorkbenchHost from "@/components/plugins/PluginWorkbenchHost.vue";
 import PluginRefreshState from "@/components/plugins/PluginRefreshState.vue";
 import * as api from "@/lib/backend/api";
 import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
-import type { PluginWorkbenchContext } from "@/lib/plugins/pluginHostBridge";
+import type { PluginAiRecommendationHostUpdate, PluginWorkbenchContext } from "@/lib/plugins/pluginHostBridge";
 import type { InstalledPlugin } from "@/types/database";
 import { useQueryStore } from "@/stores/queryStore";
 import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
 
 const props = defineProps<{
+  tabId?: string;
   pluginId: string;
   contributionId: string;
   connectionId?: string;
@@ -21,6 +22,7 @@ const props = defineProps<{
 const { t, locale: appLocale } = useI18n();
 const emit = defineEmits<{
   closeTab: [];
+  recommendations: [update: PluginAiRecommendationHostUpdate];
 }>();
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
@@ -55,7 +57,8 @@ async function load() {
   }
 }
 
-async function refresh() {
+async function refresh(options: { silent?: boolean } = {}) {
+  const silent = options.silent === true;
   deferred.value = false;
   loading.value = true;
   error.value = "";
@@ -66,25 +69,52 @@ async function refresh() {
         // The connection is open but the plugin sidecar's registry may have
         // been wiped (iframe reload, tab restore): ensureConnected's health
         // fast-path only probes the sidecar process and would not heal that.
-        // Force a re-push instead; it no-ops when a push just happened.
-        await connectionStore.repushPluginConnection(connectionId);
+        // Force a re-push instead; it no-ops when a push just happened. A
+        // silent restore additionally overrides the recent-health TTL: the
+        // SPA's boot restore can mark the connection healthy without ever
+        // delivering credentials to the sidecar, and a skipped push here
+        // strands the restored plugin with an empty registry
+        // (dbx-plugin-ssh#144).
+        const pushed = await connectionStore.repushPluginConnection(connectionId, { ignoreRecentHealthCheck: silent });
+        if (silent && pushed === false) {
+          loading.value = false;
+          deferred.value = true;
+          return;
+        }
       } else {
-        await connectionStore.ensureConnected(connectionId);
+        // 被动唤醒（页签恢复/重新挂载）：用户显式关掉的连接不在这里偷偷重连。
+        await connectionStore.ensureConnected(connectionId, { allowPasswordPrompt: silent ? false : undefined, skipIfClosedByUser: true });
       }
     }
     await load();
   } catch (cause) {
     loading.value = false;
+    if (silent) {
+      // Silent recovery (tab restore after a page refresh, or a workbench
+      // opened for a not-yet-connected connection) must not surface an error
+      // card nor trigger an interactive credential prompt from the background:
+      // park on the explicit reload prompt so the user can retry
+      // interactively (dbx-plugin-ssh#144).
+      error.value = "";
+      deferred.value = !!resolvedConnectionId.value;
+      return;
+    }
     error.value = cause instanceof Error ? cause.message : String(cause);
   }
 }
 
 function start() {
   const connectionId = resolvedConnectionId.value;
-  deferred.value = !!connectionId && !connectionStore.connectedIds.has(connectionId);
-  if (deferred.value) {
-    loading.value = false;
-    error.value = "";
+  if (connectionId && !connectionStore.connectedIds.has(connectionId)) {
+    // A restored tab (page refresh) or a link for a closed connection used to
+    // park here from a one-shot snapshot: even when the SPA's boot connect
+    // replay landed a moment later nothing re-checked, so the tab dead-ended
+    // on the reload prompt and the plugin could never re-establish its
+    // session (dbx-plugin-ssh#144). Self-heal silently instead — the Refresh
+    // button's path minus interactive prompts — and only park when silent
+    // recovery cannot proceed (interactive credentials required, connection
+    // gone).
+    void refresh({ silent: true });
     return;
   }
   void load();
@@ -115,6 +145,19 @@ function openFilesystem(pluginId: string, providerId: string, context?: PluginWo
   });
 }
 
+function onSetTitle(title: string | null) {
+  if (props.tabId) {
+    queryStore.setPluginWorkbenchTabTitle(props.tabId, title);
+  }
+}
+
+function onGetTitle(): string {
+  if (props.tabId) {
+    return queryStore.getPluginWorkbenchTabTitle(props.tabId) ?? "";
+  }
+  return "";
+}
+
 onMounted(start);
 watch(() => [props.pluginId, props.contributionId, props.connectionId, props.context?.connectionId], start);
 
@@ -129,6 +172,18 @@ defineExpose({ refresh });
       <AlertTriangle class="mt-0.5 size-4 shrink-0" />
       <span>{{ error || t("pluginPlatform.workbenchUnavailableFallback") }}</span>
     </div>
-    <PluginWorkbenchHost v-else class="min-h-0 flex-1" :plugin="entry.plugin" :contribution="entry.contribution" :context="hostContext" @open-workbench="openWorkbench" @open-filesystem="openFilesystem" @close-tab="emit('closeTab')" />
+    <PluginWorkbenchHost
+      v-else
+      class="min-h-0 flex-1"
+      :plugin="entry.plugin"
+      :contribution="entry.contribution"
+      :context="hostContext"
+      :set-title="onSetTitle"
+      :get-title="onGetTitle"
+      @open-workbench="openWorkbench"
+      @open-filesystem="openFilesystem"
+      @close-tab="emit('closeTab')"
+      @recommendations="emit('recommendations', $event)"
+    />
   </div>
 </template>

@@ -1,7 +1,7 @@
 import { computed, nextTick, ref } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { isDangerousSql, requiresDatabaseSelection, supportsSqlTemplateParameters, useSqlExecution } from "../useSqlExecution";
+import { isDangerousSql, requiresDatabaseSelection, snapshotResultForMerge, supportsSqlTemplateParameters, useSqlExecution } from "../useSqlExecution";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useHistoryStore } from "@/stores/historyStore";
 import { useQueryStore } from "@/stores/queryStore";
@@ -10,6 +10,7 @@ import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { createQueryEditorExecutionViewportOwnership } from "@/lib/editor/queryEditorExecutionViewport";
 import * as objectMetadataCache from "@/lib/metadata/objectMetadataCache";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
+import { formatSqlText } from "@/lib/sql/sqlFormatter";
 import type { SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 
 vi.mock("vue-i18n", () => ({
@@ -138,6 +139,30 @@ describe("useSqlExecution", () => {
     installLocalStorage();
     setActivePinia(createPinia());
     vi.mocked(objectMetadataCache.invalidateObjectMetadataCache).mockClear();
+  });
+
+  it("executes Neo4j graph patterns without a SQL parameter dialog", async () => {
+    const sql = 'MATCH (p:Person)-[:WORK_IN]->(c:Company{name:"星云科技"})\nRETURN p.name, p.job, c.name';
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("neo4j"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("neo4j"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const queryStore = useQueryStore();
+    const executeCurrentSql = vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      if (activeTab.value) activeTab.value.result = { columns: ["p.name"], rows: [["Ada"]], affected_rows: 0, execution_time_ms: 1 };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(executeCurrentSql).toHaveBeenCalledWith(sql, { tabId: "tab-1" });
   });
 
   it("invalidates object metadata after successful connection-level DDL", async () => {
@@ -318,6 +343,30 @@ describe("useSqlExecution", () => {
 
     expect(execution.showSqlParameterDialog.value).toBe(false);
     expect(executeCurrentSql).toHaveBeenCalledWith("SELECT * FROM patrol WHERE post_id = '224';", { tabId: "tab-1" });
+  });
+
+  it("executes an unsemicoloned @set followed by a query without producing empty SQL or silently cancelling", async () => {
+    const sql = ["@set user_id = 42", "select * from users where id = @user_id"].join("\n");
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const queryStore = useQueryStore();
+    const executeCurrentSql = vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      if (activeTab.value) activeTab.value.result = { columns: ["id"], rows: [["42"]], affected_rows: 0, execution_time_ms: 1 };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      resolveExecutableSql: async () => sql,
+      activeOutputView,
+    });
+
+    await execution.tryExecute(sql);
+
+    expect(executeCurrentSql).toHaveBeenCalledWith("select * from users where id = 42", { tabId: "tab-1" });
   });
 
   it("opens the result table for a multi-statement batch by default", async () => {
@@ -616,6 +665,26 @@ SELECT @value AS Message;`;
     expect(activeOutputView.value).toBe("messages");
   });
 
+  it("keeps Messages selected after a batch with live output completes", async () => {
+    const sql = "SET client_min_messages = NOTICE; DO $$ BEGIN RAISE NOTICE 'hello'; END $$;";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockImplementation(async () => {
+      activeOutputView.value = "messages";
+      if (activeTab.value) activeTab.value.result = { columns: [], rows: [], affected_rows: 0, execution_time_ms: 1, messages: [{ severity: "NOTICE", message: "hello" }] };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+    await execution.tryExecute();
+    expect(activeOutputView.value).toBe("messages");
+  });
+
   it("keeps the summary view for a MySQL INSERT that carries an INFO message", async () => {
     const sql = "INSERT INTO users (name) VALUES ('a'), ('b')";
     const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
@@ -695,6 +764,273 @@ SELECT @value AS Message;`;
     expect(activeOutputView.value).toBe("result");
   });
 
+  it("returns to the result view when a notice arrived before a PostgreSQL function's result set", async () => {
+    // Regression for #11822: `SELECT some_function()` emits a NOTICE while it runs and then
+    // returns rows. The live-output watcher in ContentArea advances to Messages as soon as the
+    // notice lands, because the rows do not exist yet. With a result set present the completion
+    // path used to skip every branch, so the view stayed on Messages instead of showing the data.
+    const sql = "SELECT log_and_return()";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    const queryStore = useQueryStore();
+    vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      // Mirrors the real order of events: the notice is surfaced live and the view moves to
+      // Messages, then the statement finishes with a tabular result.
+      activeOutputView.value = "messages";
+      if (activeTab.value) {
+        activeTab.value.uiState = { ...activeTab.value.uiState, autoSwitchedToMessagesDuringExecution: true };
+        activeTab.value.result = { columns: ["log_and_return"], rows: [["done"]], affected_rows: 0, execution_time_ms: 1, messages: [{ severity: "NOTICE", message: "working" }] };
+      }
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeTab.value?.result?.rows).toEqual([["done"]]);
+    expect(activeOutputView.value).toBe("result");
+    expect(activeTab.value?.uiState?.autoSwitchedToMessagesDuringExecution).toBe(false);
+  });
+
+  it("keeps Messages selected when a completed run produced no tabular result", async () => {
+    const sql = "DO $$ BEGIN RAISE NOTICE 'hello'; END $$;";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    const queryStore = useQueryStore();
+    vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      activeOutputView.value = "messages";
+      if (activeTab.value) activeTab.value.result = { columns: [], rows: [], affected_rows: 0, execution_time_ms: 1, messages: [{ severity: "NOTICE", message: "hello" }] };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeOutputView.value).toBe("messages");
+  });
+
+  it("does not pull a background tab's Messages view away from the tab the user is looking at", async () => {
+    const sql = "SELECT log_and_return()";
+    const executionTab = { ...queryTab("app"), sql };
+    const activeTab = ref<QueryTab | undefined>(executionTab);
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    const queryStore = useQueryStore();
+    let finishExecution!: () => void;
+    const executionFinished = new Promise<void>((resolve) => {
+      finishExecution = resolve;
+    });
+    const executeCurrentSql = vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      await executionFinished;
+      executionTab.result = { columns: ["log_and_return"], rows: [["done"]], affected_rows: 0, execution_time_ms: 1, messages: [{ severity: "NOTICE", message: "working" }] };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    const pending = execution.tryExecute();
+    await vi.waitFor(() => expect(executeCurrentSql).toHaveBeenCalledOnce());
+    activeTab.value = { ...queryTab("app"), id: "tab-2" };
+    activeOutputView.value = "messages";
+    finishExecution();
+    await pending;
+
+    expect(activeOutputView.value).toBe("messages");
+  });
+
+  it("redirects from messages to result when tabular data is produced after auto-switching (#11822)", async () => {
+    const sql = "SELECT * FROM test_func_with_info()";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockImplementation(async () => {
+      activeOutputView.value = "messages";
+      if (activeTab.value) {
+        activeTab.value.uiState = { ...activeTab.value.uiState, autoSwitchedToMessagesDuringExecution: true };
+        activeTab.value.result = {
+          columns: ["val"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+          messages: [{ severity: "INFO", message: "function info message" }],
+        };
+      }
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeOutputView.value).toBe("result");
+    expect(activeTab.value?.uiState?.autoSwitchedToMessagesDuringExecution).toBe(false);
+  });
+
+  it("does not redirect from messages when query fails with error result (#11822)", async () => {
+    const sql = "SELECT * FROM test_func_with_error()";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockImplementation(async () => {
+      activeOutputView.value = "messages";
+      if (activeTab.value) {
+        activeTab.value.uiState = { ...activeTab.value.uiState, autoSwitchedToMessagesDuringExecution: true };
+        activeTab.value.result = {
+          columns: ["Error"],
+          execution_error: true,
+          rows: [["function exception"]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+          messages: [{ severity: "INFO", message: "function info message" }],
+        };
+      }
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeOutputView.value).toBe("messages");
+    expect(activeTab.value?.uiState?.autoSwitchedToMessagesDuringExecution).toBe(false);
+  });
+
+  it("does not redirect when user manually switched to messages mid-run (#11822)", async () => {
+    const sql = "SELECT * FROM test_func_with_info()";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockImplementation(async () => {
+      activeOutputView.value = "messages";
+      if (activeTab.value) {
+        // User manually selected messages mid-run, so autoSwitchedToMessagesDuringExecution is false
+        activeTab.value.uiState = { ...activeTab.value.uiState, autoSwitchedToMessagesDuringExecution: false };
+        activeTab.value.result = {
+          columns: ["val"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+        };
+      }
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeOutputView.value).toBe("messages");
+  });
+
+  it("honors multiStatementDefaultView when redirecting multi-statement execution (#11822)", async () => {
+    const sql = "SELECT 1; SELECT 2;";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("result");
+    const settingsStore = useSettingsStore();
+    settingsStore.editorSettings.multiStatementDefaultView = "summary";
+
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockImplementation(async () => {
+      activeOutputView.value = "messages";
+      if (activeTab.value) {
+        activeTab.value.uiState = { ...activeTab.value.uiState, autoSwitchedToMessagesDuringExecution: true };
+        activeTab.value.result = {
+          columns: ["val"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+        };
+        activeTab.value.results = [activeTab.value.result];
+      }
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeOutputView.value).toBe("summary");
+  });
+
+  it("redirects background tab uiState to result when query finishes while tab is inactive (#11822)", async () => {
+    const sql = "SELECT * FROM test_func_with_info()";
+    const tab1: QueryTab = { ...queryTab("app"), id: "tab-1", sql, uiState: { activeOutputView: "messages", autoSwitchedToMessagesDuringExecution: true } };
+    const tab2: QueryTab = { ...queryTab("app"), id: "tab-2", sql: "SELECT 2", uiState: { activeOutputView: "chart" } };
+    const queryStore = useQueryStore();
+    queryStore.tabs = [tab1, tab2];
+    const activeTab = ref<QueryTab | undefined>(tab2);
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart" | "messages">("chart");
+
+    vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async (_sql, options) => {
+      const targetTab = queryStore.tabs.find((t) => t.id === options?.tabId);
+      if (targetTab) {
+        targetTab.uiState = { ...targetTab.uiState, activeOutputView: "messages", autoSwitchedToMessagesDuringExecution: true };
+        targetTab.result = {
+          columns: ["val"],
+          rows: [[1]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+        };
+      }
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute(undefined, { tabId: tab1.id });
+
+    // Active tab (tab2) output view should remain untouched
+    expect(activeOutputView.value).toBe("chart");
+    // Background tab (tab1) uiState should have redirected to "result"
+    expect(tab1.uiState?.activeOutputView).toBe("result");
+    expect(tab1.uiState?.autoSwitchedToMessagesDuringExecution).toBe(false);
+  });
+
   it("forwards execute-in-new-result-tab intent to the query store", async () => {
     const sql = "SELECT * FROM users";
     const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
@@ -770,6 +1106,28 @@ SELECT @value AS Message;`;
     expect(executeCurrentSql).toHaveBeenCalledWith(resolvedSql, { tabId: "tab-1", openInNewResultTab: true });
   });
 
+  it("settles a failed execution after accepting a SQL parameter dialog", async () => {
+    const sql = "SELECT * FROM users WHERE id = :id";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("mysql"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockRejectedValue(new Error("connection lost"));
+    const onDeferredExecutionSettled = vi.fn();
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+      onDeferredExecutionSettled,
+    });
+
+    await execution.tryExecute();
+    await execution.onSqlParametersConfirm("SELECT * FROM users WHERE id = 7");
+
+    expect(onDeferredExecutionSettled).toHaveBeenCalledWith({ status: "started", ok: false, errorMessage: "connection lost", tabId: "tab-1" });
+  });
+
   it("executes the PostgreSQL ARRAY date-format query without opening the parameter dialog", async () => {
     const sql = `
       WITH rec_flow AS (
@@ -830,10 +1188,12 @@ SELECT @value AS Message;`;
     expect(executeCurrentSql).toHaveBeenCalledWith(sql, { tabId: "tab-1" });
   });
 
-  it("executes Oracle database-link queries without opening the parameter dialog", async () => {
-    const sql = "SELECT 1 FROM DUAL@WDHIS160;";
-    const activeTab = ref<QueryTab | undefined>(queryTab("ORCL"));
-    const activeConnection = ref<ConnectionConfig | undefined>(connection("oracle"));
+  it.each([
+    { databaseType: "oracle", database: "ORCL", sql: "SELECT 1 FROM DUAL@WDHIS160;" },
+    { databaseType: "dameng", database: "test", sql: "select * from test.table_name@dm1" },
+  ] as const)("executes $databaseType database-link queries without opening the parameter dialog", async ({ databaseType, database, sql }) => {
+    const activeTab = ref<QueryTab | undefined>(queryTab(database));
+    const activeConnection = ref<ConnectionConfig | undefined>(connection(databaseType));
     const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
     const queryStore = useQueryStore();
     const executeCurrentSql = vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
@@ -853,6 +1213,104 @@ SELECT @value AS Message;`;
     expect(execution.showSqlParameterDialog.value).toBe(false);
     expect(execution.sqlParameterNames.value).toEqual([]);
     expect(executeCurrentSql).toHaveBeenCalledWith(sql, { tabId: "tab-1" });
+  });
+
+  it("executes a formatted Dameng DBLink query without a parameter dialog or SQL changes", async () => {
+    const sql = await formatSqlText("select * from test.table_name@dm1", "dameng");
+    expect(sql).toContain("table_name @dm1");
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("test"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("dameng"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const executeCurrentSql = vi.spyOn(useQueryStore(), "executeCurrentSql").mockResolvedValue(undefined);
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({ activeTab: computed(() => activeTab.value), activeConnection: computed(() => activeConnection.value), executableSql: computed(() => sql), activeOutputView });
+
+    await execution.tryExecute();
+
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(execution.sqlParameterNames.value).toEqual([]);
+    expect(executeCurrentSql).toHaveBeenCalledWith(sql, { tabId: "tab-1" });
+  });
+
+  it.each(["", " ", "/* separator */", "-- separator\n"])("preserves a Dameng link separated by %j in the full @set execution flow", async (separator) => {
+    const target = `select * from test.table_name${separator}@dm1 where id=@DM1`;
+    const sql = `@set dm1 = 7;\n${target}`;
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("test"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("dameng"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const executeCurrentSql = vi.spyOn(useQueryStore(), "executeCurrentSql").mockResolvedValue(undefined);
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({ activeTab: computed(() => activeTab.value), activeConnection: computed(() => activeConnection.value), executableSql: computed(() => sql), activeOutputView });
+
+    await execution.tryExecute();
+
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(execution.sqlParameterNames.value).toEqual([]);
+    expect(executeCurrentSql).toHaveBeenCalledWith(`select * from test.table_name${separator}@dm1 where id=7`, { tabId: "tab-1" });
+  });
+
+  it.each(["oracle", "oceanbase-oracle", "dameng"] as const)("executes %s XML templates without treating CONTENT as a linked object", async (databaseType) => {
+    const sql = "@set value = XMLTYPE('<a/>');\nSELECT XMLSERIALIZE(CONTENT @value AS CLOB) FROM DUAL";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("test"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection(databaseType));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const executeCurrentSql = vi.spyOn(useQueryStore(), "executeCurrentSql").mockResolvedValue(undefined);
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({ activeTab: computed(() => activeTab.value), activeConnection: computed(() => activeConnection.value), executableSql: computed(() => sql), activeOutputView });
+
+    await execution.tryExecute();
+
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(execution.sqlParameterNames.value).toEqual([]);
+    expect(executeCurrentSql).toHaveBeenCalledWith("SELECT XMLSERIALIZE(CONTENT XMLTYPE('<a/>') AS CLOB) FROM DUAL", { tabId: "tab-1" });
+  });
+
+  it.each(["oracle", "oceanbase-oracle", "dameng"] as const)("expands %s SQL/XML function names before execution", async (databaseType) => {
+    const selectedSql = "SELECT XMLSERIALIZE(CONTENT @fn('<a/>') AS CLOB) FROM DUAL";
+    const sql = `@set fn = XMLTYPE;\n${selectedSql}`;
+    const selectionFrom = sql.indexOf("SELECT");
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("test"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection(databaseType));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const executeCurrentSql = vi.spyOn(useQueryStore(), "executeCurrentSql").mockResolvedValue(undefined);
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({ activeTab: computed(() => activeTab.value), activeConnection: computed(() => activeConnection.value), executableSql: computed(() => sql), activeOutputView });
+
+    await execution.tryExecute();
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(executeCurrentSql).toHaveBeenLastCalledWith("SELECT XMLSERIALIZE(CONTENT XMLTYPE('<a/>') AS CLOB) FROM DUAL", { tabId: "tab-1" });
+
+    await execution.tryExecute({ fullSql: sql, selectedSql, cursorPos: selectionFrom, selectionFrom, selectionTo: sql.length });
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(executeCurrentSql).toHaveBeenCalledTimes(2);
+    expect(executeCurrentSql).toHaveBeenLastCalledWith("SELECT XMLSERIALIZE(CONTENT XMLTYPE('<a/>') AS CLOB) FROM DUAL", { tabId: "tab-1" });
+  });
+
+  it.each([
+    { databaseType: "oracle", target: "SELECT XMLQUERY('/a' PASSING BY VALUE @fn('<a/>') RETURNING CONTENT) FROM DUAL", value: "XMLTYPE" },
+    { databaseType: "oracle", target: "SELECT XMLTABLE('/a' PASSING @fn('<a/>') COLUMNS name VARCHAR2(50) PATH '.') FROM DUAL", value: "XMLTYPE" },
+    { databaseType: "dameng", target: "SELECT XMLTABLE('/a' PASSING BY VALUE @fn('<a/>') COLUMNS name VARCHAR2(50) PATH '.') FROM DUAL", value: "XMLTYPE" },
+    { databaseType: "oceanbase-oracle", target: "SELECT XMLQUERY('/a' PASSING BY VALUE @fn('<a/>') RETURNING CONTENT) FROM DUAL", value: "XMLTYPE" },
+    { databaseType: "oracle", target: "BEGIN @fn('ok'); END;", value: "DBMS_OUTPUT.PUT_LINE" },
+    { databaseType: "oceanbase-oracle", target: "BEGIN LOOP @fn('ok'); EXIT; END LOOP; END;", value: "DBMS_OUTPUT.PUT_LINE" },
+  ] as const)("executes full and selected $databaseType function templates in $target", async ({ databaseType, target, value }) => {
+    const sql = `@set fn = ${value};\n${target}`;
+    const selectionFrom = sql.indexOf(target);
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("test"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection(databaseType));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const executeCurrentSql = vi.spyOn(useQueryStore(), "executeCurrentSql").mockResolvedValue(undefined);
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const execution = useSqlExecution({ activeTab: computed(() => activeTab.value), activeConnection: computed(() => activeConnection.value), executableSql: computed(() => sql), activeOutputView });
+
+    await execution.tryExecute();
+    await execution.tryExecute({ fullSql: sql, selectedSql: target, cursorPos: selectionFrom, selectionFrom, selectionTo: sql.length });
+
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(execution.sqlParameterNames.value).toEqual([]);
+    expect(executeCurrentSql).toHaveBeenCalledTimes(2);
+    expect(executeCurrentSql).toHaveBeenNthCalledWith(1, target.replaceAll("@fn", value), { tabId: "tab-1" });
+    expect(executeCurrentSql).toHaveBeenNthCalledWith(2, target.replaceAll("@fn", value), { tabId: "tab-1" });
   });
 
   it("sends native SET variables without client-side expansion", async () => {
@@ -1334,6 +1792,28 @@ SELECT @value AS Message;`;
     expect(executeCurrentSql).toHaveBeenCalledWith(sql, { tabId: "tab-1", openInNewResultTab: true });
   });
 
+  it("settles a failed execution after accepting a dangerous-SQL dialog", async () => {
+    const sql = "DELETE FROM users WHERE id = 7";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("mysql"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    vi.spyOn(useQueryStore(), "executeCurrentSql").mockRejectedValue(new Error("connection lost"));
+    const onDeferredExecutionSettled = vi.fn();
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+      onDeferredExecutionSettled,
+    });
+
+    await execution.tryExecute();
+    await execution.onDangerConfirm();
+
+    expect(onDeferredExecutionSettled).toHaveBeenCalledWith({ status: "started", ok: false, errorMessage: "connection lost", tabId: "tab-1" });
+  });
+
   it("keeps the active retained result when a new-result dangerous prompt is cancelled", async () => {
     const result = { columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
     const activeTab = ref<QueryTab | undefined>({
@@ -1567,6 +2047,30 @@ SELECT @value AS Message;`;
     expect(executeCurrentSql).toHaveBeenCalledWith(sql, { tabId: "tab-1", skipRedisSafetyCheck: false });
   });
 
+  it("keeps an explicitly selected Redis console visible for multi-command execution", async () => {
+    const sql = "GET user:1\nDBSIZE";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("0"), sql, uiState: { redisResultViewMode: "console" } });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("redis"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("summary");
+    const queryStore = useQueryStore();
+    useSettingsStore().editorSettings.multiStatementDefaultView = "summary";
+    vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      if (activeTab.value) activeTab.value.result = { columns: ["result"], rows: [["value"]], affected_rows: 0, execution_time_ms: 1, redis_console_output: "value" };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(activeOutputView.value).toBe("result");
+  });
+
   it("distinguishes read-only and mutating Meilisearch REST requests", () => {
     expect(isDangerousSql("GET /health", "meilisearch")).toBe(false);
     expect(isDangerousSql('POST /indexes/movies/documents/fetch\n{"limit":10}', "meilisearch")).toBe(false);
@@ -1610,5 +2114,37 @@ SELECT @value AS Message;`;
     productionSafetyStore.confirm();
     await pendingExecution;
     expect(executeCurrentSql).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("snapshotResultForMerge", () => {
+  it("stays intact after the store releases the live payload in place", () => {
+    const live = {
+      columns: ["id", "amount"],
+      rows: [
+        [1, 10],
+        [2, 20],
+      ],
+      column_types: ["INT", "DECIMAL"],
+      affected_rows: 2,
+      execution_time_ms: 5,
+    };
+    const snapshot = snapshotResultForMerge(live as never)!;
+
+    // Mirrors queryStore.releaseResultObjectPayload: the arrays the merged view
+    // reads are detached, so clearing the live result must not empty them.
+    live.columns = [];
+    live.rows = [];
+
+    expect(snapshot.columns).toEqual(["id", "amount"]);
+    expect(snapshot.rows).toEqual([
+      [1, 10],
+      [2, 20],
+    ]);
+    expect(snapshot.column_types).toEqual(["INT", "DECIMAL"]);
+  });
+
+  it("passes undefined through", () => {
+    expect(snapshotResultForMerge(undefined)).toBeUndefined();
   });
 });

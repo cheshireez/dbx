@@ -67,6 +67,39 @@ describe("transferTaskStore", () => {
     expect(store.listTasks("folder-1").map((task) => task.id)).toEqual(["task-1"]);
   });
 
+  it("normalizes a legacy task with no object selection to an empty modern selection map", async () => {
+    const legacyConfig = makeConfig() as Partial<TransferTaskConfig>;
+    delete legacyConfig.objects;
+    vi.mocked(api.loadTransferTaskLibrary).mockResolvedValue({
+      version: 1,
+      folders: [],
+      tasks: [{ id: "legacy-selection", name: "legacy selection", config: legacyConfig }],
+    } as unknown as TransferTaskLibrary);
+
+    const store = useTransferTaskStore();
+    await store.initFromStorage();
+
+    expect(store.getTask("legacy-selection")?.config.objects).toEqual({});
+  });
+
+  it("round-trips TABLE-only and TABLE + VIEW task selections", async () => {
+    const store = useTransferTaskStore();
+    const tableOnly = await store.saveTask({ name: "table-only", config: makeConfig({ objects: { TABLE: ["orders"] } }) });
+    const tableAndView = await store.saveTask({
+      name: "table-and-view",
+      config: makeConfig({ objects: { TABLE: ["orders"], VIEW: ["v_orders"] } }),
+    });
+    const persisted = vi.mocked(api.saveTransferTaskLibrary).mock.calls.at(-1)?.[0] as TransferTaskLibrary;
+
+    vi.mocked(api.loadTransferTaskLibrary).mockResolvedValue(persisted);
+    setActivePinia(createPinia());
+    const reloadedStore = useTransferTaskStore();
+    await reloadedStore.initFromStorage();
+
+    expect(reloadedStore.getTask(tableOnly.id)?.config.objects).toEqual({ TABLE: ["orders"] });
+    expect(reloadedStore.getTask(tableAndView.id)?.config.objects).toEqual({ TABLE: ["orders"], VIEW: ["v_orders"] });
+  });
+
   it("keeps target column quoting enabled for saved tasks created before the option existed", async () => {
     const legacyConfig = makeConfig() as Partial<TransferTaskConfig>;
     delete legacyConfig.quoteTargetColumnNames;
@@ -80,6 +113,30 @@ describe("transferTaskStore", () => {
     await store.initFromStorage();
 
     expect(store.tasks[0]?.config.quoteTargetColumnNames).toBe(true);
+  });
+
+  it("keeps legacy tasks on inherited timeouts and round-trips a custom timeout", async () => {
+    const store = useTransferTaskStore();
+    const inherited = await store.saveTask({ name: "inherited", config: makeConfig() });
+    const custom = await store.saveTask({ name: "custom", config: makeConfig({ operationTimeoutSecs: 600 }) });
+    const unlimited = await store.saveTask({ name: "unlimited", config: makeConfig({ operationTimeoutSecs: 0 }) });
+
+    expect(inherited.config.operationTimeoutSecs).toBeUndefined();
+    expect(custom.config.operationTimeoutSecs).toBe(600);
+    expect(unlimited.config.operationTimeoutSecs).toBe(0);
+  });
+
+  it("drops an invalid persisted transfer timeout instead of applying it", async () => {
+    vi.mocked(api.loadTransferTaskLibrary).mockResolvedValue({
+      version: 1,
+      folders: [],
+      tasks: [{ id: "invalid-timeout", name: "invalid timeout", config: makeConfig({ operationTimeoutSecs: 3601 }) }],
+    } as unknown as TransferTaskLibrary);
+    const store = useTransferTaskStore();
+
+    await store.initFromStorage();
+
+    expect(store.getTask("invalid-timeout")?.config.operationTimeoutSecs).toBeUndefined();
   });
 
   it("loads a legacy rebuild task as append without restoring its previous confirmation", async () => {

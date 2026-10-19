@@ -263,10 +263,7 @@ A field may declare `visible_when` and `required_when`. A leaf clause matches wh
     ]
   },
   "required_when": {
-    "all_of": [
-      { "field": "sudo_source", "one_of": ["custom"] },
-      { "not": { "field": "read_only", "one_of": [true] } }
-    ]
+    "all_of": [{ "field": "sudo_source", "one_of": ["custom"] }, { "not": { "field": "read_only", "one_of": [true] } }]
   }
 }
 ```
@@ -369,7 +366,19 @@ A workbench opens in a normal persistent DBX tab. The iframe is loaded with `san
 - `sendBinary(channel, data)` — requires `host.binary`
 - `readAsset(path)` / `readAssetUrl(path)`
 - `openWorkbench(contributionId, context)` — requires `host.workbench`
+- `setTitle(title)` / `getTitle()` — updates (pass `null` to reset) or reads the calling tab title; requires `host.workbench`
+- `executeCommand(commandId, context?)` — executes one of this plugin's own declared commands through the same path a menu placement takes: `enablement` is re-checked, `presentation: "panel"` commands dock in the bottom panel and `presentation: "tab"` (default) commands open a workbench tab, with §4.1 singleton reuse. `context` merges over the command-declared context (reserved identity fields stay host-owned) and scopes `instance_key` `{{path}}` placeholders — declare `instance_key: "logs:{{connectionId}}"` to get one panel instance per connection; a template that cannot resolve falls back to its literal. Resolves `{ error }` for expected outcomes (unknown command, enablement-blocked); requires `host.workbench`
 - `openFilesystem(providerId, context)` — requires `host.filesystem`
+- `getPlanCapabilities(connectionId)` / `explainPlan(request)` — reads an estimated execution plan for one connection; requires `host.plans:read`, see [Estimated execution plans](#estimated-execution-plans)
+- `getTableMetadata({ connectionId, database?, schema?, table })` — reads narrow schema metadata for one table on an already-open connection; requires `host.schema:read`, see [Table Schema Metadata](#table-schema-metadata)
+- `queryData({ connectionId, database?, schema?, sql, maxRows?, timeoutMs? })` — runs one read-only SQL statement on a connection the user granted to the plugin; requires `host.data:read`, see [Read-only data queries](#read-only-data-queries)
+- `storage` — `storage.get(key)` / `storage.set(key, value)` / `storage.delete(key)` persist small JSON state per plugin in `plugin-data/<id>`; requires `host.storage`; values cap at 256 KiB and the whole store at 1 MiB, bulk data belongs in the sidecar's `DBX_PLUGIN_DATA_DIR`
+- `ai.openConversation({ title, prompt, context, send?, mode? })` — opens a plugin conversation in the built-in DBX AI panel; requires `host.ai`; `mode` defaults to `ask` for snapshot compatibility, while `mode: "agent"` uses live tools on the context's open plugin connection when available. `title` caps at 200 characters, `prompt` at 32000, and `context` at 2 MiB, and `send` defaults to `false` so pass `true` to start the analysis immediately. The host copies the snapshot into the conversation as history data and never hands model output or model configuration back to the plugin through this conversation API
+- `ai.listProviders()` / `ai.discoverModels(configId)` — require `host.ai` and `capabilities.aiModelDiscovery`. List API providers including those without configured models, and fetch models using credentials retained by the host. Manual model IDs are accepted by text generation without changing global defaults.
+- `ai.listModels()` — requires `host.ai` and `capabilities.aiCompletion`. Returns only `{ configId, name, model, isDefault }` for configured API models. No endpoints, keys, headers, or CLI environment are exposed. CLI agents are excluded from text completion.
+- `ai.generateText({ configId, model, prompt })` — requires `host.ai` and `capabilities.aiCompletion`; prompts are nonempty and limited to 100000 characters. The desktop host asks for confirmation naming the plugin and selected model before each send, resolves credentials itself, and returns plain text (up to 16000 characters). No tools or file writes are enabled. One generation per workbench may run at a time. Provider failures return a generic error to avoid leaking secrets. Old hosts may omit these methods/capability.
+- `ai.setRecommendations({ context, items })` / `ai.clearRecommendations()` — updates the context-aware quick-question chips shown by the global DBX AI panel; requires `host.ai`. Each item is `{ id, label, prompt, order? }`, supports `{{path.to.value}}` placeholders resolved against the supplied context, and is capped at five visible items. Recommendations belong to the current workbench instance and are not persisted into conversation history. Use `ai.openConversation()` when a user clicks a recommendation; DBX sends the selected prompt through the same snapshot safety boundary.
+- `capabilities` — `{ downloadFile, planApi, schemaMetadataApi, dataApi, connectionsApi, storage, ai, aiModelDiscovery, aiCompletion, aiRecommendations }` advertised in the init message; a missing or `false` entry means that Host API group is unavailable on this host, so gate the matching call on it instead of probing with a request
 - `onEvent(listener)` — events are forwarded only with `host.events`
 - `onBinary(listener)` — binary frames are forwarded only with `host.binary`; listeners receive `{ channel, data: Uint8Array }`
 
@@ -424,11 +433,11 @@ A result view contributes a plugin-rendered visualization for query results. DBX
 
 A result view declares display metadata only: it carries no UI of its own and never names a workbench. The opened contribution id reaches the plugin UI in the init payload (`dbx-plugin-init` detail `contributionId`), so a plugin that declares several result views selects the matching one inside its single UI entrypoint.
 
-The `context.result` snapshot is bounded — `{ columns, rows (<= 500), truncated }` plus `sql`, `connectionId`, and `database`. Plugins that need the full or streamed result set should re-execute through their backend using the SQL and connection reference. Requires a UI entrypoint.
+The `context.result` snapshot is bounded — `{ columns, rows (<= 500), truncated }` plus `sql`, `connectionId`, `database`, and `schema`. Plugins that need more rows can re-run a read-only statement with [`queryData`](#read-only-data-queries) (requires `host.data:read` and the user's consent for that connection). Requires a UI entrypoint.
 
 ### `context-menu`
 
-A context-menu entry is rendered **natively** by DBX (no sandbox iframe, native theme and keyboard behavior) in the declared menu surface. v1 supports the saved-connection sidebar menu:
+A context-menu entry is rendered **natively** by DBX (no sandbox iframe, native theme and keyboard behavior) in the declared menu surface. v1 supports the saved-connection and table menus in the Sidebar Tree. Object Browser integration is not part of the first table contribution surface.
 
 ```json
 {
@@ -439,7 +448,93 @@ A context-menu entry is rendered **natively** by DBX (no sandbox iframe, native 
 }
 ```
 
-Clicking the item dispatches a `contextMenu/<id>` backend request with a non-secret connection summary (`{ id, dbType, name, database }`). The backend entrypoint is required; return `{ "message": "..." }` to surface a toast.
+For a table-scoped action, declare `menu: "table"`:
+
+```json
+{
+  "type": "context-menu",
+  "id": "example.inspect-table",
+  "label": "Inspect table",
+  "menu": "table"
+}
+```
+
+A context-menu item can instead declare a host-handled Workbench action:
+
+```json
+{
+  "type": "context-menu",
+  "id": "vendor.example.generate",
+  "label": "Generate test data",
+  "menu": "table",
+  "action": {
+    "type": "open-workbench",
+    "workbench": "vendor.example.main"
+  }
+}
+```
+
+The `workbench` reference must identify a `workbench` contribution in the same plugin manifest. This declarative action is resolved by the host and does not invoke the plugin backend.
+
+To provide state-dependent items and one level of native submenus, set `"dynamic": true` on a `context-menu` contribution. This requires a backend entrypoint. On each right-click, DBX calls `contextMenu/resolve/<id>` with the same non-secret `{ connection }` or `{ table }` envelope used by legacy actions, plus the current `locale`; connection menus also include `ownerPluginId` when the connection belongs to a plugin. A plugin can return an empty menu for connections it does not own. Return `{ "items": [...] }`; returning an empty array hides the contribution. For example:
+
+```json
+{
+  "items": [
+    {
+      "label": "Tunnels",
+      "children": [
+        { "label": "Manage port forwards", "action": { "type": "open-workbench", "workbench": "ssh.tunnels", "presentation": "dialog" } },
+        { "label": "Start saved tunnels", "action": { "type": "invoke", "id": "start-all", "reopenConnectionOnMissing": true } }
+      ]
+    }
+  ]
+}
+```
+
+Each item accepts `label`, optional `visible`, `enabled`, `checked`, and either `action` or `children`. Children may not contain another submenu. An `invoke` action calls the declared contribution's existing `contextMenu/<id>` backend method with the original envelope plus `itemId`; the host never executes an arbitrary method supplied by the resolver. For connection items, `reopenConnectionOnMissing: true` retries once after DBX restores that plugin connection when the backend reports `Connection is not active`; omit it for actions that do not need an open connection. An `open-workbench` action must target a workbench declared by the same plugin. Dynamic menu items may add `"presentation": "dialog"` to that action to show the workbench in a modal over DBX; without it the workbench opens in a tab. The host limits response size and resolution time; invalid or failed responses contribute no items. Existing static context-menu contributions continue to work unchanged.
+
+For legacy entries without `action`, clicking a connection item dispatches `contextMenu/<id>` with the existing non-secret connection summary (`{ id, dbType, name, database }`) under `connection`. Clicking a table item uses the same backend method and dispatches:
+
+```json
+{
+  "table": {
+    "connectionId": "connection-id",
+    "database": "example",
+    "schema": "public",
+    "table": "users"
+  }
+}
+```
+
+`database` and `schema` are optional and are omitted when the selected database does not expose those scopes. The table context contains object identity only; it never contains credentials, connection strings, or raw connection configuration.
+
+For a declarative `open-workbench` action, DBX passes the current connection summary as Workbench context for `menu: "connection"`, and the stable `TableContext` object above directly as Workbench context for `menu: "table"` (without the backend `table` envelope). Connection context includes only `id`, `dbType`, `name`, and `database`; the host may also provide the standard `connectionId` for tab association. Neither path includes `host`, `port`, `username`, `password`, a connection string, or raw connection configuration. Reopening the same Workbench refreshes it with the latest invocation context.
+
+#### Declarative launch options (`options_action`)
+
+A dock `command` contribution's `open-workbench` action may declare `options_action: "<sidecar method>"` (context-menu entries cannot: their action form has no such field, and unknown fields are rejected at manifest validation). Before offering launch targets, the host invokes that method with the current UI locale so labels arrive localized:
+
+```json
+{ "locale": "zh-CN" }
+```
+
+The sidecar answers:
+
+```json
+{
+  "entries": [
+    { "label": "Local terminal", "description": "Default shell: /bin/zsh", "context": {} },
+    { "label": "zsh", "description": "/bin/zsh", "context": { "shell": "zsh" } }
+  ]
+}
+```
+
+- `context` is opaque plugin payload: it is merged into the host-authored Workbench context of the panel opened for that entry, and the host never interprets it.
+- A command declaring `options_action` owns the picker: the host's generic replay item hides while `options_action` is declared and does not come back if the sidecar fetch fails or returns nothing — the picker then simply has no launch entries.
+- Plugins ignore the `locale` field safely if they do not localize.
+
+A backend entrypoint is required only for legacy context-menu entries without a declarative action. Their `{ "message": "..." }` result continues to surface as a toast.
 
 ### `filesystem-provider`
 
@@ -472,6 +567,190 @@ Every entry has `name`, canonical `uri`, `kind` (`file`, `directory`, `symlink`,
 
 Mutation methods return `{ success, message?, entry? }` and are rejected unless the provider declares the matching capability. Inline read/write payloads are capped at 4 MiB. The built-in file manager currently owns directory navigation, pagination, and bounded file preview. Large upload/download and PTY/SFTP streams use `stdio-framed` binary channels with plugin-defined transfer methods, chunk acknowledgements, cancellation, and progress events; they must not be encoded as one large JSON value.
 
+### `mcp`
+
+A backend that implements the optional MCP tool bridge (`mcp/tools` + `mcp/call`, see "Tools for the built-in AI assistant" below) does not put its tools in front of anyone by itself: the built-in AI agent only sees a plugin after the user enabled it in the Plugin Center, and the external `dbx` MCP server (`dbx-mcp`) only sees plugins that opt in with `external_tools: true`. This optional contribution declares and tunes those surfaces:
+
+```json
+{
+  "type": "mcp",
+  "id": "vendor.ssh.mcp",
+  "description": "Terminal and file tools over SSH connections.",
+  "external_tools": true
+}
+```
+
+Only `id` is required; `ai_tools` defaults to `true` (set it to `false` to keep the tools off the AI surface even when the user opts in) and `external_tools` defaults to `false` (set it to `true` to expose the tools on the external server). At most one `mcp` contribution is allowed per manifest, and it requires a backend entrypoint. Declaring it makes the manifest unreadable to hosts that predate the contribution type, so plugins that must install on older hosts should stay undeclared. The runtime gates stay in force on every call regardless: open connections for the AI surface, the global MCP policy plus per-connection allowlist for the external surface, per-call approval for anything not `annotations.readOnlyHint: true`, and the Plugin Center switch (which always wins) to turn a plugin's AI tools off entirely.
+
+### Table Schema Metadata
+
+A plugin can read narrow, read-only schema metadata for one table without owning a driver, connection pool, credential, or SQL string. It reuses the canonical `PluginTableContext` identity used by table contributions:
+
+```json
+{
+  "permissions": ["host.schema:read"]
+}
+```
+
+```js
+if (window.dbxPlugin.capabilities.schemaMetadataApi) {
+  const metadata = await window.dbxPlugin.getTableMetadata({
+    connectionId,
+    database,
+    schema,
+    table: "users",
+  });
+  renderColumns(metadata.columns);
+}
+```
+
+The result is deliberately narrower than DBX's internal `ColumnInfo`:
+
+```json
+{
+  "columns": [
+    {
+      "name": "id",
+      "dataType": "integer",
+      "nullable": false,
+      "precision": 32,
+      "default": "nextval('users_id_seq'::regclass)"
+    }
+  ],
+  "fieldCapabilities": {
+    "length": "supported",
+    "precision": "supported",
+    "scale": "supported",
+    "default": "supported"
+  }
+}
+```
+
+`columns` exposes only `name`, `dataType`, `nullable`, and optional `length`, `precision`, `scale`, and `default`. Comments, keys/indexes, credentials, connection strings, driver objects, and arbitrary SQL results never cross the boundary. Optional values remain omitted or `null`; the host never turns missing metadata into `0` or an empty string. `fieldCapabilities` reports `supported`, `unsupported`, or `unknown` for each structured optional field. `unknown` means DBX lacks reliable provider provenance and must not be treated as support.
+
+`database` and `schema` are optional and omitted when unavailable. `connectionId` and `table` are non-empty, trimmed identity values capped at 256 characters. The host must already hold the matching connection/session: a saved-but-disconnected connection is rejected with `Connection is not open`, and a database without an open matching session is rejected instead of creating a pool or switching connections. The permission grants no arbitrary SQL and no write access.
+
+This is Host API 1.3. A plugin that requires it declares:
+
+```json
+{
+  "engines": { "host_api": "^1.3" }
+}
+```
+
+The `schemaMetadataApi` capability is runtime detection for older hosts; a plugin should gate the call on it rather than probing the request. Without `host.schema:read`, the bridge rejects the call before the backend adapter runs.
+
+### Read-only data queries
+
+A plugin can run one read-only SQL statement on a DBX connection the user granted to it. It never receives a driver, pool, credential, or connection string:
+
+```json
+{
+  "engines": { "host_api": "^1.4" },
+  "permissions": ["host.data:read"]
+}
+```
+
+```js
+if (window.dbxPlugin.capabilities.dataApi) {
+  const { columns, rows, truncated } = await window.dbxPlugin.queryData({
+    connectionId,
+    database,
+    sql: "SELECT status, count(*) AS total FROM orders GROUP BY status",
+    maxRows: 200,
+  });
+}
+```
+
+The result is `{ dbType, columns: [{ name, dataType? }], rows, truncated, elapsedMs }`. The host owns every decision:
+
+- **Consent per (plugin, connection).** The first query for a connection shows a host dialog naming both. An allow is persisted in `app_settings.plugin_data_grants` and listed under the plugin in Plugin Center → Installed, where it can be revoked; a denial is remembered for the workbench session. Uninstalling a plugin drops its grants. A revoked grant fails with `PLUGIN_DATA_ACCESS_NOT_GRANTED: …` and the next query asks again.
+- **One read-only statement.** The statement must be the only one in the request and must be rated read-only by the shared SQL risk classifier used for MCP read-only access and the AI agent. Writes, DDL, locking reads, and session database switches (`USE …`) are rejected.
+- **Open SQL connections only.** A saved-but-closed connection is rejected with `Connection is not open`; non-SQL connections are not served.
+- **Bounds.** `maxRows` defaults to 500 (max 5000), serialized rows are capped at 8 MiB, and `timeoutMs` is clamped to the connection timeout and 60 s.
+
+The backend re-checks the manifest permission and the grant on every call (`crates/dbx-core/src/query/plugin_data.rs`); the bridge only adds the consent prompt and a per-session cache. Hosts without a consent surface deny instead of granting.
+
+### Estimated execution plans
+
+A plugin can read the **estimated** execution plan of a query without touching a database driver, a credential, or a connection string. The host builds the `EXPLAIN` statement with its own `build_explain_sql`, applies the same read-only safety gate DBX uses for its own plan view, and executes it on the connection the plugin names. The plugin receives only the raw plan.
+
+```json
+{
+  "permissions": ["host.plans:read"]
+}
+```
+
+| Request                                                                         | Purpose                                                                                                                                                                      |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host.getPlanCapabilities({ connectionId })`                                    | Reports what the host and this connection can plan. It only reads the stored connection config; it never connects or probes the server. The connection must already be open. |
+| `host.explainPlan({ connectionId, database?, schema?, sql, mode, timeoutMs? })` | Returns the estimated plan for `sql`. The connection must already be open.                                                                                                   |
+
+`host.getPlanCapabilities` returns:
+
+```json
+{
+  "dbType": "postgres",
+  "dbVersion": "15.19",
+  "supports": { "estimatedPlan": true },
+  "limits": { "maxTimeoutMs": 60000, "maxPlanBytes": 4194304 }
+}
+```
+
+- `supports.estimatedPlan` is `false` when this connection's dialect has no estimated plan path in DBX; disable the feature instead of calling `explainPlan`.
+- `limits` are the host's ceilings. `maxTimeoutMs` already accounts for the connection's own query timeout, and a requested `timeoutMs` is clamped to it. A connection configured with no query timeout still gets the host ceiling.
+- `dbVersion` is present only when DBX already learned the product version for this connection. The host never probes the server on the plugin's behalf.
+
+`host.explainPlan` returns:
+
+```json
+{
+  "dbType": "postgres",
+  "dbVersion": "15.19",
+  "format": "json",
+  "rawPlan": [{ "Plan": { "Node Type": "Seq Scan" } }],
+  "truncated": false,
+  "warnings": []
+}
+```
+
+- `format` is `json`, `xml` (SQL Server `ShowPlanXML`), or `text`. `rawPlan` is a parsed JSON document for `json` and the plan text otherwise, so the plugin can parse and normalize it itself.
+- `warnings` carries `plan_not_json` when the server answered with something that is not JSON (the payload is then reported as `text` rather than pretending it is JSON), `plan_truncated` when the host cut the plan to respect `maxPlanBytes`, and `plan_rows_truncated` when the driver stopped collecting plan rows.
+- `truncated` is `true` whenever the host cut the plan for either reason.
+
+The sandboxed UI can call this through `window.dbxPlugin` directly:
+
+```js
+if (window.dbxPlugin.capabilities.planApi) {
+  const capabilities = await window.dbxPlugin.getPlanCapabilities(connectionId);
+  if (capabilities.supports.estimatedPlan) {
+    const plan = await window.dbxPlugin.explainPlan({ connectionId, database, sql, mode: "estimated", timeoutMs: 15000 });
+  }
+}
+```
+
+Boundaries:
+
+- **Estimated plans only.** `mode` must be `"estimated"`; any other value is rejected. Actual plans (`EXPLAIN ANALYZE`, `SET STATISTICS XML`) execute the statement and are not part of this API.
+- **The plugin never supplies SQL to execute.** Only the source `sql` is accepted and the host builds the `EXPLAIN` statement itself, so a plugin cannot pass an `EXPLAIN` statement, a driver command, or an execution mode.
+- **Read-only targets only.** The same gate DBX uses for its own plan view rejects multi-statement input, DDL, DML, and dangerous keywords. Oracle is the one dialect where DBX also plans DML, because `EXPLAIN PLAN FOR` does not execute it.
+- **No credentials.** The response carries the plan and metadata only; a password, credential, connection string, or driver internals never cross this boundary, and the plan is not a user result set.
+- **The connection must already be open.** DBX does not connect on a plugin's behalf. A saved connection that is currently disconnected is rejected by both `host.getPlanCapabilities` and `host.explainPlan` with `Connection is not open`; only a connection DBX already holds open can be planned.
+- **`host.plans:read` is read-only.** It does not permit normal SQL execution, writes, DDL, or actual plans, and it is the only permission this API reads.
+- **Bounded.** `limits.maxPlanBytes` caps the plan payload, `timeoutMs` is clamped by the host, and a plan that cannot be cut safely fails with an explicit error instead of returning a partial document.
+
+Gate on capability rather than probing: read `window.dbxPlugin.capabilities.planApi` from the init message (an older host omits it), then confirm per-connection support with `host.getPlanCapabilities` before calling `host.explainPlan`.
+
+The plan API is Host API 1.2, so a plugin that cannot work without it declares the floor in its manifest:
+
+```json
+{
+  "engines": { "host_api": "^1.2" }
+}
+```
+
+The manifest range is a compatibility floor and `capabilities.planApi` is the runtime check; keep both.
+
 ### Host API methods a plugin may call
 
 Plugins normally answer requests, but Host API 1.1 adds one method a plugin backend may call back into DBX. Plugin-initiated requests use **string** ids (`"prompt-1"`), while DBX-owned requests and their responses keep numeric ids, so one stream carries both directions and older hosts that only understand numeric ids ignore the new frames instead of failing.
@@ -501,6 +780,25 @@ Plugins normally answer requests, but Host API 1.1 adds one method a plugin back
 - DBX answers only with what the user typed. It never auto-fills, caches, or logs the value, and it allows at most four open prompts per plugin session.
 - Capability gating: `plugin/initialize` advertises `host.hostApiVersion` (`1.1.0` or later) and `host.features` (containing `host.requestUserInput` when available). Only call the method when it is advertised; an older host reports `1.0.0` and drops the frame.
 - The Rust SDK (`dbx-plugin-sdk`) wraps this: `dbx_plugin_sdk::host_client()`, `HostClient::supports("host/requestUserInput")`, and `HostClient::request_user_input(&UserInputPrompt::secret("Verification code"))`.
+
+## Tools for the built-in AI assistant
+
+A backend can expose tools to the built-in DBX AI agent through the MCP-shaped sidecar methods `mcp/tools` and `mcp/call` — the same methods DBX's MCP bridge uses:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"mcp/tools","params":{"connectionId":"<open connection id>"}}
+{"jsonrpc":"2.0","id":8,"method":"mcp/call","params":{"tool":"orders_lag","arguments":{"group":"billing"},"lifecycle":{"provider":{},"connection":{},"runtime":{}}}}
+```
+
+`mcp/tools` returns `{ "tools": [{ "name", "description", "inputSchema", "annotations"? }] }`; `mcp/call` returns an MCP `CallToolResult` (`{ "content": [{ "type": "text", "text": "…" }], "isError": false }`). `lifecycle` is the open connection's `connection/connect` payload, with secrets resolved by the host and the runtime endpoint after transport layers.
+
+Host rules (`crates/dbx-core/src/ai/plugin_tools.rs`):
+
+- Tools are opt-in: a plugin contributes AI tools only after the user enabled it in Plugin Center, and a manifest `mcp` contribution with `ai_tools: false` keeps it off the surface even when opted in. The Plugin Center switch turns a plugin off for good. Tools appear only in Agent mode with API model providers, and only for plugin connections that are currently open.
+- The host binds the connection: `connectionId` / `connectionName` are removed from the model-facing schema, and the bound `connectionId` is injected into the forwarded arguments when the plugin schema declares it. With several open connections the model chooses through an added `dbx_connection` argument.
+- A tool runs without asking only when its entry sets `annotations.readOnlyHint: true`. Every other call pauses the run behind an inline approval that shows the exact forwarded arguments; unanswered approvals are denied after five minutes (`crates/dbx-core/src/ai/tool_approval.rs`). The hint is trusted because the plugin's native backend is already trusted code; the approval protects against model mistakes and prompt injection, not against a hostile plugin.
+- Names are exposed as `<prefix>__<tool>` (`io.dbx.ssh` → `ssh__…`). Schemas are reduced to a provider-portable subset (`type`, `description`, `properties`, `required`, `items`, string `enum`, numeric/length/item bounds); argument names must match `[A-Za-z_][A-Za-z0-9_]{0,63}`.
+- Discovery times out after 8 s per connection, calls after 120 s, and results are compacted before reaching the model.
 
 ## Backend protocol
 
@@ -584,7 +882,8 @@ Sidecars are shared per plugin process, not spawned per tab. Plugins own their i
 - **UI isolation:** sandboxed iframe, restrictive CSP, bounded bridge payloads, safe asset paths, plugin identity binding.
 - **Secret persistence:** plugin secrets are removed from connection JSON and stored through DBX's secret-store path. Ordinary cloud-sync snapshots always contain redacted placeholders. Secrets enter sync data only inside the encrypted payload when the user has configured a sync passphrase; without one, plugin secrets remain local and are not synchronized.
 - **Native backend trust:** a native sidecar runs with the current OS user's privileges. A signature identifies the repository that approved and published the package; it is not an OS sandbox or proof that the author is harmless. Install only plugins whose backend code you trust.
-- **Permission declarations:** privileged host bridge operations require declared permissions. Plugin UI network egress is fully blocked except for explicitly declared `host.network:` origins. Native process filesystem/network access cannot currently be completely mediated by DBX.
+- **Permission declarations:** privileged host bridge operations require declared permissions. Plugin UI network egress is fully blocked except for explicitly declared `host.network:` origins. Native process filesystem/network access cannot currently be completely mediated by DBX. `host.plans:read` grants reading host-generated estimated execution plans only; it never grants SQL execution, writes, DDL, or actual plans. `host.schema:read` grants only narrow metadata for a table on an already-open host connection; it never grants arbitrary SQL, writes, or reconnects. `host.storage` confines the workbench UI to a small JSON store inside its own `plugin-data/<id>` directory; it grants no other filesystem reach. `host.ai` lets a workbench open a built-in AI conversation seeded with a snapshot the plugin supplies and publish context-aware recommendation chips; the conversation API returns no model output or configuration. The optional text completion API returns sanitized model choices and generated text only after host confirmation; it never exposes credentials or SQL execution. `host.data:read` grants single read-only statements only on connections the user consented to, per plugin and connection, revocable in Plugin Center; it never grants writes, DDL, locking reads, database switches, or reconnects. `host.connections:read` grants read-only, secret-free summary metadata for all configured connections; it never grants passwords, credentials, or connection strings.
+- **AI tool exposure:** plugin MCP tools reach the built-in AI agent only after the user enabled the plugin in Plugin Center, only on open connections and — unless declared read-only — only after a per-call approval; visibility is revocable per plugin (a manifest `ai_tools: false` also opts out). The external `dbx` MCP server exposes a plugin's tools only when its manifest declares `external_tools: true`, and additionally applies the global MCP connection allowlist.
 
 Custom repository public keys can be added or removed in Plugin Center. Obtain them through a channel independent from the downloaded package.
 

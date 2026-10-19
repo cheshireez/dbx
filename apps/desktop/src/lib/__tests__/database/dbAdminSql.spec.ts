@@ -25,7 +25,7 @@ import {
   oracleDuplicateTableCreateOptions,
   sqlServerClonePrimaryKeyConstraintName,
   SQLSERVER_IDENTIFIER_MAX_LENGTH,
-  supportsNativeMysqlAutoIncrement,
+  supportsMysqlAutoIncrement,
 } from "@/lib/database/dbAdminSql";
 
 beforeEach(() => {
@@ -33,24 +33,37 @@ beforeEach(() => {
 });
 
 describe("MySQL AUTO_INCREMENT administration", () => {
-  it("is available only for explicit native MySQL connections", () => {
-    expect(supportsNativeMysqlAutoIncrement({ db_type: "mysql", driver_profile: undefined })).toBe(true);
-    expect(supportsNativeMysqlAutoIncrement({ db_type: "mysql", driver_profile: "" })).toBe(true);
-    expect(supportsNativeMysqlAutoIncrement({ db_type: "mysql", driver_profile: " MySQL " })).toBe(true);
-
+  it("is available for supported MySQL-family connections", () => {
     for (const connection of [
-      { db_type: "jdbc", driver_profile: "mysql" },
+      { db_type: "mysql", driver_profile: undefined },
+      { db_type: "mysql", driver_profile: "" },
+      { db_type: "mysql", driver_profile: " MySQL " },
       { db_type: "mysql", driver_profile: "mariadb" },
       { db_type: "mysql", driver_profile: "tidb" },
       { db_type: "mysql", driver_profile: "oceanbase" },
+      { db_type: "mysql", driver_profile: "tdsql" },
+      { db_type: "mysql", driver_profile: "polardb" },
+      { db_type: "mysql", driver_profile: "greatsql" },
+      { db_type: "mysql", driver_profile: "custom_mysql" },
       { db_type: "mysql", driver_profile: "dolt" },
-      { db_type: "goldendb", driver_profile: "goldendb" },
       { db_type: "mysql", driver_profile: "goldendb" },
+      { db_type: "goldendb", driver_profile: "goldendb" },
+    ] as const) {
+      expect(supportsMysqlAutoIncrement(connection as any), JSON.stringify(connection)).toBe(true);
+    }
+
+    for (const connection of [
+      { db_type: "jdbc", driver_profile: "mysql" },
+      { db_type: "mysql", driver_profile: "unknown" },
       { db_type: "doris", driver_profile: "doris" },
+      { db_type: "mysql", driver_profile: "doris" },
+      { db_type: "mysql", driver_profile: "selectdb" },
+      { db_type: "mysql", driver_profile: "starrocks" },
+      { db_type: "mysql", driver_profile: "manticoresearch" },
       { db_type: "doris", driver_profile: "selectdb" },
       { db_type: "starrocks", driver_profile: "starrocks" },
     ] as const) {
-      expect(supportsNativeMysqlAutoIncrement(connection as any)).toBe(false);
+      expect(supportsMysqlAutoIncrement(connection as any), JSON.stringify(connection)).toBe(false);
     }
   });
 
@@ -284,6 +297,13 @@ describe("damengDuplicateTableCreateOptions", () => {
 });
 
 describe("buildDuplicateTableStructurePlan", () => {
+  it("refuses OceanBase structure cloning when source column metadata cannot be read", async () => {
+    apiMock.getColumns.mockRejectedValueOnce(new Error("source columns inaccessible"));
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue('CREATE TABLE "APP"."COPY" AS SELECT * FROM "APP"."SOURCE" WHERE 1=0;');
+    await expect(buildDuplicateTableStructurePlan({ connectionId: "ob-clone", database: "APP", databaseType: "oceanbase-oracle", schema: "APP", sourceName: "SOURCE", targetName: "COPY" })).rejects.toThrow("source columns inaccessible");
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
   it("loads Oracle metadata through the list APIs and builds a script", async () => {
     const columns = [{ name: "ID", data_type: "NUMBER", is_nullable: false, column_default: "42", is_primary_key: true }];
     const indexes = [{ name: "IDX_ORDERS_ID", columns: ["ID"], is_unique: false, is_primary: false }];
@@ -408,19 +428,144 @@ describe("buildDuplicateTableStructurePlan", () => {
     expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
   });
 
-  it("keeps representative non-Dameng clones on the generic path", async () => {
+  it("loads Vastbase source comments without rebuilding constraints or defaults", async () => {
+    const columns = [
+      { name: '备"注', comment: "  客户's;备注  ", data_type: "text", is_nullable: true, column_default: "'default'", is_primary_key: false },
+      ...[null, "", " \t\n ", undefined].map((comment, index) => ({ name: `empty_${index}`, comment, data_type: "text", is_nullable: true, column_default: null, is_primary_key: false })),
+    ];
+    apiMock.getColumns.mockResolvedValue(columns);
+    const sql = 'CREATE TABLE "copy" AS SELECT * FROM "source" WHERE 1=0;\nCOMMENT ON TABLE "copy" IS \'订单\';\nCOMMENT ON COLUMN "copy"."note" IS \'备注\';';
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({
+      connectionId: "vastbase-1",
+      database: "app",
+      catalog: "catalog",
+      databaseType: "vastbase",
+      schema: '业"务',
+      sourceName: '订"单',
+      targetName: '订"单_副本',
+      tableComment: "  客户's;订单  ",
+      identifierQuote: '"',
+    });
+
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("vastbase-1", "app", '业"务', '订"单', "catalog");
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledExactlyOnceWith({
+      databaseType: "vastbase",
+      schema: '业"务',
+      sourceName: '订"单',
+      targetName: '订"单_副本',
+      tableComment: "  客户's;订单  ",
+      columnComments: [{ name: '备"注', comment: "  客户's;备注  " }],
+      identifierQuote: '"',
+    });
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: true });
+    expect(apiMock.listIndexes).not.toHaveBeenCalled();
+    expect(apiMock.buildCreateTableSql).not.toHaveBeenCalled();
+    expect(apiMock.getTableComment).not.toHaveBeenCalled();
+  });
+
+  it.each([null, "", " \t\n "])("reuses Vastbase columns and keeps absent comments optional: %j", async (comment) => {
+    const columns = [{ name: "note", comment, data_type: "text", is_nullable: true, column_default: null, is_primary_key: false }];
+    const sql = 'CREATE TABLE "copy" AS SELECT * FROM "source" WHERE 1=0;';
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({ connectionId: "vastbase-1", database: "app", databaseType: "vastbase", sourceName: "source", targetName: "copy", tableComment: comment, sourceColumns: columns });
+
+    expect(apiMock.getColumns).not.toHaveBeenCalled();
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: comment, columnComments: [] }));
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: false });
+  });
+
+  it("does not silently clone Vastbase without comments when column metadata fails", async () => {
+    const error = new Error("column metadata unavailable");
+    apiMock.getColumns.mockRejectedValueOnce(error);
+
+    await expect(buildDuplicateTableStructurePlan({ connectionId: "vastbase-1", database: "app", databaseType: "vastbase", sourceName: "source", targetName: "copy" })).rejects.toBe(error);
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("vastbase-1", "app", "", "source", undefined);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it("loads Oscar source column comments and keeps table and column comments in the clone plan", async () => {
+    const columns = [
+      { name: "ID", comment: null, data_type: "int", is_nullable: false, column_default: null, is_primary_key: true },
+      { name: "NAME", comment: "  用户's;姓名  ", data_type: "varchar(50)", is_nullable: true, column_default: null, is_primary_key: false },
+      { name: "BLANK", comment: " \t\n ", data_type: "varchar(50)", is_nullable: true, column_default: null, is_primary_key: false },
+    ];
+    const sql = 'CREATE TABLE "SYSDBA"."USERS_COPY" AS SELECT * FROM "SYSDBA"."USERS" WHERE 1=0;\nCOMMENT ON TABLE "SYSDBA"."USERS_COPY" IS \'  用户\'\'s;表  \';\nCOMMENT ON COLUMN "SYSDBA"."USERS_COPY"."NAME" IS \'  用户\'\'s;姓名  \';';
+    apiMock.getColumns.mockResolvedValue(columns);
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({
+      connectionId: "oscar-1",
+      database: "osrdb",
+      catalog: "catalog",
+      databaseType: "oscar",
+      schema: "SYSDBA",
+      sourceName: "USERS",
+      targetName: "USERS_COPY",
+      tableComment: "  用户's;表  ",
+      identifierQuote: '"',
+    });
+
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("oscar-1", "osrdb", "SYSDBA", "USERS", "catalog");
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledExactlyOnceWith({
+      databaseType: "oscar",
+      schema: "SYSDBA",
+      sourceName: "USERS",
+      targetName: "USERS_COPY",
+      tableComment: "  用户's;表  ",
+      columnComments: [{ name: "NAME", comment: "  用户's;姓名  " }],
+      identifierQuote: '"',
+    });
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: true });
+    expect(apiMock.listIndexes).not.toHaveBeenCalled();
+    expect(apiMock.buildCreateTableSql).not.toHaveBeenCalled();
+    expect(apiMock.getTableComment).not.toHaveBeenCalled();
+  });
+
+  it.each([null, "", " \t\n "])("reuses Oscar columns and keeps absent comments optional: %j", async (comment) => {
+    const columns = [{ name: "note", comment, data_type: "text", is_nullable: true, column_default: null, is_primary_key: false }];
+    const sql = 'CREATE TABLE "copy" AS SELECT * FROM "source" WHERE 1=0;';
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({
+      connectionId: "oscar-1",
+      database: "osrdb",
+      databaseType: "oscar",
+      sourceName: "source",
+      targetName: "copy",
+      tableComment: comment,
+      sourceColumns: columns,
+    });
+
+    expect(apiMock.getColumns).not.toHaveBeenCalled();
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: comment, columnComments: [] }));
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: false });
+  });
+
+  it("does not silently clone Oscar without comments when column metadata fails", async () => {
+    const error = new Error("column metadata unavailable");
+    apiMock.getColumns.mockRejectedValueOnce(error);
+
+    await expect(buildDuplicateTableStructurePlan({ connectionId: "oscar-1", database: "osrdb", databaseType: "oscar", sourceName: "source", targetName: "copy" })).rejects.toBe(error);
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("oscar-1", "osrdb", "", "source", undefined);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it.each(["postgres", "mysql", "highgo", "kingbase", undefined] as const)("keeps %s clones on the generic path", async (databaseType) => {
     apiMock.buildDuplicateTableStructureSql.mockResolvedValue('CREATE TABLE "copy" (LIKE "source" INCLUDING ALL);');
 
     const plan = await buildDuplicateTableStructurePlan({
       connectionId: "postgres-1",
       database: "app",
-      databaseType: "postgres",
+      databaseType,
       schema: "public",
       sourceName: "source",
       targetName: "copy",
     });
 
-    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ databaseType: "postgres", sourceName: "source", targetName: "copy" }));
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ databaseType, sourceName: "source", targetName: "copy", columnComments: [] }));
     expect(apiMock.getColumns).not.toHaveBeenCalled();
     expect(apiMock.listIndexes).not.toHaveBeenCalled();
     expect(apiMock.buildCreateTableSql).not.toHaveBeenCalled();
@@ -428,6 +573,8 @@ describe("buildDuplicateTableStructurePlan", () => {
   });
 
   it("recreates the SQL Server primary key that SELECT INTO drops", async () => {
+    apiMock.getColumns.mockResolvedValue([]);
+    apiMock.getTableComment.mockResolvedValue(null);
     apiMock.listIndexes.mockResolvedValue([
       { name: "PK_ORDERS", columns: ["ID", "SEQ"], is_unique: true, is_primary: true },
       { name: "IDX_ORDERS_CUSTOMER", columns: ["CUSTOMER"], is_unique: false, is_primary: false },
@@ -449,6 +596,8 @@ describe("buildDuplicateTableStructurePlan", () => {
   });
 
   it("renames the SQL Server clone PK when it would collide with a source index", async () => {
+    apiMock.getColumns.mockResolvedValue([]);
+    apiMock.getTableComment.mockResolvedValue(null);
     apiMock.listIndexes.mockResolvedValue([
       { name: "PK_ORDERS", columns: ["ID"], is_unique: true, is_primary: true },
       { name: "PK_orders_copy", columns: ["FLAG"], is_unique: false, is_primary: false },
@@ -491,6 +640,8 @@ describe("buildDuplicateTableStructurePlan", () => {
   });
 
   it("keeps primary-key-free SQL Server clones on a single statement", async () => {
+    apiMock.getColumns.mockResolvedValue([]);
+    apiMock.getTableComment.mockResolvedValue(null);
     apiMock.listIndexes.mockResolvedValue([{ name: "IDX_ORDERS_CUSTOMER", columns: ["CUSTOMER"], is_unique: false, is_primary: false }]);
     apiMock.buildDuplicateTableStructureSql.mockResolvedValue("SELECT TOP 0 * INTO [orders_copy] FROM [orders];");
 
@@ -504,7 +655,63 @@ describe("buildDuplicateTableStructurePlan", () => {
     });
 
     expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ databaseType: "sqlserver", primaryKeyColumns: [] }));
-    expect(plan).toEqual({ sql: "SELECT TOP 0 * INTO [orders_copy] FROM [orders];", sourceColumns: undefined, executeAsScript: false });
+    expect(plan).toEqual({ sql: "SELECT TOP 0 * INTO [orders_copy] FROM [orders];", sourceColumns: [], executeAsScript: false });
+  });
+
+  it("loads SQL Server table and column comments and runs a comment-only clone as a script", async () => {
+    const columns = [
+      { name: "value field", comment: "  字段 O'Brien;注释  ", data_type: "nvarchar", is_nullable: true, column_default: null, is_primary_key: false },
+      { name: "id", comment: null, data_type: "int", is_nullable: false, column_default: null, is_primary_key: false },
+    ];
+    const sql = "SELECT TOP 0 * INTO [dbo].[copy] FROM [dbo].[source];\nEXEC sys.sp_addextendedproperty ...;";
+    apiMock.getColumns.mockResolvedValue(columns);
+    apiMock.getTableComment.mockResolvedValue("  表 O'Brien;注释  ");
+    apiMock.listIndexes.mockResolvedValue([]);
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue(sql);
+
+    const plan = await buildDuplicateTableStructurePlan({ connectionId: "mssql-1", database: "app", catalog: "catalog", databaseType: "sqlserver", schema: "dbo", sourceName: "source", targetName: "copy" });
+
+    expect(apiMock.getColumns).toHaveBeenCalledExactlyOnceWith("mssql-1", "app", "dbo", "source", "catalog");
+    expect(apiMock.getTableComment).toHaveBeenCalledExactlyOnceWith("mssql-1", "app", "dbo", "source", "catalog");
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: "  表 O'Brien;注释  ", columnComments: [{ name: "value field", comment: "  字段 O'Brien;注释  " }], primaryKeyColumns: [] }));
+    expect(plan).toEqual({ sql, sourceColumns: columns, executeAsScript: true });
+  });
+
+  it("reuses supplied SQL Server column and table comments for data-copy callers", async () => {
+    const columns = [{ name: "id", comment: "编号", data_type: "int", is_nullable: false, column_default: null, is_primary_key: true }];
+    apiMock.listIndexes.mockResolvedValue([{ name: "PK_source", columns: ["id"], is_unique: true, is_primary: true }]);
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue("SELECT TOP 0 * INTO [copy] FROM [source];");
+    const plan = await buildDuplicateTableStructurePlan({ connectionId: "mssql-1", database: "app", databaseType: "sqlserver", sourceName: "source", targetName: "copy", sourceColumns: columns, tableComment: "表注释" });
+    expect(apiMock.getColumns).not.toHaveBeenCalled();
+    expect(apiMock.getTableComment).not.toHaveBeenCalled();
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: "表注释", columnComments: [{ name: "id", comment: "编号" }], primaryKeyColumns: ["id"] }));
+    expect(plan.sourceColumns).toBe(columns);
+    expect(plan.executeAsScript).toBe(true);
+  });
+
+  it("does not create a SQL Server clone when column metadata cannot be loaded", async () => {
+    apiMock.listIndexes.mockResolvedValue([]);
+    apiMock.getColumns.mockResolvedValue([]);
+    apiMock.getTableComment.mockResolvedValue(null);
+    const error = new Error("comment metadata unavailable");
+    apiMock.getColumns.mockRejectedValueOnce(error);
+    await expect(buildDuplicateTableStructurePlan({ connectionId: "mssql-1", database: "app", databaseType: "sqlserver", sourceName: "source", targetName: "copy" })).rejects.toBe(error);
+    expect(apiMock.buildDuplicateTableStructureSql).not.toHaveBeenCalled();
+  });
+
+  it("keeps SQL Server cloning available when optional table comment loading fails", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    apiMock.listIndexes.mockResolvedValue([]);
+    apiMock.getColumns.mockResolvedValue([]);
+    apiMock.getTableComment.mockRejectedValue(new Error("Table comment lookup is not available in the web backend"));
+    apiMock.buildDuplicateTableStructureSql.mockResolvedValue("SELECT TOP 0 * INTO [copy] FROM [source];");
+
+    const plan = await buildDuplicateTableStructurePlan({ connectionId: "mssql-web", database: "app", databaseType: "sqlserver", sourceName: "source", targetName: "copy" });
+
+    expect(apiMock.buildDuplicateTableStructureSql).toHaveBeenCalledWith(expect.objectContaining({ tableComment: null, columnComments: [], primaryKeyColumns: [] }));
+    expect(plan).toEqual({ sql: "SELECT TOP 0 * INTO [copy] FROM [source];", sourceColumns: [], executeAsScript: false });
+    expect(warning).toHaveBeenCalledOnce();
+    warning.mockRestore();
   });
 
   it("forwards the connection identifier quote so dual-dialect clones stay executable", async () => {

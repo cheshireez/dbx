@@ -12,6 +12,9 @@ const mocks = vi.hoisted(() => ({
   repushPluginConnection: vi.fn(),
   ensureConnected: vi.fn(),
   openPluginWorkbench: vi.fn(),
+  setPluginWorkbenchTabTitle: vi.fn(),
+  getPluginWorkbenchTabTitle: vi.fn(),
+  connectedIds: new Set<string>(["conn-1"]),
 }));
 
 vi.mock("@/lib/backend/api", () => ({
@@ -29,14 +32,20 @@ vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: ref(false)
 vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { uiFontFamily: "", fontFamily: "", fontSize: 14 } }) }));
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
-    connectedIds: new Set(["conn-1"]),
+    connectedIds: mocks.connectedIds,
     getConfig: () => undefined,
     ensureConnected: mocks.ensureConnected,
     repushPluginConnection: mocks.repushPluginConnection,
     reopenPluginConnection: vi.fn(),
   }),
 }));
-vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({ openPluginWorkbench: mocks.openPluginWorkbench }) }));
+vi.mock("@/stores/queryStore", () => ({
+  useQueryStore: () => ({
+    openPluginWorkbench: mocks.openPluginWorkbench,
+    setPluginWorkbenchTabTitle: mocks.setPluginWorkbenchTabTitle,
+    getPluginWorkbenchTabTitle: mocks.getPluginWorkbenchTabTitle,
+  }),
+}));
 vi.mock("vue-i18n", () => ({
   useI18n: () => ({ locale: ref("en"), t: (key: string, params?: Record<string, unknown>) => (params ? `${key} ${JSON.stringify(params)}` : key) }),
 }));
@@ -48,7 +57,7 @@ const plugin: InstalledPlugin = {
     id: "com.example.graph",
     name: "Graph plugin",
     version: "1.0.0",
-    permissions: [],
+    permissions: ["host.workbench"],
     drivers: [],
     entrypoints: { ui: { root: "ui", entry: "ui/index.html" } },
     contributions: [
@@ -152,5 +161,99 @@ describe("PluginWorkbenchTab contribution resolution", () => {
 
     expect(root.querySelector("iframe")).toBeNull();
     expect(root.textContent).toContain("pluginPlatform.workbenchUnavailable");
+  });
+
+  it("forwards setTitle and getTitle from the bridge to queryStore for the tab", async () => {
+    mocks.getPluginWorkbenchTabTitle.mockReturnValue("Tab Original Title");
+    app = createApp(PluginWorkbenchTab, { tabId: "tab-test-1", pluginId: "com.example.graph", contributionId: "graph.main", connectionId: "conn-1" });
+    app.mount(root);
+    await nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await nextTick();
+    const frame = root.querySelector("iframe");
+    expect(frame).toBeInstanceOf(HTMLIFrameElement);
+    const target = frame!.contentWindow!;
+    const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
+    frame!.dispatchEvent(new Event("load"));
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalled());
+
+    // Send host.setTitle from the iframe
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id: "t-set", method: "host.setTitle", params: { title: "Custom Title" } },
+      }),
+    );
+    await vi.waitFor(() => expect(mocks.setPluginWorkbenchTabTitle).toHaveBeenCalledWith("tab-test-1", "Custom Title"));
+
+    // Send host.getTitle from the iframe
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id: "t-get", method: "host.getTitle" },
+      }),
+    );
+    await vi.waitFor(() => expect(mocks.getPluginWorkbenchTabTitle).toHaveBeenCalledWith("tab-test-1"));
+  });
+});
+
+// Restored-tab self-heal (dbx-plugin-ssh#144): a page refresh used to park the
+// tab on the reload prompt from a one-shot `start()` snapshot, so the plugin
+// could never re-establish its session even after the SPA's boot connect
+// replay landed. `start()` now recovers silently and only parks when silent
+// recovery cannot proceed.
+describe("PluginWorkbenchTab restore self-heal", () => {
+  let app: App<Element> | undefined;
+  let root: HTMLDivElement;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
+    vi.stubGlobal("getComputedStyle", () => Object.assign([], { getPropertyValue: () => "" }));
+    mocks.listPlugins.mockResolvedValue([plugin]);
+    mocks.readPluginUiEntry.mockResolvedValue({ dataBase64: btoa("<!doctype html><html><body></body></html>"), contentType: "text/html" });
+    mocks.subscribePluginEvents.mockResolvedValue(vi.fn());
+    mocks.repushPluginConnection.mockResolvedValue(undefined);
+    mocks.ensureConnected.mockResolvedValue(undefined);
+    mocks.connectedIds.clear();
+    root = document.createElement("div");
+    document.body.appendChild(root);
+  });
+
+  afterEach(() => {
+    app?.unmount();
+    root.remove();
+    vi.unstubAllGlobals();
+  });
+
+  it("self-heals a restored tab: silent ensureConnected, then the workbench loads", async () => {
+    app = createApp(PluginWorkbenchTab, { pluginId: "com.example.graph", contributionId: "graph.main", connectionId: "conn-1" });
+    app.mount(root);
+
+    await vi.waitFor(() => expect(mocks.ensureConnected).toHaveBeenCalledWith("conn-1", { allowPasswordPrompt: false, skipIfClosedByUser: true }));
+    await vi.waitFor(() => expect(root.querySelector("iframe")).toBeInstanceOf(HTMLIFrameElement));
+    expect(root.textContent).not.toContain("pluginPlatform.reloadRequired");
+  });
+
+  it("keeps an already-connected restore on the direct load path", async () => {
+    mocks.connectedIds.add("conn-1");
+    app = createApp(PluginWorkbenchTab, { pluginId: "com.example.graph", contributionId: "graph.main", connectionId: "conn-1" });
+    app.mount(root);
+
+    await vi.waitFor(() => expect(root.querySelector("iframe")).toBeInstanceOf(HTMLIFrameElement));
+    // The direct load path must not reconnect behind the user's back. (The
+    // host's PluginWorkbenchHost re-pushes credentials on its own mount; that
+    // is not start()'s concern here.)
+    expect(mocks.ensureConnected).not.toHaveBeenCalled();
+    expect(root.textContent).not.toContain("pluginPlatform.reloadRequired");
+  });
+
+  it("parks on the reload prompt without an error card when silent recovery fails", async () => {
+    mocks.ensureConnected.mockRejectedValue(new Error("interactive password required"));
+    app = createApp(PluginWorkbenchTab, { pluginId: "com.example.graph", contributionId: "graph.main", connectionId: "conn-1" });
+    app.mount(root);
+
+    await vi.waitFor(() => expect(root.textContent).toContain("pluginPlatform.reloadRequired"));
+    expect(root.querySelector("iframe")).toBeNull();
   });
 });

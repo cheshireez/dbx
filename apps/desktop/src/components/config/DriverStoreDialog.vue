@@ -24,6 +24,7 @@ import {
   addDriverInstallQueue,
   driverInstallProgressChannel,
   driverInstallProgressPercent,
+  formatDriverInstallProgressText,
   isDriverInstallCanceledError,
   isDriverInstallCancellationTarget,
   isDriverInstallProgressForOperation,
@@ -40,6 +41,8 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import { runAgentOfflineExportAction } from "@/lib/driverStore/agentOfflineExportFlow";
 import { DRIVER_CATEGORIES, getCategoryForAgentDriver, assertAgentDriverCategoriesComplete } from "@/lib/connection/driver-category-definitions";
 import { hasAnyUpdatableDriverMatching, countInstalledDrivers, countAvailableDrivers, partitionDriversByInstallStatus, upgradeAllDriverTypes, upgradeAllMatchesFullUpdateSet, type DriverInstallStatusFilter } from "@/lib/connection/driverListFilter";
+import { COMPONENT_DRIVER_UPDATES_CHANGED_EVENT, notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
+import { updateBlockerLabels } from "@/lib/updates/componentUpdateOrchestration";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -50,6 +53,10 @@ const isWeb = !isTauriRuntime();
 function backendError(e: unknown): string {
   const message = e instanceof Error ? e.message : ((e as { message?: string } | null)?.message ?? String(e));
   return translateBackendError(t, message);
+}
+
+function driverUpdateBlockedMessage(blockers: Awaited<ReturnType<typeof api.checkAgentUpdateBlockers>>): string {
+  return updateBlockerLabels(blockers).join(", ");
 }
 
 const props = withDefaults(
@@ -238,15 +245,7 @@ const installedJres = computed(() => {
 });
 
 function formatProgressText(p: DriverInstallProgress | null | undefined): string {
-  if (!p) return "";
-  if (p.step === "jre-extract") return t("driverStore.progressJreExtract");
-  if (p.step === "jdbc-plugin-extract") return t("driverStore.progressJdbcPluginExtract");
-  const label = p.step === "jre" ? t("driverStore.progressDownloadJre") : p.step === "jdbc-plugin" ? t("driverStore.progressDownloadJdbcPlugin") : t("driverStore.progressDownloadDriver");
-  if (!p.total) return `${label}...`;
-  const pct = Math.round(((p.downloaded ?? 0) / p.total) * 100);
-  const dl = formatSize(p.downloaded ?? 0);
-  const total = formatSize(p.total);
-  return `${label}  ${dl} / ${total}  (${pct}%)`;
+  return formatDriverInstallProgressText(p, t);
 }
 
 function getAgentProgressText(dbType: string): string {
@@ -268,12 +267,10 @@ function getAgentProgressPercent(dbType: string): number | null {
   return next ?? lastAgentProgressPercent[dbType] ?? null;
 }
 
-const jdbcPluginProgressNumber = computed(() => {
-  const next = driverInstallProgressPercent(jdbcPluginProgress.value);
-  if (next !== null) {
-    lastJdbcPluginProgressPercent.value = next;
-  }
-  return next ?? lastJdbcPluginProgressPercent.value;
+const jdbcPluginProgressNumber = computed(() => driverInstallProgressPercent(jdbcPluginProgress.value) ?? lastJdbcPluginProgressPercent.value);
+watch(jdbcPluginProgress, (progress) => {
+  const next = driverInstallProgressPercent(progress);
+  if (next !== null) lastJdbcPluginProgressPercent.value = next;
 });
 
 function resetAgentInstallProgress() {
@@ -425,6 +422,10 @@ async function forceRefresh() {
   }
 }
 
+function handleComponentDriverUpdatesChanged() {
+  void Promise.allSettled([forceRefresh(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
+}
+
 function setUpdateDownloadSource(value: unknown) {
   if (value !== "official" && value !== "cnb") return;
   if (value === settingsStore.editorSettings.updateDownloadSource) return;
@@ -497,18 +498,20 @@ async function runDriverInstall(dbType: string) {
       if (managedResult.drivers) jdbcDrivers.value = managedResult.drivers;
       jdbcMavenBundles.value = managedResult.bundles;
       void loadDriverStoreUsage();
+      notifyComponentUpdatesChanged();
       toast(t("driverStore.driverInstallSuccess", { label }));
       return;
     }
     const blockers = await api.checkAgentUpdateBlockers([dbType]);
     if (blockers.length > 0) {
-      toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
+      toast(t("driverStore.driverUpdateBlocked", { labels: driverUpdateBlockedMessage(blockers) }));
       return;
     }
     const operationId = uuid();
     activeAgentOperationId.value = operationId;
     cancellableAgentInstallDbType.value = dbType;
     await api.installAgent(dbType, operationId);
+    notifyComponentUpdatesChanged();
     await refreshAgents();
     toast(t("driverStore.driverInstallSuccess", { label }));
   } catch (e: any) {
@@ -545,7 +548,7 @@ async function upgradeAll() {
     if (updatableDbTypes.length === 0) return;
     const blockers = await api.checkAgentUpdateBlockers(updatableDbTypes);
     if (blockers.length > 0) {
-      toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
+      toast(t("driverStore.driverUpdateBlocked", { labels: driverUpdateBlockedMessage(blockers) }));
       return;
     }
     // Do not expose Cancel until the backend operation has registered its token.
@@ -557,6 +560,7 @@ async function upgradeAll() {
     queuedDriverInstalls.value = [];
     resetAgentInstallProgress();
     const result = await api.upgradeAllAgents(activeAgentOperationId.value);
+    notifyComponentUpdatesChanged();
     await refreshAgents();
     if (result.cancelled > 0 && result.failed.length === 0) {
       toast(t("driverStore.upgradeAllCancelled", { count: result.cancelled }));
@@ -613,15 +617,17 @@ async function uninstallDriver(dbType: string) {
       if (managedResult.drivers) jdbcDrivers.value = managedResult.drivers;
       jdbcMavenBundles.value = managedResult.bundles;
       void loadDriverStoreUsage();
+      notifyComponentUpdatesChanged();
       toast(t("driverStore.driverUninstallSuccess", { label }));
       return;
     }
     const blockers = await api.checkAgentUpdateBlockers([dbType]);
     if (blockers.length > 0) {
-      toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
+      toast(t("driverStore.driverUpdateBlocked", { labels: driverUpdateBlockedMessage(blockers) }));
       return;
     }
     await api.uninstallAgent(dbType);
+    notifyComponentUpdatesChanged();
     await refreshAgents();
     toast(t("driverStore.driverUninstallSuccess", { label }));
   } catch (e: any) {
@@ -744,6 +750,7 @@ async function importOfflineZip() {
   resetAgentInstallProgress();
   try {
     const result = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+    notifyComponentUpdatesChanged();
     await Promise.all([refreshAgents(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
     toastOfflineImportResult(result);
   } catch (e: any) {
@@ -784,7 +791,7 @@ async function importDriverFile(driver: AgentDriverInfo) {
   }
   const blockers = await api.checkAgentUpdateBlockers([dbType]);
   if (blockers.length > 0) {
-    toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
+    toast(t("driverStore.driverUpdateBlocked", { labels: driverUpdateBlockedMessage(blockers) }));
     return;
   }
   const label = driverLabel(dbType);
@@ -796,6 +803,7 @@ async function importDriverFile(driver: AgentDriverInfo) {
       resetAgentInstallProgress();
       try {
         const result = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+        notifyComponentUpdatesChanged();
         await Promise.all([refreshAgents(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
         toastOfflineImportResult(result);
       } finally {
@@ -805,6 +813,7 @@ async function importDriverFile(driver: AgentDriverInfo) {
     } else {
       await api.importAgentDriver(dbType, selected);
       await refreshAgents();
+      notifyComponentUpdatesChanged();
       toast(t("driverStore.driverImportSuccess", { label }));
     }
   };
@@ -1288,6 +1297,7 @@ async function installJdbcPlugin() {
   try {
     jdbcPluginStatus.value = await api.installJdbcPlugin();
     emitDriverUpdateCount();
+    notifyComponentUpdatesChanged();
     toast(t("settings.jdbcPluginInstallSuccess"));
     await loadJdbcDrivers();
   } catch (e: any) {
@@ -1318,6 +1328,7 @@ async function installJdbcPluginLocal() {
   try {
     jdbcPluginStatus.value = await api.installJdbcPluginLocal(selected);
     emitDriverUpdateCount();
+    notifyComponentUpdatesChanged();
     toast(t("settings.jdbcPluginInstallSuccess"));
     await loadJdbcDrivers();
   } catch (e: any) {
@@ -1334,6 +1345,7 @@ async function uninstallJdbcPlugin() {
   try {
     jdbcPluginStatus.value = await api.uninstallJdbcPlugin();
     emitDriverUpdateCount();
+    notifyComponentUpdatesChanged();
     toast(t("settings.jdbcPluginUninstallSuccess"));
     await loadJdbcDrivers();
   } catch (e: any) {
@@ -1443,6 +1455,7 @@ async function deleteJdbcLocalBundle(bundleId: string) {
 // ──────────── Lifecycle ────────────
 
 onMounted(async () => {
+  window.addEventListener(COMPONENT_DRIVER_UPDATES_CHANGED_EVENT, handleComponentDriverUpdatesChanged);
   updateAgentDrivers(await api.listInstalledAgentsLocal());
   void loadJavaRuntimeConfig();
   void loadDriverStoreUsage();
@@ -1490,6 +1503,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener(COMPONENT_DRIVER_UPDATES_CHANGED_EVENT, handleComponentDriverUpdatesChanged);
   unlisten?.();
   stopDriverRuntimePolling();
 });
@@ -2214,14 +2228,22 @@ html.dark .driver-store-agent-row--installed::before {
   overflow-x: hidden;
 }
 
-/* Storage tab: cards scroll together inside the tab */
-.driver-store-storage-tab {
+/* Storage tab: cards scroll together inside the tab. The selector must out-specify
+   `.driver-store-tabs-root > [data-slot="tabs-content"]` above, otherwise the
+   `overflow: hidden` there wins and the cards get clipped with no way to scroll. */
+.driver-store-tabs-root > [data-slot="tabs-content"].driver-store-storage-tab {
   display: flex !important;
   flex-direction: column;
   flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+}
+
+/* Cards must keep their natural height, otherwise `flex` squeezes the runtime
+   list inside the last card instead of letting the tab scroll. */
+.driver-store-tabs-root > [data-slot="tabs-content"].driver-store-storage-tab > * {
+  flex-shrink: 0;
 }
 
 .driver-store-agent-name,

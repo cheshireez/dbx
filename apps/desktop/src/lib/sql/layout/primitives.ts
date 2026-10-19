@@ -1,4 +1,4 @@
-import type { AstNode, ClauseNode, KeywordNode, LimitClauseNode, ParenthesisNode, SetOperationNode } from "sql-formatter/dist/esm/parser/ast.js";
+import type { AstNode, CaseExpressionNode, ClauseNode, KeywordNode, LimitClauseNode, ParenthesisNode, SetOperationNode } from "sql-formatter/dist/esm/parser/ast.js";
 import type { SqlLayoutRenderers } from "./internals";
 
 /**
@@ -30,6 +30,13 @@ export interface SqlLayoutOptions {
    * wherever it fits, matching the element alignment rule.
    */
   logicalOperatorNewline: "before" | "after" | "none";
+  /**
+   * Where commas are placed in multiline item lists.
+   *
+   * `after` places commas at the end of the line (trailing comma);
+   * `before` places commas at the start of continuation lines (leading comma).
+   */
+  commaPosition: "after" | "before";
   /** Blank lines left between two statements. */
   linesBetweenQueries: number;
   /** Whether indentation is written with tab characters. */
@@ -41,6 +48,8 @@ export interface SqlLayoutOptions {
    * "FROM clause" setting.
    */
   fromClauseSourceOnSameLine: boolean;
+  /** Whether the terminating semicolon is placed on its own line. */
+  newlineBeforeSemicolon: boolean;
 }
 
 export interface SqlLayoutContext {
@@ -74,6 +83,15 @@ export interface SqlLayoutContext {
 export class Writer {
   private lines: string[] = [""];
   private columns: number[] = [0];
+  /**
+   * Whether the text written last ends inside a `--` comment.
+   *
+   * A line comment consumes the rest of its line, so whatever the printer emits
+   * next — the separating comma, the closing parenthesis, the statement's `;` —
+   * would land inside the comment and disappear from the formatted SQL. The next
+   * `write`/`space` therefore continues on a new line first.
+   */
+  private lineCommentOpen = false;
 
   constructor(private readonly options: Pick<SqlLayoutOptions, "useTabs" | "indentWidth">) {}
 
@@ -84,17 +102,33 @@ export class Writer {
 
   /** Appends text verbatim. */
   write(text: string): void {
+    if (text.length === 0) return;
+    this.closeLineComment();
     this.lines[this.lines.length - 1] += text;
     this.columns[this.columns.length - 1] += text.length;
   }
 
   /** Appends a single separating space, unless one is already there. */
   space(): void {
+    if (this.lineCommentOpen) {
+      this.closeLineComment();
+      return;
+    }
     const line = this.lines[this.lines.length - 1];
     if (line.length > 0 && !line.endsWith(" ")) {
       this.lines[this.lines.length - 1] = `${line} `;
       this.columns[this.columns.length - 1] += 1;
     }
+  }
+
+  /**
+   * Records that the text written last ends inside a `--` comment, so the next
+   * `write`/`space` has to start a new line. Callers know this from the AST —
+   * see {@link endsWithLineComment} — because only they can tell a comment token
+   * apart from the same two dashes inside a string literal.
+   */
+  markLineComment(): void {
+    this.lineCommentOpen = true;
   }
 
   /** Starts a new line at `indent` columns, dropping trailing blanks first. */
@@ -104,6 +138,7 @@ export class Writer {
     const column = Math.max(0, indent);
     this.lines.push(this.indentation(column));
     this.columns.push(column);
+    this.lineCommentOpen = false;
   }
 
   toString(): string {
@@ -111,6 +146,28 @@ export class Writer {
       .map((line) => line.trimEnd())
       .join("\n")
       .trim();
+  }
+
+  /**
+   * Continues on a new line after a comment, keeping the indentation of the
+   * line the comment is on: the next column of a `SELECT` list lines up under
+   * the one the comment was written on.
+   */
+  private closeLineComment(): void {
+    if (!this.lineCommentOpen) return;
+    this.newline(this.lineIndent());
+  }
+
+  /** Display columns taken by the indentation of the current line. */
+  private lineIndent(): number {
+    const indentWidth = Math.max(1, this.options.indentWidth);
+    let columns = 0;
+    for (const character of this.lines[this.lines.length - 1]) {
+      if (character === "\t") columns += indentWidth;
+      else if (character === " ") columns += 1;
+      else break;
+    }
+    return columns;
   }
 
   /** The whitespace achieving `column` columns of indentation. */
@@ -125,18 +182,37 @@ export function isParenthesis(node: AstNode): node is ParenthesisNode {
   return node.type === "parenthesis";
 }
 
+/** Whether `node` is a `--` comment, which comments out the rest of its line. */
+export function isLineComment(node: AstNode | undefined): boolean {
+  return node?.type === "line_comment";
+}
+
+/**
+ * Whether `nodes` end with a `--` comment.
+ *
+ * The caller that renders such a run has to tell the {@link Writer} about it, so
+ * that the next token is not written into the comment.
+ */
+export function endsWithLineComment(nodes: AstNode[]): boolean {
+  return isLineComment(nodes[nodes.length - 1]);
+}
+
 /**
  * The keyword a node opens its line with, or `null` for a node that is part of
  * an expression. Clauses, set operations and limit clauses each start a line.
  */
-export function bodyKeyword(node: AstNode): string | null {
+export function bodyKeywordNode(node: AstNode): KeywordNode | null {
   if (node.type === "clause" || node.type === "set_operation") {
-    return (node as ClauseNode | SetOperationNode).nameKw.text;
+    return (node as ClauseNode | SetOperationNode).nameKw;
   }
   if (node.type === "limit_clause") {
-    return (node as LimitClauseNode).limitKw.text;
+    return (node as LimitClauseNode).limitKw;
   }
   return null;
+}
+
+export function bodyKeyword(node: AstNode): string | null {
+  return bodyKeywordNode(node)?.text ?? null;
 }
 
 export function isBodyNode(node: AstNode): boolean {
@@ -168,14 +244,90 @@ export function limitChildren(node: LimitClauseNode): AstNode[] {
   return node.offset ? [...node.offset, LIMIT_SEPARATOR, ...node.count] : [...node.count];
 }
 
-export function keywordText(text: string, ctx: SqlLayoutContext): string {
+export function keywordText(token: AstNode | string, ctx: SqlLayoutContext): string {
+  const text = typeof token === "string" ? token : (token as KeywordNode).text;
+  const raw = typeof token === "object" && token && "raw" in token && typeof (token as KeywordNode).raw === "string" ? (token as KeywordNode).raw : undefined;
   switch (ctx.options.keywordCase) {
     case "upper":
       return text.toUpperCase();
     case "lower":
       return text.toLowerCase();
+    case "preserve":
     default:
-      return text;
+      return raw ? raw.replace(/\s+/g, " ") : text;
+  }
+}
+
+/** Whether an AST value contains comments that must retain their own lines. */
+function containsComments(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== "object") return false;
+  const object = value as object;
+  if (seen.has(object)) return false;
+  seen.add(object);
+
+  const record = value as Record<string, unknown>;
+  if (record.type === "line_comment" || record.type === "block_comment" || record.type === "disable_comment") return true;
+  if (Array.isArray(record.leadingComments) && record.leadingComments.length > 0) return true;
+  if (Array.isArray(record.trailingComments) && record.trailingComments.length > 0) return true;
+
+  return Object.entries(record).some(([key, child]) => key !== "leadingComments" && key !== "trailingComments" && containsComments(child, seen));
+}
+
+/**
+ * Renders a CASE expression as one expression when every branch fits. The
+ * regular sql-formatter inline renderer deliberately expands CASE branches;
+ * keeping the expression together makes a CASE projection obey the same
+ * one-field-per-line rule as every other SELECT item.
+ */
+function renderCompactCaseExpression(ctx: SqlLayoutContext, node: CaseExpressionNode, width: number): string | null {
+  if (containsComments(node)) return null;
+
+  const parts: string[] = [keywordText(node.caseKw, ctx)];
+  const append = (text: string | null): boolean => {
+    if (!text) return false;
+    parts.push(text);
+    return parts.join(" ").length <= width;
+  };
+
+  if (node.expr.length > 0 && !append(renderInline(collapsedContext(ctx), node.expr, width))) return null;
+
+  for (const clause of node.clauses) {
+    if (clause.type === "case_when") {
+      if (!append(keywordText(clause.whenKw, ctx))) return null;
+      if (!append(renderInline(collapsedContext(ctx), clause.condition, width))) return null;
+      if (!append(keywordText(clause.thenKw, ctx))) return null;
+      if (!append(renderInline(collapsedContext(ctx), clause.result, width))) return null;
+    } else {
+      if (!append(keywordText(clause.elseKw, ctx))) return null;
+      if (!append(renderInline(collapsedContext(ctx), clause.result, width))) return null;
+    }
+  }
+
+  if (!append(keywordText(node.endKw, ctx))) return null;
+  return parts.join(" ");
+}
+
+/** Keeps CASE expressions inside functions/parentheses compact as well. */
+function compactNestedCases(ctx: SqlLayoutContext, node: AstNode, width: number): AstNode {
+  switch (node.type) {
+    case "case_expression": {
+      const text = renderCompactCaseExpression(ctx, node, width);
+      // This already-formatted expression is opaque to the upstream renderer;
+      // the original AST remains available for the multiline fallback.
+      return text ? ({ type: "literal", text } as AstNode) : node;
+    }
+    case "parenthesis":
+      return { ...node, children: node.children.map((child) => compactNestedCases(ctx, child, width)) };
+    case "function_call":
+    case "parameterized_data_type":
+    case "array_subscript":
+      return { ...node, parenthesis: compactNestedCases(ctx, node.parenthesis, width) as ParenthesisNode };
+    case "property_access":
+      return { ...node, object: compactNestedCases(ctx, node.object, width) };
+    case "between_predicate":
+      return { ...node, expr1: node.expr1.map((child) => compactNestedCases(ctx, child, width)), expr2: node.expr2.map((child) => compactNestedCases(ctx, child, width)) };
+    default:
+      return node;
   }
 }
 
@@ -192,6 +344,11 @@ export function splitByComma(children: AstNode[]): AstNode[][] {
   }
   groups.push(current);
   return groups;
+}
+
+/** Whether a clause name is SELECT, including modifiers such as DISTINCT or ALL. */
+export function isProjectionClauseName(name: string): boolean {
+  return /^SELECT(?:\s|$)/i.test(name.trim());
 }
 
 /**
@@ -254,6 +411,28 @@ export function clauseChildContext(ctx: SqlLayoutContext, clause: ClauseNode): S
   return { ...ctx, nonCallParens: new Set([...(ctx.nonCallParens ?? []), clause.children[at]]) };
 }
 
+// The parser groups everything up to a semicolon into one StatementNode,
+// including scripts whose statements are separated only by newlines. Do not
+// collapse several statement heads onto one line. Only inspect sibling clauses:
+// SELECTs in CTEs, subqueries, strings and comments must not count here.
+function hasMultipleStatementHeads(nodes: AstNode[]): boolean {
+  let seenHead = false;
+  let updateNeedsSet = false;
+  for (const node of nodes) {
+    if (node.type !== "clause") continue;
+    const keyword = node.nameKw.text.toUpperCase();
+    if (keyword === "SET" && updateNeedsSet) {
+      updateNeedsSet = false;
+      continue;
+    }
+    if (!/^(?:SELECT|INSERT|REPLACE|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SET|CALL|EXEC|EXECUTE|GRANT|REVOKE|COMMIT|ROLLBACK)\b/.test(keyword)) continue;
+    if (seenHead) return true;
+    seenHead = true;
+    updateNeedsSet = keyword === "UPDATE";
+  }
+  return false;
+}
+
 /**
  * Renders `nodes` on one line, or `null` when they do not fit in `width`.
  *
@@ -272,7 +451,7 @@ export function clauseChildContext(ctx: SqlLayoutContext, clause: ClauseNode): S
  * while it fits; the printer splits the operators onto their own lines otherwise.
  */
 export function renderInline(ctx: SqlLayoutContext, nodes: AstNode[], width: number): string | null {
-  if (nodes.length === 0 || width <= 0) return null;
+  if (nodes.length === 0 || width <= 0 || hasMultipleStatementHeads(nodes)) return null;
 
   const parenAt = nodes.findIndex(isParenthesis);
   if (parenAt >= 0) {
@@ -280,7 +459,27 @@ export function renderInline(ctx: SqlLayoutContext, nodes: AstNode[], width: num
     if (group) return group;
   }
 
-  const direct = ctx.renderers.inline(nodes, width);
+  const caseAt = nodes.findIndex((node) => node.type === "case_expression");
+  if (caseAt >= 0) {
+    const prefix = caseAt === 0 ? "" : renderInline(collapsedContext(ctx), nodes.slice(0, caseAt), width);
+    if (prefix === null) return null;
+    const caseText = renderCompactCaseExpression(ctx, nodes[caseAt] as CaseExpressionNode, width - prefix.length - (prefix ? 1 : 0));
+    if (!caseText) return null;
+
+    let text = prefix ? `${prefix}${separatorBefore(nodes[caseAt], ctx)}${caseText}` : caseText;
+    const tailNodes = nodes.slice(caseAt + 1);
+    if (tailNodes.length > 0) {
+      const tail = renderInline(collapsedContext(ctx), tailNodes, width - text.length - 1);
+      if (!tail) return null;
+      text += `${separatorBefore(tailNodes[0], ctx)}${tail}`;
+    }
+    return text.length <= width ? text : null;
+  }
+
+  const direct = ctx.renderers.inline(
+    nodes.map((node) => compactNestedCases(ctx, node, width)),
+    width,
+  );
   if (direct) return direct;
 
   const joinsOperators = ctx.joinLogicalOperators ?? ctx.options.logicalOperatorNewline === "none";
@@ -292,15 +491,16 @@ export function renderInline(ctx: SqlLayoutContext, nodes: AstNode[], width: num
   const parts: string[] = [];
   let used = 0;
   for (const node of nodes) {
-    const keyword = bodyKeyword(node);
-    if (!keyword) return null;
+    const kwNode = bodyKeywordNode(node);
+    if (!kwNode) return null;
     const childCtx = node.type === "limit_clause" ? ctx : clauseChildContext(ctx, node as ClauseNode);
     const children = node.type === "limit_clause" ? limitChildren(node as LimitClauseNode) : (node as ClauseNode).children;
-    const text = renderInline(childCtx, children, width - used - keyword.length - 2);
+    const kwText = keywordText(kwNode, ctx);
+    const text = renderInline(childCtx, children, width - used - kwText.length - 2);
     if (!text) return null;
-    used += (parts.length > 0 ? 1 : 0) + keyword.length + 1 + text.length;
+    used += (parts.length > 0 ? 1 : 0) + kwText.length + 1 + text.length;
     if (used > width) return null;
-    parts.push(`${keywordText(keyword, ctx)} ${text}`);
+    parts.push(`${kwText} ${text}`);
   }
   return parts.join(" ");
 }
@@ -412,7 +612,7 @@ function renderLogicalJoin(ctx: SqlLayoutContext, nodes: AstNode[], width: numbe
       continue;
     }
     if (!flush()) return null;
-    const operator = keywordText(node.text, ctx);
+    const operator = keywordText(node, ctx);
     used += operator.length + 1;
     parts.push(operator);
   }
@@ -425,7 +625,7 @@ function renderLogicalJoin(ctx: SqlLayoutContext, nodes: AstNode[], width: numbe
  * column the block starts at. `text` is rendered relative to column 0, so its
  * own leading whitespace carries the nesting levels and only needs shifting.
  */
-export function emitText(writer: Writer, text: string, baseColumn: number): void {
+export function emitText(writer: Writer, text: string, baseColumn: number, endsWithComment = false): void {
   const lines = text.split("\n");
   writer.write(lines[0].trimEnd());
   for (let index = 1; index < lines.length; index++) {
@@ -437,4 +637,5 @@ export function emitText(writer: Writer, text: string, baseColumn: number): void
     writer.newline(baseColumn + line.length - line.trimStart().length);
     writer.write(line.trimStart());
   }
+  if (endsWithComment) writer.markLineComment();
 }

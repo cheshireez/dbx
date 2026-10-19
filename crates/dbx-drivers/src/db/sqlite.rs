@@ -18,9 +18,9 @@ extern crate libsqlite3_hotbundle;
 use super::file_validator::validate_file_path;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
-    CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
-    ForeignKeyInfo, IndexInfo, QueryResult, TableInfo, TriggerInfo,
+    ColumnInfo, ColumnMetadataCapabilities, CompletionAssistantCandidate, CompletionAssistantCandidateKind,
+    CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest,
+    CompletionAssistantResponse, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, TableInfo, TriggerInfo,
 };
 
 const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -1588,6 +1588,7 @@ pub async fn get_columns(pool: &SqliteHandle, schema: &str, table: &str) -> Resu
                     numeric_scale: None,
                     character_maximum_length: None,
                     enum_values: None,
+                    metadata_capabilities: Some(ColumnMetadataCapabilities::default_only()),
                     ..Default::default()
                 }
             })
@@ -1623,6 +1624,7 @@ pub async fn get_columns(pool: &SqliteHandle, schema: &str, table: &str) -> Resu
                         numeric_scale: None,
                         character_maximum_length: None,
                         enum_values: None,
+                        metadata_capabilities: Some(ColumnMetadataCapabilities::default_only()),
                         ..Default::default()
                     })
                 })
@@ -1716,6 +1718,7 @@ fn sqlite_completion_schemas(
             parent_name: None,
             comment: None,
             data_type: None,
+            routine_id: None,
             signature: None,
         })
         .collect())
@@ -1770,6 +1773,7 @@ fn sqlite_completion_tables(
                 parent_name: None,
                 comment: None,
                 data_type: None,
+                routine_id: None,
                 signature: None,
             })
         })
@@ -1809,6 +1813,7 @@ fn sqlite_completion_columns(
             parent_name: Some(table.to_string()),
             comment: None,
             data_type: Some(data_type),
+            routine_id: None,
             signature: None,
         });
         if candidates.len() >= limit {
@@ -2511,6 +2516,9 @@ pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Res
                 })
                 .collect();
             indexes.push(IndexInfo {
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name,
                 columns,
                 is_unique,
@@ -2567,6 +2575,9 @@ pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Res
                     .collect::<Vec<_>>();
 
                 indexes.push(IndexInfo {
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name,
                     columns,
                     is_unique,
@@ -2948,6 +2959,7 @@ fn execute_query_blocking(
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
                 server_execute_time_us: None,
+                query_timings_ms: None,
                 truncated,
                 session_id: None,
                 has_more: false,
@@ -2966,6 +2978,7 @@ fn execute_query_blocking(
                 affected_rows: conn.changes(),
                 execution_time_ms: start.elapsed().as_millis(),
                 server_execute_time_us: None,
+                query_timings_ms: None,
                 truncated: false,
                 session_id: None,
                 has_more: false,

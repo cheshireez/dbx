@@ -13,6 +13,14 @@ function isKnownOracleBaseTableType(tableType?: string): boolean {
   return tableType?.trim().toUpperCase() === "TABLE";
 }
 
+function isKnownPostgresBaseTableType(tableType?: string): boolean {
+  // PostgreSQL reports `relkind = 'r'` through `listTables` as the
+  // information-schema spelling `BASE TABLE`; `TABLE` still reaches this from
+  // object-browser paths and tests, so both must be accepted.
+  const normalized = tableType?.trim().toUpperCase();
+  return normalized === "TABLE" || normalized === "BASE TABLE";
+}
+
 export function isTdengineStableTableType(tableType?: string): boolean {
   const normalized = tableType?.trim().toUpperCase();
   return normalized === "STABLE" || normalized === "SUPER TABLE" || normalized === "SUPERTABLE";
@@ -40,8 +48,14 @@ export function editableRowIdentifierColumns(databaseType: DatabaseType | undefi
   const primaryKeys = editablePrimaryKeys(databaseType, columns, tableType);
   const oracleRowIdFallback = getDatabaseCapability(databaseType).syntheticKey === "oracle-rowid" && primaryKeys.length === 1 && primaryKeys[0]?.toUpperCase() === DBX_ROWID_COLUMN;
   if (primaryKeys.length > 0 && !oracleRowIdFallback) return primaryKeys;
-  const uniqueIndex = indexes?.filter((index) => !index.filter && index.columns.length > 0 && (index.is_primary || index.is_unique)).sort((left, right) => Number(right.is_primary) - Number(left.is_primary) || left.columns.length - right.columns.length)[0];
-  return uniqueIndex?.columns ?? primaryKeys;
+  const columnByName = new Map(columns.map((column) => [column.name.toLowerCase(), column]));
+  const uniqueIndex = indexes
+    ?.filter((index) => {
+      if (index.filter?.trim() || index.columns.length === 0 || (!index.is_primary && !index.is_unique) || index.key_is_expression?.some(Boolean)) return false;
+      return index.columns.every((name) => columnByName.get(name.toLowerCase())?.is_nullable === false);
+    })
+    .sort((left, right) => Number(right.is_primary) - Number(left.is_primary) || left.columns.length - right.columns.length)[0];
+  return uniqueIndex?.columns.map((name) => columnByName.get(name.toLowerCase())!.name) ?? primaryKeys;
 }
 
 export function isTableDataEditable(databaseType: DatabaseType | undefined, primaryKeys: string[], tableType?: string): boolean {
@@ -68,6 +82,16 @@ export function canUseKeylessRowPredicate(databaseType: DatabaseType | undefined
   return primaryKeys.length === 0 && usesKeylessRowPredicate(databaseType);
 }
 
+/**
+ * The toolbar badge warns that updates and deletes fall back to matching every
+ * column value, so exact duplicate rows can be changed together. A preview that
+ * carries a hidden physical row locator addresses a single row, so showing that
+ * warning for it would contradict what the save actually does.
+ */
+export function showsKeylessEditWarning(databaseType: DatabaseType | undefined, primaryKeys: string[], tableType?: string): boolean {
+  return canUseKeylessRowPredicate(databaseType, primaryKeys) && !shouldIncludeSyntheticRowId(databaseType, primaryKeys, tableType);
+}
+
 export function canEditExistingTableRows(databaseType: DatabaseType | undefined, hiveTableTransactional?: boolean, primaryKeys?: string[]): boolean {
   const tableData = getDatabaseCapability(databaseType).tableData;
   if (tableData.readonly) return false;
@@ -92,6 +116,12 @@ export function canDeleteExistingTdengineRows(databaseType: DatabaseType | undef
 
 export function hiveTablePropertiesIndicateTransactional(result: { rows: readonly (readonly unknown[])[] }): boolean {
   return result.rows.some((row) => {
+    if (row.length === 1)
+      return (
+        String(row[0] ?? "")
+          .trim()
+          .toLowerCase() === "true"
+      );
     const name = String(row[0] ?? "")
       .trim()
       .toLowerCase();
@@ -107,23 +137,25 @@ export function usesSyntheticRowIdKey(databaseType: DatabaseType | undefined, pr
   const syntheticKey = getDatabaseCapability(databaseType).syntheticKey;
   if (primaryKeys.length !== 1) return false;
   if (syntheticKey === "oracle-rowid" || syntheticKey === "xugu-rowid") return primaryKeys[0].toUpperCase() === DBX_ROWID_COLUMN;
+  if (syntheticKey === "postgres-ctid") {
+    return primaryKeys[0].toUpperCase() === DBX_ROWID_COLUMN && (!tableType || isKnownPostgresBaseTableType(tableType));
+  }
   return syntheticKey === "neo4j-element-id" && primaryKeys[0] === DBX_NEO4J_ELEMENT_ID_COLUMN;
 }
 
-/**
- * Table-data tabs may start before metadata has populated declared primary keys.
- * Xugu base/partitioned/temp tables can still be addressed safely with ROWID,
- * so request the hidden projection during that cold-cache window as well.
- */
+/** Requests a hidden physical locator only when the backend knows the object type supports it. */
 export function shouldIncludeSyntheticRowId(databaseType: DatabaseType | undefined, primaryKeys: string[], tableType?: string): boolean {
   if (isViewTableType(tableType)) return false;
-  if (getDatabaseCapability(databaseType).syntheticKey === "oracle-rowid" && !isKnownOracleBaseTableType(tableType)) return false;
+  const syntheticKey = getDatabaseCapability(databaseType).syntheticKey;
+  if (syntheticKey === "oracle-rowid" && !isKnownOracleBaseTableType(tableType)) return false;
+  if (syntheticKey === "postgres-ctid" && !isKnownPostgresBaseTableType(tableType)) return false;
   if (usesSyntheticRowIdKey(databaseType, primaryKeys, tableType)) return true;
-  return databaseType === "xugu" && primaryKeys.length === 0;
+  return (databaseType === "xugu" || syntheticKey === "postgres-ctid") && primaryKeys.length === 0;
 }
 
 export function isHiddenGridColumn(databaseType: DatabaseType | undefined, column: string, primaryKeys: string[], tableType?: string): boolean {
   if (databaseType === "neo4j" && column === DBX_NEO4J_ELEMENT_ID_COLUMN) return true;
+  if (databaseType === "postgres" && isKnownPostgresBaseTableType(tableType) && column.toUpperCase() === DBX_ROWID_COLUMN) return true;
   // Xugu may inject ROWID before table metadata finishes loading. Keep this
   // internal projection hidden even after the real primary keys arrive.
   if (databaseType === "xugu" && !isViewTableType(tableType) && column.toUpperCase() === DBX_ROWID_COLUMN) return true;
@@ -142,4 +174,50 @@ export function isClickHouseExistingRowReadonlyColumn(databaseType: DatabaseType
   if (primaryKeys.some((key) => key.toLowerCase() === column.toLowerCase())) return true;
   const columnInfo = columns.find((info) => info.name.toLowerCase() === column.toLowerCase());
   return /\bpartition_key\b/i.test(columnInfo?.extra ?? "");
+}
+
+/**
+ * Describe flags the Salesforce driver packs into `ColumnInfo.extra`
+ * (see `parse_describe_columns` in crates/dbx-drivers/src/db/salesforce_driver.rs).
+ * `relationshipName` / `referenceTo` also live there but are consumed by SOQL
+ * completion instead (`soqlFieldFromColumnInfo`).
+ */
+export interface SalesforceColumnFlags {
+  updateable?: boolean;
+  createable?: boolean;
+  custom?: boolean;
+  label?: string;
+}
+
+export function parseSalesforceColumnExtra(extra?: string | null): SalesforceColumnFlags | null {
+  if (!extra) return null;
+  try {
+    const parsed: unknown = JSON.parse(extra);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as SalesforceColumnFlags) : null;
+  } catch {
+    return null;
+  }
+}
+
+function findColumnInfoByName(columns: ColumnInfo[], column: string): ColumnInfo | undefined {
+  return columns.find((info) => info.name.toLowerCase() === column.toLowerCase());
+}
+
+/**
+ * Existing Salesforce rows: the record `Id` is the identity and never a write
+ * target, and describe reports `updateable: false` for formula, rollup summary,
+ * auto-number and system fields (CreatedDate, CreatedById, LastModifiedDate…).
+ * Missing/unparseable metadata fails open — Salesforce enforces the real rules
+ * server-side and returns a per-record error we surface on the row.
+ */
+export function isSalesforceExistingRowReadonlyColumn(databaseType: DatabaseType | undefined, column: string, primaryKeys: readonly string[], columns: ColumnInfo[] = []): boolean {
+  if (databaseType !== "salesforce") return false;
+  if (primaryKeys.some((key) => key.toLowerCase() === column.toLowerCase())) return true;
+  return parseSalesforceColumnExtra(findColumnInfoByName(columns, column)?.extra)?.updateable === false;
+}
+
+/** New Salesforce rows: fields describe reports as `createable: false` (Id, CreatedDate, …) cannot be set on insert. */
+export function isSalesforceNewRowReadonlyColumn(databaseType: DatabaseType | undefined, column: string, columns: ColumnInfo[] = []): boolean {
+  if (databaseType !== "salesforce") return false;
+  return parseSalesforceColumnExtra(findColumnInfoByName(columns, column)?.extra)?.createable === false;
 }

@@ -32,9 +32,22 @@ impl MqSystemKind {
 /// Capability flags. The frontend reads these to show/hide functionality, and
 /// the adapter computes them from the detected server version so unsupported
 /// features are hidden rather than failing at call time.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MqCapabilities {
+    #[serde(default = "capability_default_true")]
+    pub supports_list_topics: bool,
+    #[serde(default = "capability_default_true")]
+    pub supports_create_topic: bool,
+    #[serde(default = "capability_default_true")]
+    pub supports_delete_topic: bool,
+    #[serde(default = "capability_default_true")]
+    pub supports_topic_stats: bool,
+    #[serde(default = "capability_default_true")]
+    pub supports_broker_admin: bool,
+    #[serde(default = "capability_default_true")]
+    pub supports_producer_listing: bool,
+
     pub supports_tenants: bool,
     pub supports_namespaces: bool,
     pub supports_partitioned_topics: bool,
@@ -79,6 +92,49 @@ pub struct MqCapabilities {
     /// RabbitMQ: cluster overview & node monitoring via the management API.
     #[serde(default)]
     pub supports_cluster_monitoring: bool,
+}
+
+fn capability_default_true() -> bool {
+    true
+}
+
+impl Default for MqCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_list_topics: true,
+            supports_create_topic: true,
+            supports_delete_topic: true,
+            supports_topic_stats: true,
+            supports_broker_admin: true,
+            supports_producer_listing: true,
+            supports_tenants: false,
+            supports_namespaces: false,
+            supports_partitioned_topics: false,
+            supports_subscriptions: false,
+            supports_create_subscription: false,
+            supports_reset_cursor: false,
+            supports_skip_messages: false,
+            supports_clear_backlog: false,
+            supports_peek_messages: false,
+            supports_expire_messages: false,
+            supports_rate_limits: false,
+            supports_backlog_quota: false,
+            supports_retention: false,
+            supports_permissions: false,
+            supports_geo_replication: false,
+            supports_token_management: false,
+            supports_raw_admin_api: false,
+            supports_send_message: false,
+            supports_message_query: false,
+            supports_dlq: false,
+            supports_message_trace: false,
+            supports_exchanges: false,
+            supports_client_connections: false,
+            supports_user_permissions: false,
+            supports_policies: false,
+            supports_cluster_monitoring: false,
+        }
+    }
 }
 
 /// Result of a connectivity test, including the detected server version and how
@@ -378,6 +434,79 @@ pub struct ListTopicsOpts {
     /// Include non-persistent topics in the listing.
     #[serde(default)]
     pub include_non_persistent: bool,
+}
+
+pub const DEFAULT_MQ_LIST_PAGE_SIZE: u32 = 100;
+pub const MAX_MQ_LIST_PAGE_SIZE: u32 = 500;
+
+/// Sort keys shared by the bounded MQ list endpoints. `MessagesReady` is used
+/// by RabbitMQ queues; exchange listings use the default name ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MqListSort {
+    #[default]
+    Name,
+    MessagesReady,
+}
+
+/// One-based request for a bounded MQ list page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqListPageRequest {
+    #[serde(default = "default_mq_list_page")]
+    pub page: u32,
+    #[serde(default = "default_mq_list_page_size")]
+    pub page_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub sort: MqListSort,
+    #[serde(default)]
+    pub sort_descending: bool,
+}
+
+impl Default for MqListPageRequest {
+    fn default() -> Self {
+        Self {
+            page: default_mq_list_page(),
+            page_size: default_mq_list_page_size(),
+            search: None,
+            sort: MqListSort::default(),
+            sort_descending: false,
+        }
+    }
+}
+
+impl MqListPageRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.page == 0 {
+            return Err("page must be at least 1".to_string());
+        }
+        if self.page_size == 0 || self.page_size > MAX_MQ_LIST_PAGE_SIZE {
+            return Err(format!("pageSize must be between 1 and {MAX_MQ_LIST_PAGE_SIZE}"));
+        }
+        Ok(())
+    }
+}
+
+const fn default_mq_list_page() -> u32 {
+    1
+}
+
+const fn default_mq_list_page_size() -> u32 {
+    DEFAULT_MQ_LIST_PAGE_SIZE
+}
+
+/// A bounded list response. `total_count` is the number of rows matching the
+/// request's search filter, not merely the number loaded in this page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MqListPage<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total_count: u64,
+    pub has_more: bool,
 }
 
 /// Aggregated, UI-friendly topic statistics. Parsed from the version-specific
@@ -1158,8 +1287,9 @@ pub struct SendMessageRequest {
 pub struct SendMessageResponse {
     /// Topic the message was written to.
     pub topic: String,
-    /// Partition the message was written to.
-    pub partition: i32,
+    /// Partition the message was written to, when the transport reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
     /// Offset of the produced message.
     pub offset: i64,
     /// Broker-assigned timestamp, if available.
@@ -1170,6 +1300,23 @@ pub struct SendMessageResponse {
 #[cfg(test)]
 mod tests {
     use super::ResetPosition;
+
+    #[test]
+    fn send_result_partition_can_be_unknown_or_known() {
+        for partition in [None, Some(serde_json::Value::Null)] {
+            let mut value = serde_json::json!({ "topic": "events", "offset": 0 });
+            if let Some(partition) = partition {
+                value["partition"] = partition;
+            }
+            let result: super::SendMessageResponse = serde_json::from_value(value).unwrap();
+            assert!(serde_json::to_value(result).unwrap().get("partition").is_none());
+        }
+        let result: super::SendMessageResponse = serde_json::from_value(serde_json::json!({
+            "topic": "events", "offset": 17, "partition": 2
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap()["partition"], 2);
+    }
 
     #[test]
     fn reset_position_deserializes_camel_case_variant_fields() {

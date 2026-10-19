@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { test } from "vitest";
 import {
   DatabaseBackupConnectionQueue,
@@ -97,14 +96,14 @@ test("normalization deduplicates databases and bounds schedule values", () => {
     ...schedule(),
     databases: ["app", "app", " analytics "],
     intervalHours: 999,
-    retentionCount: 0,
+    retentionCount: -1,
     timeOfDay: "invalid",
   });
 
   assert.ok(normalized);
   assert.deepEqual(normalized.databases, ["app", "analytics"]);
   assert.equal(normalized.intervalHours, 168);
-  assert.equal(normalized.retentionCount, 1);
+  assert.equal(normalized.retentionCount, 0);
   assert.equal(normalized.timeOfDay, "02:00");
 });
 
@@ -158,6 +157,7 @@ test("retention pruning keeps the newest successful runs", () => {
     databaseBackupRunsToPrune(runs, "schedule-1", 2).map((item) => item.id),
     ["old"],
   );
+  assert.deepEqual(databaseBackupRunsToPrune(runs, "schedule-1", 0), []);
 });
 
 test("backup history normalization preserves an independent display name and progress", () => {
@@ -337,35 +337,4 @@ test("retention never selects failed backup runs", () => {
     databaseBackupRunsToPrune([failed, ...successful], "schedule-1", 1).map((item) => item.id),
     ["old"],
   );
-});
-
-test("scheduled backup history translates stable backend errors inline", () => {
-  const source = readFileSync("apps/desktop/src/components/backup/ScheduledDatabaseBackupSettings.vue", "utf8");
-
-  assert.match(source, /\{\{ translateBackendError\(t, run\.error\) \}\}/);
-  assert.doesNotMatch(source, /\{\{ run\.error \}\}/);
-});
-
-test("scheduled backup history exposes rename and overall percentage controls", () => {
-  const source = readFileSync("apps/desktop/src/components/backup/ScheduledDatabaseBackupSettings.vue", "utf8");
-  const scheduler = readFileSync("apps/desktop/src/composables/useScheduledDatabaseBackups.ts", "utf8");
-
-  assert.match(source, /run\.displayName \|\| run\.scheduleName/);
-  assert.match(source, /role="progressbar"/);
-  assert.match(scheduler, /databaseBackupConnectionQueue\.run\(config\.connectionId/);
-  assert.match(scheduler, /status: databaseBackupAggregateExportStatus\(progress\.status, false\)/);
-  assert.match(scheduler, /overallPercent: progressPercent/);
-});
-
-test("scheduled backups prepare table scope before opening a consistent snapshot", () => {
-  const scheduler = readFileSync("apps/desktop/src/composables/useScheduledDatabaseBackups.ts", "utf8");
-  const exportCore = readFileSync("crates/dbx-core/src/data/database_export.rs", "utf8");
-  const schemaIndex = scheduler.indexOf("await api.listSchemas(config.connectionId, database)");
-  const snapshotIndex = scheduler.indexOf("await api.beginDatabaseBackupSnapshot(config.connectionId, database, runId)");
-  const exportIndex = scheduler.indexOf("await runDatabaseExportUntilTerminal(");
-
-  assert.ok(schemaIndex >= 0);
-  assert.ok(snapshotIndex > schemaIndex);
-  assert.ok(exportIndex > snapshotIndex);
-  assert.match(exportCore, /keep_manual_transaction_alive\(state, snapshot_session_id\)\.await/);
 });

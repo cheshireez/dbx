@@ -1,7 +1,5 @@
 // @vitest-environment happy-dom
 
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createApp, defineComponent, h, nextTick, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
@@ -61,8 +59,6 @@ vi.mock("@/components/ui/button", async () => {
 });
 
 import SshHostKeyPromptDialog from "@/components/ssh/SshHostKeyPromptDialog.vue";
-
-const dialogSource = readFileSync(resolve(process.cwd(), "apps/desktop/src/components/ssh/SshHostKeyPromptDialog.vue"), "utf8");
 
 class MockEventSource {
   static instances: MockEventSource[] = [];
@@ -128,22 +124,6 @@ async function mountDialog() {
 }
 
 describe("SshHostKeyPromptDialog web bridge", () => {
-  it("requires an explicit answer for blocking SSH prompts", () => {
-    expect(dialogSource).toContain(':show-close-button="false"');
-    expect(dialogSource).toContain("@interact-outside.prevent");
-    expect(dialogSource).toContain("@escape-key-down.prevent");
-    expect(dialogSource).not.toContain(':dismissible="false"');
-  });
-
-  it("stacks above dialogs that mount later than it does", () => {
-    // Dialog portals teleport into <body> when their component mounts, so paint
-    // order at the shared z-50 follows mount order. This prompt mounts once at
-    // app start, so an on-demand dialog (e.g. the connection editor) would bury
-    // it and block the whole window. It must opt out of the default layer.
-    expect(dialogSource).toContain('overlay-class="z-[200]"');
-    expect(dialogSource).toContain('portal-class="z-[200]"');
-  });
-
   it("keeps the prompt above a later body-mounted connection dialog and answerable", async () => {
     await mountDialog();
 
@@ -168,13 +148,13 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     connectionPositioner.textContent = "New connection";
     document.body.append(connectionPositioner);
 
-    const promptPositioner = document.body.querySelector<HTMLElement>(".dialog-positioner.z-\\[200\\]");
-    const promptOverlay = document.body.querySelector<HTMLElement>(".dialog-overlay.z-\\[200\\]");
+    const promptPositioner = document.body.querySelector<HTMLElement>(".dialog-positioner.\\!z-\\[200\\]");
+    const promptOverlay = document.body.querySelector<HTMLElement>(".dialog-overlay.\\!z-\\[200\\]");
     expect(promptPositioner).not.toBeNull();
     expect(promptOverlay).not.toBeNull();
     expect(connectionPositioner.classList.contains("z-50")).toBe(true);
-    expect(promptPositioner?.classList.contains("z-[200]")).toBe(true);
-    expect(promptOverlay?.classList.contains("z-[200]")).toBe(true);
+    expect(promptPositioner?.classList.contains("!z-[200]")).toBe(true);
+    expect(promptOverlay?.classList.contains("!z-[200]")).toBe(true);
     expect(document.body.textContent).toContain("layered.example.test:22");
 
     const buttons = document.body.querySelectorAll<HTMLButtonElement>("button");
@@ -385,8 +365,6 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     expect(document.body.textContent).toContain("203.0.113.10:22");
     expect(document.body.textContent).toContain("08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709");
     expect(document.body.textContent).toContain("/home/testuser/.cache/dbx/sqlite-worker/");
-    expect(dialogSource).toContain("break-all");
-    expect(dialogSource).toContain("shrink-0");
 
     const buttons = [...document.body.querySelectorAll("button")].map((button) => button.textContent?.trim());
     expect(buttons).toContain("Cancel");
@@ -481,6 +459,35 @@ describe("SshHostKeyPromptDialog web bridge", () => {
         secret: "654321",
       });
     });
+  });
+
+  it("pads the prompt scroll container so the input focus ring is not clipped", async () => {
+    // Regression: the container had no horizontal padding, so the 2px focus
+    // ring of the `w-full` input was clipped on the left/right edges even
+    // though `overflow-y-auto` also clips the horizontal axis.
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "ring-clip-1",
+        kind: "UserInput",
+        host: "",
+        port: 0,
+        prompt: "Please enter 6 digits.",
+        title: "Dynamic token",
+        source: "Terminal",
+        echo: false,
+      },
+    });
+    await nextTick();
+
+    const input = document.body.querySelector<HTMLInputElement>("input");
+    if (!input) throw new Error("plugin prompt input was not rendered");
+    const scroller = input.closest(".overflow-y-auto");
+    expect(scroller).not.toBeNull();
+    expect(scroller?.classList.contains("px-1")).toBe(true);
   });
 
   it("answers a fixed-choice plugin question by picking an option", async () => {

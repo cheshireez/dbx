@@ -14,6 +14,7 @@ use crate::models::connection::DatabaseType;
 
 pub const DEFAULT_SQL_FILE_UPLOAD_MAX_MB: u32 = 200;
 pub const MAX_SQL_FILE_UPLOAD_MAX_MB: u32 = 4096;
+const SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS: usize = 100;
 
 pub fn clamp_sql_file_upload_max_mb(value: u32) -> u32 {
     value.clamp(1, MAX_SQL_FILE_UPLOAD_MAX_MB)
@@ -24,8 +25,9 @@ use crate::query::{
     QueryExecutionOptions,
 };
 use crate::sql::{
-    optimize_sql_file_import_statements, prepare_sql_file_statement, split_sql_batches, statement_summary,
-    SqlFileImportStatement, SqlFileImportStatementKind, SqlFilePhase, SqlFileProgress, SqlFileRequest,
+    optimize_sql_file_import_statements, optimize_sql_file_import_statements_with_max_insert_batch_statements,
+    prepare_sql_file_statement, split_sql_batches, starts_with_sqlserver_module_ddl, statement_summary,
+    SqlFileEncoding, SqlFileImportStatement, SqlFileImportStatementKind, SqlFilePhase, SqlFileProgress, SqlFileRequest,
     SqlFileStatementAction, SqlFileStatus, SqlParsingOptions, SqlStatementSplitter, SqlStatementWithControl,
 };
 use crate::types::QueryResult;
@@ -33,6 +35,22 @@ use crate::types::QueryResult;
 mod table_restore;
 pub use table_restore::SqlFileTable;
 use table_restore::TableRestoreFilter;
+
+mod failure_log;
+mod failure_log_derive;
+pub use failure_log::{
+    prune_sql_file_failure_logs, prune_sql_file_failure_logs_with_limits, start_sql_file_failure_log,
+    SqlFileFailureLogFileInfo, SqlFileFailureLogHandle, SqlFileFailureLogInfo, SqlFileFailureLogLimits,
+    SqlFileFailureLogMeta, SqlFileFailureLogRegistry, SqlFileFailureLogRunCounters, SqlFileFailureLogStatus,
+    SqlFileFailureLogStatusProbe, SqlFileFailureLogSummary, SQL_FILE_FAILURE_LOG_DIR,
+    SQL_FILE_FAILURE_LOG_MAX_DIR_BYTES, SQL_FILE_FAILURE_LOG_MAX_FILES, SQL_FILE_FAILURE_LOG_MAX_STATEMENT_BYTES,
+    SQL_FILE_FAILURE_LOG_MAX_TOTAL_BYTES,
+};
+pub use failure_log_derive::{
+    export_sql_file_failure_log, sql_file_failure_log_text, SqlFileFailureLogDeriveError,
+    SqlFileFailureLogDeriveSummary, SqlFileFailureLogFormat, SqlFileFailureLogKey,
+    SQL_FILE_FAILURE_LOG_CLIPBOARD_MAX_BYTES,
+};
 
 /// How the database compatibility mode used for SQL statement splitting was
 /// resolved. `Option<String>` cannot express the difference between "this
@@ -86,8 +104,18 @@ struct ControlledSqlFileImportStatement {
     stop_on_error: bool,
 }
 
-const SQL_FILE_READ_CHUNK_BYTES: usize = 256 * 1024;
+pub(crate) const SQL_FILE_READ_CHUNK_BYTES: usize = 256 * 1024;
 const SQL_FILE_STATEMENT_BATCH_SIZE: usize = 256;
+/// Upper bound on how much SQL text may be buffered before a batch is executed.
+///
+/// Dumps that use extended inserts (mysqldump default, ~1 MB per statement) put
+/// hundreds of megabytes into a 256-statement batch, so the statement-count bound
+/// alone both spikes memory and delays the first execution: parsing/planning the
+/// buffered text emits no progress at all, which the UI shows as a frozen import
+/// (dbx#10246).  Flushing on either bound keeps the buffered batch small and keeps
+/// progress events flowing for large files, while tiny statements still batch up to
+/// the statement-count bound so round trips do not increase.
+const SQL_FILE_STATEMENT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SQL_FILE_PREVIEW_ENCODING_SAMPLE_BYTES: usize = 1024 * 1024;
 const SQL_FILE_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -579,7 +607,7 @@ async fn set_relational_constraints_enabled(
         &request.connection_id,
         &request.database,
         sql,
-        None,
+        request.schema.as_deref(),
         Some(token.clone()),
         QueryExecutionOptions::default(),
     )
@@ -594,10 +622,13 @@ async fn sql_file_transaction_schema(state: &AppState, request: &SqlFileRequest)
     let sessions = state.transaction_sessions.read().await;
     let session =
         sessions.get(session_id).ok_or("SQL file transaction session not found; no statements were retried")?;
-    if session.connection_id != request.connection_id || session.database != request.database {
+    if session.connection_id != request.connection_id
+        || session.database != request.database
+        || request.schema.as_ref().is_some_and(|schema| session.schema.as_ref() != Some(schema))
+    {
         return Err("SQL file target does not match its manual transaction".to_string());
     }
-    Ok(session.schema.clone())
+    Ok(request.schema.clone().or_else(|| session.schema.clone()))
 }
 
 async fn with_sql_file_transaction<T>(
@@ -678,6 +709,7 @@ async fn execute_sql_file_content_inner(
         import_target.as_ref().map(|target| target.db_type),
         import_target.as_ref().and_then(|target| target.driver_profile.as_deref()),
         request.txn_session_id.is_some(),
+        None,
     );
     // MySQL-family imports need one pinned connection so `USE` and session
     // state survive across the whole file.
@@ -749,11 +781,42 @@ pub async fn execute_sql_file_paths(
     started_at: Instant,
     emit: impl FnMut(SqlFileProgress),
 ) -> Result<(), String> {
+    execute_sql_file_paths_with_options(state, request, file_paths, token, started_at, false, emit).await
+}
+
+pub async fn execute_sql_file_zip_package_paths(
+    state: &AppState,
+    request: &SqlFileRequest,
+    file_paths: &[&Path],
+    token: CancellationToken,
+    started_at: Instant,
+    emit: impl FnMut(SqlFileProgress),
+) -> Result<(), String> {
+    execute_sql_file_paths_with_options(state, request, file_paths, token, started_at, true, emit).await
+}
+
+async fn execute_sql_file_paths_with_options(
+    state: &AppState,
+    request: &SqlFileRequest,
+    file_paths: &[&Path],
+    token: CancellationToken,
+    started_at: Instant,
+    zip_package: bool,
+    emit: impl FnMut(SqlFileProgress),
+) -> Result<(), String> {
     with_sql_file_transaction(
         state,
         request,
         &token,
-        Box::pin(execute_sql_file_paths_inner(state, request, file_paths, token.clone(), started_at, emit)),
+        Box::pin(execute_sql_file_paths_inner(
+            state,
+            request,
+            file_paths,
+            token.clone(),
+            started_at,
+            zip_package,
+            emit,
+        )),
     )
     .await
 }
@@ -764,6 +827,7 @@ async fn execute_sql_file_paths_inner(
     file_paths: &[&Path],
     token: CancellationToken,
     started_at: Instant,
+    zip_package: bool,
     mut emit: impl FnMut(SqlFileProgress),
 ) -> Result<(), String> {
     if file_paths.is_empty() {
@@ -787,6 +851,7 @@ async fn execute_sql_file_paths_inner(
         })
         .unwrap_or_default();
     let database_type = import_target.as_ref().map(|target| target.db_type);
+    let max_insert_batch_statements = sql_file_import_max_insert_batch_statements(zip_package, database_type);
     let mut progress = SqlFileExecutionProgress::new();
     // Validate the entire dump before any SQL reaches the database. This also
     // identifies view placeholders whose final CREATE VIEW appears later.
@@ -795,7 +860,7 @@ async fn execute_sql_file_paths_inner(
         let Some(selected) = &request.selected_tables else {
             return Ok(None);
         };
-        let (tables, views) = scan_sql_file_tables(file_paths[0], &token).await?;
+        let (tables, views) = scan_sql_file_tables(file_paths[0], &token, request.encoding).await?;
         validate_selected_tables(selected, &tables)?;
         Ok::<_, String>(Some(TableRestoreFilter::with_views(views)))
     }
@@ -846,8 +911,13 @@ async fn execute_sql_file_paths_inner(
     let mut prev_success_count = 0usize;
     let mut prev_failure_count = 0usize;
     let mut prev_affected_rows = 0u64;
+    let mut splitter = zip_package.then(|| StreamingSqlFileSplitter::new(database_type, options, true));
+    let mut pending_statements = Vec::with_capacity(SQL_FILE_STATEMENT_BATCH_SIZE);
     let import_result = async {
         for (file_index, file_path) in file_paths.iter().enumerate() {
+            if !zip_package {
+                splitter = Some(StreamingSqlFileSplitter::new(database_type, options, false));
+            }
             let file_name = file_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
             // Emit a file-boundary progress event so the frontend knows which file is
@@ -868,18 +938,18 @@ async fn execute_sql_file_paths_inner(
                     phase: None,
                     file_index: Some(file_index),
                     file_name: Some(file_name.clone()),
+                    failure_sql: None,
                 });
             }
 
-            let mut splitter = StreamingSqlFileSplitter::new(database_type, options);
-            let mut pending_statements = Vec::with_capacity(SQL_FILE_STATEMENT_BATCH_SIZE);
             let normalize_mysql_binary_literals = import_target.as_ref().is_some_and(|target| {
                 crate::sql::is_mysql_compatible_import_target(&target.db_type, target.driver_profile.as_deref())
             });
-            let mut decoder = match SqlFileStreamDecoder::open_for_target_with_progress(
+            let mut decoder = match SqlFileStreamDecoder::open_for_import(
                 file_path,
+                request.encoding.to_encoding(),
                 normalize_mysql_binary_literals,
-                read_progress.bytes_read.clone(),
+                Some(read_progress.bytes_read.clone()),
             )
             .await
             {
@@ -931,7 +1001,10 @@ async fn execute_sql_file_paths_inner(
                     "",
                     None,
                 ));
-                let mut next_statements = splitter.push_chunk(&chunk);
+                let mut next_statements = splitter
+                    .as_mut()
+                    .expect("splitter is only taken by finish() on the last file, after this loop exits")
+                    .push_chunk(&chunk);
                 if let Some(filter) = restore_filter.as_mut() {
                     if let Err(error) = filter_restore_statements(
                         &mut next_statements,
@@ -948,7 +1021,11 @@ async fn execute_sql_file_paths_inner(
                     }
                 }
                 pending_statements.extend(next_statements);
-                if pending_statements.len() < SQL_FILE_STATEMENT_BATCH_SIZE {
+                // Recomputed from the batch itself (which is emptied by
+                // `execute_sql_file_statement_batch`) so no separate counter can
+                // drift out of sync across files or batches.
+                let buffered_bytes = buffered_statement_bytes(&pending_statements);
+                if !sql_file_statement_batch_is_full(pending_statements.len(), buffered_bytes) {
                     continue;
                 }
                 execute_sql_file_statement_batch(
@@ -957,6 +1034,7 @@ async fn execute_sql_file_paths_inner(
                     &token,
                     started_at,
                     &mut pending_statements,
+                    max_insert_batch_statements,
                     import_target.as_ref(),
                     mysql_executor.as_mut(),
                     &mut progress,
@@ -965,29 +1043,34 @@ async fn execute_sql_file_paths_inner(
                 .await?;
             }
 
-            let mut next_statements = splitter.finish();
-            if let Some(filter) = restore_filter.as_mut() {
-                if let Err(error) = filter_restore_statements(
-                    &mut next_statements,
-                    filter,
-                    request.selected_tables.as_deref().unwrap_or_default(),
-                ) {
-                    emit(sql_file_execution_error_progress(
-                        &request.execution_id,
-                        started_at,
-                        &progress,
-                        error.clone(),
-                    ));
-                    return Err(error);
+            let should_finish_splitter = !zip_package || file_index + 1 == file_count;
+            if should_finish_splitter {
+                let mut next_statements =
+                    splitter.take().expect("splitter is finished at each ordinary file or the last ZIP part").finish();
+                if let Some(filter) = restore_filter.as_mut() {
+                    if let Err(error) = filter_restore_statements(
+                        &mut next_statements,
+                        filter,
+                        request.selected_tables.as_deref().unwrap_or_default(),
+                    ) {
+                        emit(sql_file_execution_error_progress(
+                            &request.execution_id,
+                            started_at,
+                            &progress,
+                            error.clone(),
+                        ));
+                        return Err(error);
+                    }
                 }
+                pending_statements.extend(next_statements);
             }
-            pending_statements.extend(next_statements);
             execute_sql_file_statement_batch(
                 state,
                 request,
                 &token,
                 started_at,
                 &mut pending_statements,
+                max_insert_batch_statements,
                 import_target.as_ref(),
                 mysql_executor.as_mut(),
                 &mut progress,
@@ -1013,6 +1096,7 @@ async fn execute_sql_file_paths_inner(
                     phase: None,
                     file_index: Some(file_index),
                     file_name: Some(file_name),
+                    failure_sql: None,
                 });
                 prev_statement_index = progress.statement_index;
                 prev_success_count = progress.success_count;
@@ -1056,15 +1140,24 @@ async fn execute_sql_file_paths_inner(
 }
 
 pub async fn inspect_sql_file_tables(file_path: &Path) -> Result<Vec<SqlFileTable>, String> {
-    scan_sql_file_tables(file_path, &CancellationToken::new()).await.map(|(tables, _)| tables)
+    inspect_sql_file_tables_with_encoding(file_path, SqlFileEncoding::Auto).await
+}
+
+pub async fn inspect_sql_file_tables_with_encoding(
+    file_path: &Path,
+    encoding: SqlFileEncoding,
+) -> Result<Vec<SqlFileTable>, String> {
+    scan_sql_file_tables(file_path, &CancellationToken::new(), encoding).await.map(|(tables, _)| tables)
 }
 
 async fn scan_sql_file_tables(
     file_path: &Path,
     token: &CancellationToken,
+    encoding: SqlFileEncoding,
 ) -> Result<(Vec<SqlFileTable>, std::collections::BTreeSet<SqlFileTable>), String> {
-    let mut decoder = SqlFileStreamDecoder::open_for_target(file_path, true).await?;
-    let mut splitter = StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible());
+    let mut decoder = SqlFileStreamDecoder::open_for_import(file_path, encoding.to_encoding(), true, None).await?;
+    let mut splitter =
+        StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible(), false);
     let mut scan = TableRestoreFilter::default();
     while let Some(chunk) = decoder.next_chunk().await? {
         if token.is_cancelled() {
@@ -1129,9 +1222,36 @@ fn filter_restore_statements(
 }
 
 pub async fn read_sql_file_preview(file_path: &Path, max_chars: usize) -> Result<String, String> {
-    let mut decoder =
-        SqlFileStreamDecoder::open_with_detection_limit(file_path, Some(SQL_FILE_PREVIEW_ENCODING_SAMPLE_BYTES))
-            .await?;
+    read_sql_file_preview_with_encoding(file_path, max_chars, SqlFileEncoding::Auto).await
+}
+
+pub async fn read_sql_file_preview_with_encoding(
+    file_path: &Path,
+    max_chars: usize,
+    encoding: SqlFileEncoding,
+) -> Result<String, String> {
+    let mut decoder = if encoding == SqlFileEncoding::Auto {
+        SqlFileStreamDecoder::open_with_detection_limit(file_path, Some(SQL_FILE_PREVIEW_ENCODING_SAMPLE_BYTES)).await?
+    } else {
+        SqlFileStreamDecoder::open_for_import(file_path, encoding.to_encoding(), false, None).await?
+    };
+    // Preview may run before a database is selected. Do not apply MySQL syntax
+    // rewriting to valid text (for example PostgreSQL dollar-quoted strings).
+    // Like automatic detection, recover raw mysqldump binary bytes only when
+    // ordinary UTF-8 decoding fails. Reopen so the preview cannot mix original
+    // text with normalized chunks. Honor BOM overrides and never change encoding.
+    let recover_mysql_binary = encoding != SqlFileEncoding::Auto && decoder.encoding() == encoding_rs::UTF_8;
+    match collect_sql_file_preview(&mut decoder, max_chars).await {
+        Err(error) if recover_mysql_binary && error == "Unsupported or invalid SQL file encoding" => {
+            let mut decoder =
+                SqlFileStreamDecoder::open_for_import(file_path, encoding.to_encoding(), true, None).await?;
+            collect_sql_file_preview(&mut decoder, max_chars).await
+        }
+        result => result,
+    }
+}
+
+async fn collect_sql_file_preview(decoder: &mut SqlFileStreamDecoder, max_chars: usize) -> Result<String, String> {
     let mut preview = String::new();
     while preview.chars().count() < max_chars {
         let Some(chunk) = decoder.next_chunk().await? else {
@@ -1142,8 +1262,9 @@ pub async fn read_sql_file_preview(file_path: &Path, max_chars: usize) -> Result
     Ok(preview.chars().take(max_chars).collect())
 }
 
-struct SqlFileStreamDecoder {
+pub(crate) struct SqlFileStreamDecoder {
     reader: SqlFileByteReader,
+    encoding: &'static encoding_rs::Encoding,
     decoder: encoding_rs::Decoder,
     mysql_binary_normalizer: Option<MysqlDumpBinaryLiteralNormalizer>,
     pending_bytes: Vec<u8>,
@@ -1209,6 +1330,21 @@ impl SqlFileByteReader {
     }
 }
 
+/// 嗅探文件开头的字节序标记，存在时返回 BOM 对应的编码与长度。
+///
+/// 表导入显式选择编码时也优先按 BOM 解码：与非流式 `Encoding::decode`
+/// 的行为保持一致，避免显式编码与 BOM 不匹配时把 BOM 字节解成
+/// 垃圾前缀黏在首条语句上。
+async fn detect_file_bom(file_path: &Path) -> Result<(&'static encoding_rs::Encoding, usize), String> {
+    let mut reader = SqlFileByteReader::open(file_path).await?;
+    let mut prefix = [0u8; 3];
+    let prefix_len = reader.read(&mut prefix).await?;
+    match encoding_rs::Encoding::for_bom(&prefix[..prefix_len]) {
+        Some((encoding, bom_len)) => Ok((encoding, bom_len)),
+        None => Ok((encoding_rs::UTF_8, 0)),
+    }
+}
+
 fn is_gzip_sql_file_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -1230,16 +1366,43 @@ impl SqlFileStreamDecoder {
         Self::open_with_options(file_path, detection_limit, false, None).await
     }
 
+    #[cfg(test)]
     async fn open_for_target(file_path: &Path, normalize_mysql_binary_literals: bool) -> Result<Self, String> {
         Self::open_with_options(file_path, None, normalize_mysql_binary_literals, None).await
     }
 
+    #[cfg(test)]
     async fn open_for_target_with_progress(
         file_path: &Path,
         normalize_mysql_binary_literals: bool,
         bytes_read: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         Self::open_with_options(file_path, None, normalize_mysql_binary_literals, Some(bytes_read)).await
+    }
+
+    /// 以调用方已经确定的编码打开解码器。
+    ///
+    /// 表导入会先解析用户的编码设置：显式选择了编码时不再自动探测，
+    /// 但文件带 BOM 时仍优先按 BOM 的编码解码并跳过，保持与旧的非流式
+    /// 实现一致的语义。
+    pub(crate) async fn open_for_import(
+        file_path: &Path,
+        encoding: Option<&'static encoding_rs::Encoding>,
+        normalize_mysql_binary_literals: bool,
+        bytes_read: Option<Arc<AtomicU64>>,
+    ) -> Result<Self, String> {
+        let Some(encoding) = encoding else {
+            return Self::open_with_options(file_path, None, normalize_mysql_binary_literals, bytes_read).await;
+        };
+        let (bom_encoding, bom_len) = detect_file_bom(file_path).await?;
+        let (encoding, bom_len) = if bom_len > 0 { (bom_encoding, bom_len) } else { (encoding, 0) };
+        Self::open_with_resolved_encoding(file_path, encoding, bom_len, normalize_mysql_binary_literals, bytes_read)
+            .await
+    }
+
+    /// 解码器实际使用的文本编码（显式指定或自动探测的结果）。
+    pub(crate) fn encoding(&self) -> &'static encoding_rs::Encoding {
+        self.encoding
     }
 
     async fn open_with_options(
@@ -1250,6 +1413,23 @@ impl SqlFileStreamDecoder {
     ) -> Result<Self, String> {
         let (encoding, bom_len, detected_mysql_binary_literals) =
             detect_sql_file_encoding(file_path, detection_limit).await?;
+        Self::open_with_resolved_encoding(
+            file_path,
+            encoding,
+            bom_len,
+            normalize_mysql_binary_literals || detected_mysql_binary_literals,
+            bytes_read,
+        )
+        .await
+    }
+
+    async fn open_with_resolved_encoding(
+        file_path: &Path,
+        encoding: &'static encoding_rs::Encoding,
+        bom_len: usize,
+        normalize_mysql_binary_literals: bool,
+        bytes_read: Option<Arc<AtomicU64>>,
+    ) -> Result<Self, String> {
         let mut reader = SqlFileByteReader::open_with_progress(file_path, bytes_read).await?;
         let mut prefix = [0u8; 3];
         let prefix_len = reader.read(&mut prefix).await?;
@@ -1258,9 +1438,9 @@ impl SqlFileStreamDecoder {
         pending_bytes.reserve(SQL_FILE_READ_CHUNK_BYTES);
         Ok(Self {
             reader,
+            encoding,
             decoder: encoding.new_decoder_without_bom_handling(),
-            mysql_binary_normalizer: (encoding == encoding_rs::UTF_8
-                && (normalize_mysql_binary_literals || detected_mysql_binary_literals))
+            mysql_binary_normalizer: (encoding == encoding_rs::UTF_8 && normalize_mysql_binary_literals)
                 .then(MysqlDumpBinaryLiteralNormalizer::default),
             pending_bytes,
             pending_decoded_bytes: Vec::new(),
@@ -1268,7 +1448,7 @@ impl SqlFileStreamDecoder {
         })
     }
 
-    async fn next_chunk(&mut self) -> Result<Option<String>, String> {
+    pub(crate) async fn next_chunk(&mut self) -> Result<Option<String>, String> {
         if self.reached_eof && self.pending_bytes.is_empty() && self.pending_decoded_bytes.is_empty() {
             return Ok(None);
         }
@@ -1642,15 +1822,35 @@ async fn validate_utf8_with_mysql_binary_literals(
     }
 }
 
-enum StreamingSqlFileSplitter {
+pub(crate) struct StreamingSqlFileSplitter(StreamingSqlFileSplitterKind);
+
+enum StreamingSqlFileSplitterKind {
     Statements(SqlStatementSplitter),
     SqlServerBatches(SqlServerBatchSplitter),
 }
 
 impl StreamingSqlFileSplitter {
-    fn new(db_type: Option<DatabaseType>, options: SqlParsingOptions) -> Self {
+    pub(crate) fn new(
+        db_type: Option<DatabaseType>,
+        options: SqlParsingOptions,
+        flush_sqlserver_semicolons: bool,
+    ) -> Self {
+        Self(StreamingSqlFileSplitterKind::new(db_type, options, flush_sqlserver_semicolons))
+    }
+
+    pub(crate) fn push_chunk(&mut self, chunk: &str) -> Vec<SqlStatementWithControl> {
+        self.0.push_chunk(chunk)
+    }
+
+    pub(crate) fn finish(self) -> Vec<SqlStatementWithControl> {
+        self.0.finish()
+    }
+}
+
+impl StreamingSqlFileSplitterKind {
+    fn new(db_type: Option<DatabaseType>, options: SqlParsingOptions, flush_sqlserver_semicolons: bool) -> Self {
         if db_type == Some(DatabaseType::SqlServer) {
-            Self::SqlServerBatches(SqlServerBatchSplitter::default())
+            Self::SqlServerBatches(SqlServerBatchSplitter::new(flush_sqlserver_semicolons))
         } else {
             Self::Statements(SqlStatementSplitter::with_options(options))
         }
@@ -1677,13 +1877,40 @@ impl StreamingSqlFileSplitter {
     }
 }
 
-#[derive(Default)]
 struct SqlServerBatchSplitter {
     batch: String,
     partial_line: String,
+    lexical_state: SqlServerLexicalState,
+    flush_semicolons: bool,
+}
+
+impl Default for SqlServerBatchSplitter {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+enum SqlServerLexicalState {
+    #[default]
+    Normal,
+    SingleQuote,
+    DoubleQuote,
+    BracketIdentifier,
+    LineComment,
+    BlockComment,
 }
 
 impl SqlServerBatchSplitter {
+    fn new(flush_semicolons: bool) -> Self {
+        Self {
+            batch: String::new(),
+            partial_line: String::new(),
+            lexical_state: SqlServerLexicalState::default(),
+            flush_semicolons,
+        }
+    }
+
     fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
         self.partial_line.push_str(chunk);
         let mut batches = Vec::new();
@@ -1706,11 +1933,62 @@ impl SqlServerBatchSplitter {
     }
 
     fn push_line(&mut self, line: &str, batches: &mut Vec<String>) {
-        if line.trim().eq_ignore_ascii_case("go") {
+        if matches!(self.lexical_state, SqlServerLexicalState::Normal) && line.trim().eq_ignore_ascii_case("go") {
             self.push_batch(batches);
-        } else {
-            self.batch.push_str(line);
-            self.batch.push('\n');
+            return;
+        }
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            self.batch.push(ch);
+            match self.lexical_state {
+                SqlServerLexicalState::Normal => match ch {
+                    '\'' => self.lexical_state = SqlServerLexicalState::SingleQuote,
+                    '"' => self.lexical_state = SqlServerLexicalState::DoubleQuote,
+                    '[' => self.lexical_state = SqlServerLexicalState::BracketIdentifier,
+                    '-' if chars.peek() == Some(&'-') => {
+                        self.batch.push(chars.next().unwrap());
+                        self.lexical_state = SqlServerLexicalState::LineComment;
+                    }
+                    '/' if chars.peek() == Some(&'*') => {
+                        self.batch.push(chars.next().unwrap());
+                        self.lexical_state = SqlServerLexicalState::BlockComment;
+                    }
+                    ';' if self.flush_semicolons && !starts_with_sqlserver_module_ddl(&self.batch) => {
+                        self.push_batch(batches)
+                    }
+                    _ => {}
+                },
+                SqlServerLexicalState::SingleQuote if ch == '\'' => {
+                    if chars.peek() == Some(&'\'') {
+                        self.batch.push(chars.next().unwrap());
+                    } else {
+                        self.lexical_state = SqlServerLexicalState::Normal;
+                    }
+                }
+                SqlServerLexicalState::DoubleQuote if ch == '"' => {
+                    if chars.peek() == Some(&'"') {
+                        self.batch.push(chars.next().unwrap());
+                    } else {
+                        self.lexical_state = SqlServerLexicalState::Normal;
+                    }
+                }
+                SqlServerLexicalState::BracketIdentifier if ch == ']' => {
+                    if chars.peek() == Some(&']') {
+                        self.batch.push(chars.next().unwrap());
+                    } else {
+                        self.lexical_state = SqlServerLexicalState::Normal;
+                    }
+                }
+                SqlServerLexicalState::BlockComment if ch == '*' && chars.peek() == Some(&'/') => {
+                    self.batch.push(chars.next().unwrap());
+                    self.lexical_state = SqlServerLexicalState::Normal;
+                }
+                _ => {}
+            }
+        }
+        self.batch.push('\n');
+        if matches!(self.lexical_state, SqlServerLexicalState::LineComment) {
+            self.lexical_state = SqlServerLexicalState::Normal;
         }
     }
 
@@ -1720,6 +1998,7 @@ impl SqlServerBatchSplitter {
             batches.push(batch.to_string());
         }
         self.batch.clear();
+        self.lexical_state = SqlServerLexicalState::Normal;
     }
 }
 
@@ -1730,6 +2009,7 @@ async fn execute_sql_file_statement_batch(
     token: &CancellationToken,
     started_at: Instant,
     statements: &mut Vec<SqlStatementWithControl>,
+    max_insert_batch_statements: Option<usize>,
     import_target: Option<&SqlFileImportTarget>,
     mysql_executor: Option<&mut MySqlSqlFileExecutor>,
     progress: &mut SqlFileExecutionProgress,
@@ -1744,6 +2024,7 @@ async fn execute_sql_file_statement_batch(
         import_target.map(|target| target.db_type),
         import_target.and_then(|target| target.driver_profile.as_deref()),
         request.txn_session_id.is_some(),
+        max_insert_batch_statements,
     );
     execute_planned_statements_with_progress(
         state,
@@ -1809,14 +2090,31 @@ fn split_sql_file_import_statements_with_control(
     statements
 }
 
+/// A batch is ready for execution as soon as either the statement-count bound or
+/// the buffered-bytes bound is reached.  `statement_bytes` only needs to be a
+/// proxy for the memory the batch pins, so the SQL text length is enough.
+fn sql_file_statement_batch_is_full(statement_count: usize, statement_bytes: usize) -> bool {
+    statement_count >= SQL_FILE_STATEMENT_BATCH_SIZE || statement_bytes >= SQL_FILE_STATEMENT_BATCH_MAX_BYTES
+}
+
+fn buffered_statement_bytes(statements: &[SqlStatementWithControl]) -> usize {
+    statements.iter().map(|statement| statement.sql.len()).sum()
+}
+
 fn plan_sql_file_statements(
     statements: &[SqlStatementWithControl],
     db_type: Option<DatabaseType>,
     driver_profile: Option<&str>,
     manual: bool,
+    max_insert_batch_statements: Option<usize>,
 ) -> Vec<ControlledSqlFileImportStatement> {
     if !manual {
-        return optimize_controlled_sql_file_import_statements(statements, db_type, driver_profile);
+        return optimize_controlled_sql_file_import_statements(
+            statements,
+            db_type,
+            driver_profile,
+            max_insert_batch_statements,
+        );
     }
     // Preserve each statement and its error boundary. The normal import path
     // may merge INSERTs and retry them individually, which is not valid after
@@ -1824,17 +2122,44 @@ fn plan_sql_file_statements(
     statements
         .iter()
         .flat_map(|statement| {
-            optimize_sql_file_import_statements(std::slice::from_ref(&statement.sql), db_type, driver_profile)
-                .into_iter()
-                .map(|statement| ControlledSqlFileImportStatement { statement, stop_on_error: true })
+            optimize_sql_file_import_statements_for_batch(
+                std::slice::from_ref(&statement.sql),
+                db_type,
+                driver_profile,
+                max_insert_batch_statements,
+            )
+            .into_iter()
+            .map(|statement| ControlledSqlFileImportStatement { statement, stop_on_error: true })
         })
         .collect()
+}
+
+fn sql_file_import_max_insert_batch_statements(zip_package: bool, db_type: Option<DatabaseType>) -> Option<usize> {
+    (zip_package && db_type == Some(DatabaseType::SqlServer)).then_some(SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS)
+}
+
+fn optimize_sql_file_import_statements_for_batch(
+    sql: &[String],
+    db_type: Option<DatabaseType>,
+    driver_profile: Option<&str>,
+    max_insert_batch_statements: Option<usize>,
+) -> Vec<SqlFileImportStatement> {
+    match max_insert_batch_statements {
+        Some(max_insert_batch_statements) => optimize_sql_file_import_statements_with_max_insert_batch_statements(
+            sql,
+            db_type,
+            driver_profile,
+            max_insert_batch_statements,
+        ),
+        None => optimize_sql_file_import_statements(sql, db_type, driver_profile),
+    }
 }
 
 fn optimize_controlled_sql_file_import_statements(
     statements: &[SqlStatementWithControl],
     db_type: Option<DatabaseType>,
     driver_profile: Option<&str>,
+    max_insert_batch_statements: Option<usize>,
 ) -> Vec<ControlledSqlFileImportStatement> {
     let mut controlled = Vec::new();
     let mut start = 0;
@@ -1846,7 +2171,7 @@ fn optimize_controlled_sql_file_import_statements(
         }
         let sql = statements[start..end].iter().map(|statement| statement.sql.clone()).collect::<Vec<_>>();
         controlled.extend(
-            optimize_sql_file_import_statements(&sql, db_type, driver_profile)
+            optimize_sql_file_import_statements_for_batch(&sql, db_type, driver_profile, max_insert_batch_statements)
                 .into_iter()
                 .map(|statement| ControlledSqlFileImportStatement { statement, stop_on_error }),
         );
@@ -1882,6 +2207,7 @@ pub fn sql_file_progress(
         phase: None,
         file_index: None,
         file_name: None,
+        failure_sql: None,
     }
 }
 
@@ -2319,6 +2645,7 @@ async fn execute_statement_with_progress(
                 *failure_count,
                 *affected_rows,
                 &summary,
+                &statement.sql,
                 error,
             );
 
@@ -2412,6 +2739,7 @@ async fn execute_merged_statement_fallback_with_progress(
                     *failure_count,
                     *affected_rows,
                     &summary,
+                    source_sql,
                     error,
                 );
 
@@ -2486,7 +2814,7 @@ async fn execute_sql_file_statement(
         &request.connection_id,
         &request.database,
         sql,
-        None,
+        request.schema.as_deref(),
         Some(child_token),
         QueryExecutionOptions { execution_id: Some(execution_id), timeout_secs, ..Default::default() },
     )
@@ -2511,6 +2839,7 @@ fn statement_error_decision(
     failure_count: usize,
     affected_rows: u64,
     summary: &str,
+    statement_sql: &str,
     error: String,
 ) -> StatementErrorDecision {
     if token.is_cancelled() {
@@ -2532,7 +2861,7 @@ fn statement_error_decision(
     }
 
     let failure_count = failure_count + 1;
-    let statement_failed = sql_file_progress(
+    let mut statement_failed = sql_file_progress(
         execution_id,
         SqlFileStatus::StatementFailed,
         statement_index,
@@ -2543,6 +2872,9 @@ fn statement_error_decision(
         summary,
         Some(error.clone()),
     );
+    // The full source statement rides along for the backend failure log (the
+    // field is skipped by serde, so the frontend never receives it).
+    statement_failed.failure_sql = Some(statement_sql.to_string());
 
     if continue_on_error {
         return StatementErrorDecision { progress: vec![statement_failed], failure_count, result: Ok(false) };
@@ -2579,9 +2911,9 @@ mod tests {
             Some(DatabaseType::Postgres),
             None,
         );
-        let optimized = plan_sql_file_statements(&statements, Some(DatabaseType::Postgres), None, false);
+        let optimized = plan_sql_file_statements(&statements, Some(DatabaseType::Postgres), None, false, None);
         assert_eq!(optimized.len(), 1);
-        let manual = plan_sql_file_statements(&statements, Some(DatabaseType::Postgres), None, true);
+        let manual = plan_sql_file_statements(&statements, Some(DatabaseType::Postgres), None, true, None);
         assert_eq!(manual.len(), 2);
         assert!(manual.iter().all(|item| item.stop_on_error && item.statement.source_statement_count == 1));
         assert_eq!(manual[0].statement.sql, statements[0].sql);
@@ -2591,18 +2923,21 @@ mod tests {
     #[tokio::test]
     async fn manual_file_missing_session_never_falls_back_to_ordinary_execution() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::open(&directory.path().join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let request = SqlFileRequest {
             txn_session_id: Some("expired-session".to_string()),
             execution_id: "file-missing-session".to_string(),
             connection_id: "unconfigured".to_string(),
             database: String::new(),
+            schema: None,
             file_path: String::new(),
             continue_on_error: false,
             selected_tables: None,
             part_cooldown_ms: 0,
             skip_relational_constraints: false,
+            failure_log_enabled: true,
+            encoding: Default::default(),
         };
         let mut events = Vec::new();
         let error = execute_sql_file_content(
@@ -2671,6 +3006,69 @@ mod tests {
         }
     }
 
+    /// A batch must also be bounded by how many bytes are buffered, not only by how
+    /// many statements it holds: extended-insert dumps (mysqldump default, ~1 MB per
+    /// INSERT) otherwise buffer hundreds of megabytes before the first statement runs,
+    /// and planning that buffer emits no progress at all (dbx#10246).
+    #[test]
+    fn extended_insert_dumps_flush_batches_by_buffered_bytes() {
+        const ROWS_PER_STATEMENT: usize = 1_000;
+        const STATEMENTS: usize = 24;
+        let payload = "x".repeat(900);
+        let mut dump = String::new();
+        for statement_index in 0..STATEMENTS {
+            dump.push_str("INSERT INTO t (id, payload) VALUES ");
+            for row_index in 0..ROWS_PER_STATEMENT {
+                if row_index > 0 {
+                    dump.push(',');
+                }
+                dump.push_str(&format!("({},'{payload}')", statement_index * ROWS_PER_STATEMENT + row_index));
+            }
+            dump.push_str(";\n");
+        }
+        assert!(dump.len() > SQL_FILE_STATEMENT_BATCH_MAX_BYTES * 2, "the dump must exceed the byte bound");
+
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible(), false);
+        let mut pending: Vec<SqlStatementWithControl> = Vec::new();
+        let mut batches: Vec<(usize, usize)> = Vec::new();
+        let mut largest_statement = 0usize;
+        for chunk in dump.as_bytes().chunks(SQL_FILE_READ_CHUNK_BYTES) {
+            let next = splitter.push_chunk(std::str::from_utf8(chunk).unwrap());
+            largest_statement = largest_statement.max(buffered_statement_bytes(&next));
+            pending.extend(next);
+            let bytes = buffered_statement_bytes(&pending);
+            if sql_file_statement_batch_is_full(pending.len(), bytes) {
+                batches.push((pending.len(), bytes));
+                pending.clear();
+            }
+        }
+        pending.extend(splitter.finish());
+        largest_statement = largest_statement.max(buffered_statement_bytes(&pending));
+        batches.push((pending.len(), buffered_statement_bytes(&pending)));
+
+        assert_eq!(
+            batches.iter().map(|(count, _)| count).sum::<usize>(),
+            STATEMENTS,
+            "every statement must still be executed exactly once"
+        );
+        assert!(batches.len() > 1, "an extended-insert dump must not be buffered as a single batch");
+        assert!(batches[0].0 < STATEMENTS, "the first batch must not be the whole file");
+        assert!(largest_statement > 0);
+        assert!(
+            batches.iter().all(|(_, bytes)| *bytes <= SQL_FILE_STATEMENT_BATCH_MAX_BYTES + largest_statement),
+            "a batch may only overshoot the bound by the one statement that crossed it: {batches:?}"
+        );
+    }
+
+    #[test]
+    fn small_statement_dumps_keep_batching_up_to_the_statement_count_bound() {
+        assert!(!sql_file_statement_batch_is_full(SQL_FILE_STATEMENT_BATCH_SIZE - 1, 4 * 1024));
+        assert!(sql_file_statement_batch_is_full(SQL_FILE_STATEMENT_BATCH_SIZE, 4 * 1024));
+        assert!(!sql_file_statement_batch_is_full(1, SQL_FILE_STATEMENT_BATCH_MAX_BYTES - 1));
+        assert!(sql_file_statement_batch_is_full(1, SQL_FILE_STATEMENT_BATCH_MAX_BYTES));
+    }
+
     #[test]
     fn table_restore_stream_filters_each_statement_once_across_chunks() {
         let selected = [
@@ -2678,7 +3076,7 @@ mod tests {
             SqlFileTable { database: Some("second".to_string()), name: "b".to_string() },
         ];
         let mut splitter =
-            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible());
+            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible(), false);
         let mut filter = TableRestoreFilter::default();
         let mut statements = Vec::new();
         for chunk in ["INSERT INTO a VALUES (1); USE second;", "INSERT INTO b VALUES (2); INSERT INTO a VALUES (3);"] {
@@ -2742,6 +3140,7 @@ mod tests {
             phase: None,
             file_index: None,
             file_name: None,
+            failure_sql: None,
         }
     }
 
@@ -2871,7 +3270,7 @@ mod tests {
     async fn file_progress_executor_preserves_success_cancellation_and_failure() {
         let directory = std::env::temp_dir().join(format!("dbx-file-progress-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        let storage = crate::storage::Storage::open(&directory.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         let comments = "-- no database operation\n".repeat(40_000).into_bytes();
         for (bytes, cancel, terminal) in [
@@ -2887,11 +3286,14 @@ mod tests {
                 execution_id: "file-progress".to_string(),
                 connection_id: "unconfigured".to_string(),
                 database: String::new(),
+                schema: None,
                 file_path: path.to_string_lossy().to_string(),
                 continue_on_error: false,
                 selected_tables: None,
                 part_cooldown_ms: 0,
                 skip_relational_constraints: false,
+                failure_log_enabled: true,
+                encoding: Default::default(),
             };
             let token = CancellationToken::new();
             let mut events = Vec::new();
@@ -3022,6 +3424,137 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_multifile_import_does_not_share_splitter_state() {
+        let mut first_file =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+        assert!(first_file.push_chunk("INSERT INTO dbo.items VALUES (N'partial").is_empty());
+        assert_eq!(
+            first_file.finish().into_iter().map(|statement| statement.sql).collect::<Vec<_>>(),
+            vec!["INSERT INTO dbo.items VALUES (N'partial"]
+        );
+
+        let mut second_file =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+        assert!(second_file.push_chunk("SELECT 2;\n").is_empty());
+        assert_eq!(
+            second_file.finish().into_iter().map(|statement| statement.sql).collect::<Vec<_>>(),
+            vec!["SELECT 2;"]
+        );
+    }
+
+    #[test]
+    fn sqlserver_zip_insert_cap_does_not_change_postgres_default_merge() {
+        let statements =
+            vec!["INSERT INTO items (id) VALUES (1);".to_string(), "INSERT INTO items (id) VALUES (2);".to_string()];
+
+        assert_eq!(sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::Postgres)), None);
+        assert_eq!(sql_file_import_max_insert_batch_statements(false, Some(DatabaseType::SqlServer)), None);
+        assert_eq!(
+            sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::SqlServer)),
+            Some(SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS)
+        );
+
+        let postgres =
+            optimize_sql_file_import_statements_for_batch(&statements, Some(DatabaseType::Postgres), None, None);
+        let sqlserver_zip = optimize_sql_file_import_statements_for_batch(
+            &statements,
+            Some(DatabaseType::SqlServer),
+            None,
+            sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::SqlServer)),
+        );
+
+        assert_eq!(postgres.len(), 1);
+        assert_eq!(postgres[0].source_statement_count, 2);
+        assert_eq!(sqlserver_zip.len(), 1);
+        assert_eq!(sqlserver_zip[0].source_statement_count, 2);
+    }
+
+    #[test]
+    fn sqlserver_zip_insert_cap_still_bounds_very_large_merges() {
+        let statements: Vec<String> = (0..(SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS * 2))
+            .map(|id| format!("INSERT INTO items (id) VALUES ({id});"))
+            .collect();
+
+        let sqlserver_zip = optimize_sql_file_import_statements_for_batch(
+            &statements,
+            Some(DatabaseType::SqlServer),
+            None,
+            sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::SqlServer)),
+        );
+
+        assert_eq!(sqlserver_zip.len(), 2);
+        assert!(sqlserver_zip
+            .iter()
+            .all(|statement| statement.source_statement_count == SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS));
+    }
+
+    #[test]
+    fn streaming_sqlserver_splitter_emits_semicolon_terminated_inserts_without_go() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
+        let statements = splitter
+            .push_chunk("INSERT INTO dbo.items VALUES (1);\nINSERT INTO dbo.items VALUES (2);\n")
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(statements, vec!["INSERT INTO dbo.items VALUES (1);", "INSERT INTO dbo.items VALUES (2);"]);
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn streaming_sqlserver_splitter_ignores_semicolons_inside_literals_and_comments() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
+        let statements = splitter
+            .push_chunk("INSERT INTO dbo.items VALUES (N'one; two', [a;]); -- trailing ;\n/* block ; comment */ INSERT INTO dbo.items VALUES (2);\n")
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO dbo.items VALUES (N'one; two', [a;]);",
+                "-- trailing ;\n/* block ; comment */ INSERT INTO dbo.items VALUES (2);"
+            ]
+        );
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn streaming_sqlserver_splitter_keeps_split_json_literal_across_parts() {
+        let part_one = "INSERT INTO [dbo].[VersionValue] ([value]) VALUES (N'{\"materialOrSymbolMate";
+        let part_two = "rialId\":\"9625a891-3682-4151-acdb-6480db860033\",\"label\":\"B\\\\u1ebb ch\\\\u00e2n/Th\\\\u1eb3ng/\",\"quote\":\"it''s valid\"}');\n";
+        let expected = format!("{part_one}{part_two}").trim().to_string();
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
+
+        assert!(splitter.push_chunk(part_one).is_empty());
+        let statements = splitter.push_chunk(part_two).into_iter().map(|statement| statement.sql).collect::<Vec<_>>();
+
+        assert_eq!(statements, vec![expected]);
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn streaming_sqlserver_splitter_keeps_leading_comment_module_semicolons_until_go() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
+
+        assert!(splitter
+            .push_chunk("/* setup */\nCREATE OR ALTER PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\n")
+            .is_empty());
+        let statements = splitter.push_chunk("GO\n").into_iter().map(|statement| statement.sql).collect::<Vec<_>>();
+
+        assert_eq!(
+            statements,
+            vec!["/* setup */\nCREATE OR ALTER PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND"]
+        );
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
     fn streaming_sqlserver_splitter_handles_go_across_chunks() {
         let mut splitter = SqlServerBatchSplitter::default();
         let mut batches = splitter.push_chunk("CREATE PROCEDURE dbo.demo AS\nBEGIN\nSELECT 1;\nEND\nG");
@@ -3029,6 +3562,111 @@ mod tests {
         batches.extend(splitter.finish());
 
         assert_eq!(batches, vec!["CREATE PROCEDURE dbo.demo AS\nBEGIN\nSELECT 1;\nEND", "SELECT 2;"]);
+    }
+
+    #[test]
+    fn ordinary_sqlserver_import_keeps_declared_variable_batch_scope() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+
+        let statements = splitter
+            .push_chunk("DECLARE @name nvarchar(50);\nSET @name = 'x';\nSELECT * FROM users WHERE name = @name;\nGO\n")
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statements,
+            vec!["DECLARE @name nvarchar(50);\nSET @name = 'x';\nSELECT * FROM users WHERE name = @name;"]
+        );
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn ordinary_sqlserver_import_keeps_control_flow_batch_together() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+
+        let statements = splitter
+            .push_chunk(
+                "IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'demo')\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nELSE\nBEGIN\n  SELECT 3;\nEND\nGO\n",
+            )
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statements,
+            vec!["IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'demo')\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nELSE\nBEGIN\n  SELECT 3;\nEND"]
+        );
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn zip_sqlserver_import_still_keeps_module_body_whole_with_comment_before_keyword() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
+
+        let statements = splitter
+            .push_chunk("CREATE /*c*/ PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nGO\n")
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(statements, vec!["CREATE /*c*/ PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND"]);
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encoding_preview_preserves_postgres_dollar_quotes_like_execution() {
+        let sql = "SELECT $$ _binary ' $$;\nSELECT $tag$ _binary 'abc' $tag$;\n";
+        let mut bom_bytes = vec![0xEF, 0xBB, 0xBF];
+        bom_bytes.extend_from_slice(sql.as_bytes());
+        for (bytes, encoding) in [
+            (sql.as_bytes().to_vec(), SqlFileEncoding::Auto),
+            (sql.as_bytes().to_vec(), SqlFileEncoding::Utf8),
+            (bom_bytes, SqlFileEncoding::Gbk),
+        ] {
+            let path = temporary_sql_file(&bytes).await;
+            let preview = read_sql_file_preview_with_encoding(&path, 20_000, encoding).await.unwrap();
+            // PostgreSQL execution passes false for MySQL normalization.
+            let mut execution =
+                SqlFileStreamDecoder::open_for_import(&path, encoding.to_encoding(), false, None).await.unwrap();
+            assert_eq!(preview, sql);
+            assert_eq!(preview, collect_sql_file_preview(&mut execution, 20_000).await.unwrap());
+            tokio::fs::remove_file(path).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn encoding_preview_recovers_mysql_binary_without_mixing_chunks() {
+        // The failure is in a later chunk; recovery must discard the first pass.
+        let prefix = format!("SELECT _binary 'abc';\n-- {}\n", "x".repeat(SQL_FILE_READ_CHUNK_BYTES));
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(b"INSERT INTO t VALUES (_binary '\xAC\\\xED\\0\x05', '");
+        bytes.extend_from_slice("中文');\n".as_bytes());
+        for path in [temporary_sql_file(&bytes).await, temporary_gzip_sql_file(&bytes).await] {
+            for encoding in [SqlFileEncoding::Auto, SqlFileEncoding::Utf8] {
+                let preview = read_sql_file_preview_with_encoding(&path, 1_000_000, encoding).await.unwrap();
+                let mut execution =
+                    SqlFileStreamDecoder::open_for_import(&path, encoding.to_encoding(), true, None).await.unwrap();
+                assert_eq!(preview, collect_sql_file_preview(&mut execution, 1_000_000).await.unwrap());
+                assert!(preview.starts_with("SELECT X'616263';"));
+                assert!(preview.ends_with("INSERT INTO t VALUES (X'ACED0005', '中文');\n"));
+                assert_eq!(preview.matches("SELECT").count(), 1);
+            }
+            tokio::fs::remove_file(path).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn encoding_preview_does_not_hide_invalid_utf8_outside_binary_literals() {
+        let path = temporary_sql_file(b"SELECT '\xFF';").await;
+        assert_eq!(
+            read_sql_file_preview_with_encoding(&path, 20_000, SqlFileEncoding::Utf8).await.unwrap_err(),
+            "Unsupported or invalid SQL file encoding",
+        );
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[tokio::test]
@@ -3060,6 +3698,59 @@ mod tests {
         tokio::fs::remove_file(path).await.unwrap();
 
         assert_eq!(decoded, "SELECT '中文';");
+    }
+
+    #[tokio::test]
+    async fn streaming_import_prefers_utf8_bom_over_explicit_gbk() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("INSERT INTO t VALUES ('中文');".as_bytes());
+        let path = temporary_sql_file(&bytes).await;
+        let mut decoder =
+            SqlFileStreamDecoder::open_for_import(&path, Some(encoding_rs::GBK), false, None).await.unwrap();
+        let mut decoded = String::new();
+        while let Some(chunk) = decoder.next_chunk().await.unwrap() {
+            decoded.push_str(&chunk);
+        }
+        tokio::fs::remove_file(path).await.unwrap();
+
+        assert_eq!(decoder.encoding(), encoding_rs::UTF_8);
+        assert_eq!(decoded, "INSERT INTO t VALUES ('中文');");
+    }
+
+    #[tokio::test]
+    async fn streaming_import_prefers_utf16le_bom_over_explicit_utf8() {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "SELECT '中文';".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let path = temporary_sql_file(&bytes).await;
+        let mut decoder =
+            SqlFileStreamDecoder::open_for_import(&path, Some(encoding_rs::UTF_8), false, None).await.unwrap();
+        let mut decoded = String::new();
+        while let Some(chunk) = decoder.next_chunk().await.unwrap() {
+            decoded.push_str(&chunk);
+        }
+        tokio::fs::remove_file(path).await.unwrap();
+
+        assert_eq!(decoder.encoding(), encoding_rs::UTF_16LE);
+        assert_eq!(decoded, "SELECT '中文';");
+    }
+
+    #[tokio::test]
+    async fn streaming_import_uses_explicit_encoding_without_bom() {
+        let sql = "INSERT INTO t VALUES ('中文');";
+        let (encoded, _, _) = encoding_rs::GBK.encode(sql);
+        let path = temporary_sql_file(encoded.as_ref()).await;
+        let mut decoder =
+            SqlFileStreamDecoder::open_for_import(&path, Some(encoding_rs::GBK), false, None).await.unwrap();
+        let mut decoded = String::new();
+        while let Some(chunk) = decoder.next_chunk().await.unwrap() {
+            decoded.push_str(&chunk);
+        }
+        tokio::fs::remove_file(path).await.unwrap();
+
+        assert_eq!(decoder.encoding(), encoding_rs::GBK);
+        assert_eq!(decoded, sql);
     }
 
     #[tokio::test]
@@ -3218,15 +3909,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_gaussdb_on_error_stop_overrides_continue_on_error_at_script_position() {
+    async fn streaming_postgres_family_on_error_stop_overrides_continue_on_error_at_script_position() {
+        for db_type in [DatabaseType::Postgres, DatabaseType::OpenGauss, DatabaseType::Gaussdb] {
+            assert_streaming_psql_on_error_stop_at_script_position(db_type).await;
+        }
+    }
+
+    async fn assert_streaming_psql_on_error_stop_at_script_position(db_type: DatabaseType) {
         let dir = std::env::temp_dir().join(format!("dbx-sql-file-stop-on-error-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = crate::connection::AppState::new(storage);
         let config: crate::models::connection::ConnectionConfig = serde_json::from_value(serde_json::json!({
             "id": "gauss-stream",
             "name": "GaussDB stream test",
-            "db_type": "gaussdb",
+            "db_type": db_type,
             "host": "localhost",
             "port": 5432,
             "username": "",
@@ -3244,7 +3941,7 @@ mod tests {
             .await;
 
         let path = temporary_sql_file(
-            b"CREATE TABLE side_effects(value INTEGER);\nINSERT INTO missing_before_control VALUES (1);\nINSERT INTO side_effects VALUES (1);\n\\set ON_ERROR_STOP on\nINSERT INTO missing_after_control VALUES (1);\nINSERT INTO side_effects VALUES (2);",
+            b"CREATE TABLE side_effects(value INTEGER);\nINSERT INTO missing_before_control VALUES (1);\nINSERT INTO side_effects VALUES (1);\n\\set ON_ERROR_STOP on\n\\echo progress; -- display text\nINSERT INTO missing_after_control VALUES (1);\nINSERT INTO side_effects VALUES (2);",
         )
         .await;
         let request = SqlFileRequest {
@@ -3252,11 +3949,14 @@ mod tests {
             execution_id: "gauss-stop-on-error".to_string(),
             connection_id: "gauss-stream".to_string(),
             database: String::new(),
+            schema: None,
             file_path: path.to_string_lossy().to_string(),
             continue_on_error: true,
             selected_tables: None,
             part_cooldown_ms: 0,
             skip_relational_constraints: false,
+            failure_log_enabled: true,
+            encoding: Default::default(),
         };
         let mut progress = Vec::new();
 
@@ -3306,6 +4006,7 @@ mod tests {
             0,
             5,
             "bad statement",
+            "INSERT INTO t VALUES (1)",
             "syntax error".to_string(),
         );
 
@@ -3332,6 +4033,7 @@ mod tests {
             4,
             9,
             "slow statement",
+            "SELECT pg_sleep(10)",
             "Query canceled".to_string(),
         );
 

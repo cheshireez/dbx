@@ -1,5 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+/// Agent drivers can serialize an empty native slice as JSON `null` instead of
+/// `[]` (for example a Vastbase `UPDATE ... FROM` that returns no result
+/// columns). A present `null` must deserialize as an empty vector: one driver's
+/// serialization detail must not fail the whole agent call with
+/// "invalid type: null, expected a sequence".
+fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// A data-grid statement whose BLOB values travel outside the executable SQL.
+/// The preview must match the caller's reviewed SQL before any statement runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobBoundStatement {
+    pub preview_sql: String,
+    pub sql: String,
+    pub blob_parameters: Vec<String>,
+}
+
+pub fn validate_blob_bound_statements(previews: &[String], bound: &[BlobBoundStatement]) -> Result<(), String> {
+    if previews.len() != bound.len()
+        || previews.iter().zip(bound).any(|(preview, statement)| preview != &statement.preview_sql)
+    {
+        return Err("The reviewed SQL changed; regenerate the BLOB save preview before saving.".into());
+    }
+    if bound.iter().any(|statement| {
+        statement.sql.trim().is_empty()
+            || statement.blob_parameters.is_empty() && statement.sql != statement.preview_sql
+            || statement
+                .blob_parameters
+                .iter()
+                .any(|hex| hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }) {
+        return Err("Invalid BLOB statement parameters.".into());
+    }
+    Ok(())
+}
+
 pub use crate::mysql_event::MysqlEventInfo;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -145,12 +187,63 @@ pub struct ExtensionInfo {
     pub schema: Option<String>,
 }
 
+/// A PostgreSQL event trigger (`pg_event_trigger`). Event triggers fire on DDL
+/// commands at the database level, independent of any schema. This is distinct
+/// from MySQL events (`MysqlEventInfo`) and per-table triggers (`TriggerInfo`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTriggerInfo {
+    pub name: String,
+    /// DDL event: ddl_command_start | ddl_command_end | sql_drop | table_rewrite.
+    pub event: String,
+    /// Owner role name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// `schema.function(args)` executed by the trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    /// Session replica status char: O | A | R | D.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<String>,
+    /// Command tags in the WHEN clause (NULL = all tags).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// `pg_get_eventtriggerdef` reconstruction of the CREATE statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectStatistics {
     pub name: String,
     pub schema: Option<String>,
     pub estimated_rows: Option<i64>,
     pub total_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_length: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_row_length: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_data_length: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_length: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_increment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_free: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +264,37 @@ pub enum ObjectSourceKind {
     TypeBody,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RoutineParameterMode {
+    In,
+    Out,
+    Inout,
+    Return,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutineParameterMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub mode: RoutineParameterMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jdbc_type: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectSource {
     pub name: String,
@@ -179,6 +303,28 @@ pub struct ObjectSource {
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routine_parameters: Option<Vec<RoutineParameterMetadata>>,
+}
+
+/// Provenance for structured metadata fields that are optional in [`ColumnInfo`].
+/// This stays internal to the metadata mapping path and is not serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnMetadataCapabilities {
+    pub default: bool,
+    pub length: bool,
+    pub precision: bool,
+    pub scale: bool,
+}
+
+impl ColumnMetadataCapabilities {
+    pub const fn all_supported() -> Self {
+        Self { default: true, length: true, precision: true, scale: true }
+    }
+
+    pub const fn default_only() -> Self {
+        Self { default: true, length: false, precision: false, scale: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -187,6 +333,10 @@ pub struct ColumnInfo {
     pub data_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_object_type: Option<String>,
     pub is_nullable: bool,
     pub column_default: Option<String>,
     pub is_primary_key: bool,
@@ -203,6 +353,24 @@ pub struct ColumnInfo {
     pub character_set: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
+    #[serde(skip)]
+    pub metadata_capabilities: Option<ColumnMetadataCapabilities>,
+}
+
+/// Doris aggregate-state columns contain opaque engine serialization, not a
+/// value that DBX can safely edit or emit as an INSERT literal.
+pub fn is_opaque_aggregate_state_type(data_type: &str) -> bool {
+    let data_type = data_type.trim();
+    let Some(prefix) = data_type.get(.."agg_state".len()) else { return false };
+    if !prefix.eq_ignore_ascii_case("agg_state") {
+        return false;
+    }
+    let Some(arguments) =
+        data_type.get("agg_state".len()..).map(str::trim_start).and_then(|value| value.strip_prefix('<'))
+    else {
+        return false;
+    };
+    arguments.strip_suffix('>').is_some_and(|inner| !inner.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +469,8 @@ pub struct CompletionAssistantCandidate {
     pub comment: Option<String>,
     pub data_type: Option<String>,
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routine_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +487,20 @@ pub struct SpatialColumn {
     /// SRID shared by the column's geometry cells. `None` when unknown/absent
     /// (or SRID 0). A column reports the first non-null SRID it observes.
     pub srid: Option<u32>,
+}
+
+/// Stable identity for one column selected for SQL INSERT export.
+///
+/// `source_index` preserves duplicate result labels. `name` and
+/// `name_occurrence` let paginated exports recover the same identity when a
+/// driver reports later-page metadata in a different order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlExportColumnSelection {
+    pub source_index: usize,
+    pub name: String,
+    #[serde(default)]
+    pub name_occurrence: usize,
 }
 
 #[derive(Debug, Default)]
@@ -345,10 +529,13 @@ impl SpatialColumnBuilder {
         }
     }
 
-    pub fn finish(self) -> Vec<SpatialColumn> {
+    fn finish(self) -> Vec<SpatialColumn> {
         self.columns.into_iter().map(|(column_index, srid)| SpatialColumn { column_index, srid }).collect()
     }
 
+    /// Drivers collect one SRID slot per cell while streaming rows; a result
+    /// without spatial columns drops that all-`None` matrix instead of sending
+    /// it to every consumer.
     pub fn finish_with_values(
         self,
         spatial_values: Vec<Vec<Option<u32>>>,
@@ -402,30 +589,35 @@ pub struct LargeValueCell {
     pub row_index: usize,
     pub column_index: usize,
     pub original_bytes: usize,
+    /// Opaque original-result locator. Absent for legacy preview/re-query drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueryResult {
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub columns: Vec<String>,
     /// Database type name for each column, parallel to `columns`. May be empty
     /// when a driver cannot supply types (e.g. schemaless stores or fallback
     /// query paths); consumers must tolerate a shorter/empty vector.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub column_types: Vec<String>,
     /// Sortable for each column. Parallel to `columns`. Optional and may
     /// be shorter/empty when a driver cannot supply sortable information.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub column_sortables: Vec<bool>,
     /// Spatial reference metadata for geometry/geography cells. Kept outside
     /// `rows` so displayed, copied, exported, and edited values remain WKT.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default", skip_serializing_if = "Vec::is_empty")]
     pub spatial_columns: Vec<SpatialColumn>,
     /// Per-cell SRID metadata, parallel to `rows`: `spatial_values[row][column]`
     /// is the SRID of that cell's geometry value (`None` for non-spatial cells
     /// or unknown SRID). Unlike `spatial_columns` (a column-level hint), every
     /// geometry value keeps its own SRID so mixed-SRID results stay correct.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default", skip_serializing_if = "Vec::is_empty")]
     pub spatial_values: Vec<Vec<Option<u32>>>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub rows: Vec<Vec<serde_json::Value>>,
     pub affected_rows: u64,
     pub execution_time_ms: u128,
@@ -433,6 +625,9 @@ pub struct QueryResult {
     /// completed statement cannot be correlated to one audit row.
     #[serde(default)]
     pub server_execute_time_us: Option<u64>,
+    /// Optional measured query phases in milliseconds; absent on older agents.
+    #[serde(default)]
+    pub query_timings_ms: Option<std::collections::BTreeMap<String, f64>>,
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
@@ -447,7 +642,7 @@ pub struct QueryResult {
     /// Messages emitted by the database server while executing the statement
     /// (notices, warnings, info messages). Empty for drivers that do not
     /// capture server messages.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default", skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<QueryMessage>,
 }
 
@@ -474,6 +669,7 @@ impl Serialize for QueryResult {
             + usize::from(!self.spatial_values.is_empty())
             + usize::from(self.elasticsearch_raw_body.is_some())
             + usize::from(self.server_execute_time_us.is_some())
+            + usize::from(self.query_timings_ms.is_some())
             + usize::from(!self.messages.is_empty());
         let mut state = serializer.serialize_struct("QueryResult", field_count)?;
         state.serialize_field("columns", &self.columns)?;
@@ -490,6 +686,9 @@ impl Serialize for QueryResult {
         state.serialize_field("execution_time_ms", &self.execution_time_ms)?;
         if let Some(server_execute_time_us) = &self.server_execute_time_us {
             state.serialize_field("server_execute_time_us", server_execute_time_us)?;
+        }
+        if let Some(timings) = &self.query_timings_ms {
+            state.serialize_field("query_timings_ms", timings)?;
         }
         state.serialize_field("truncated", &self.truncated)?;
         state.serialize_field("session_id", &self.session_id)?;
@@ -605,6 +804,16 @@ pub struct IndexInfo {
     /// introspection source doesn't track this (provenance unknown for that dialect/path).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_is_expression: Vec<bool>,
+    /// Parallel to `columns`: Oracle-family key order (`ASC` or `DESC`). Empty when
+    /// the source does not expose direction metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_directions: Vec<String>,
+    /// Oracle-family index visibility (`VISIBLE` or `INVISIBLE`), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// True only when the source returned aligned expression, direction and visibility metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_metadata_complete: bool,
     /// Parallel to `columns`: operator class name for each key column, if non-default.
     /// For example, a GIN trigram index on a varchar column will have `"gin_trgm_ops"`.
     /// `None` means the default operator class is used (can be omitted in DDL).
@@ -682,13 +891,51 @@ pub struct ConstraintInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_delete: Option<String>,
     #[serde(default)]
-    pub deferrable: bool,
+    pub deferrable: Option<bool>,
     #[serde(default)]
-    pub initially_deferred: bool,
+    pub initially_deferred: Option<bool>,
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
     #[serde(default)]
-    pub valid: bool,
+    pub valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_metadata: Option<OracleConstraintMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OracleConstraintMetadata {
+    pub metadata_complete: bool,
+    pub owner: String,
+    pub constraint_type: Option<String>,
+    pub status: Option<String>,
+    pub validated: Option<String>,
+    pub deferrable: Option<String>,
+    pub deferred: Option<String>,
+    pub rely: Option<String>,
+    pub index_owner: Option<String>,
+    pub index_name: Option<String>,
+    pub index_sharing: Option<String>,
+    pub index: Option<OracleConstraintIndexMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OracleConstraintIndexMetadata {
+    pub metadata_complete: bool,
+    pub owner: String,
+    pub table_owner: String,
+    pub table_name: String,
+    pub index_type: String,
+    pub uniqueness: String,
+    pub status: String,
+    pub partitioned: bool,
+    pub visibility: String,
+    pub secondary: Option<String>,
+    pub columns: Vec<String>,
+    pub directions: Vec<String>,
+    pub key_is_expression: Vec<bool>,
+    pub included_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -713,6 +960,100 @@ pub struct SubpartitionInfo {
     pub value: String,
     pub partition_type: String,
     pub partition_key: String,
+}
+
+/// PostgreSQL declarative partitioning strategy (`pg_partitioned_table.partstrat`:
+/// `r` = range, `l` = list, `h` = hash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PgPartitionKind {
+    Range,
+    List,
+    Hash,
+}
+
+/// Structured form of a partition's `pg_get_expr(relpartbound)` definition.
+///
+/// Values are kept as SQL literal text (`'2024-01-01'`, `1`, `MINVALUE`,
+/// `MAXVALUE`, `'a'`) so the UI can round-trip exactly what PostgreSQL
+/// reported without re-typing or re-quoting them client-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PgPartitionBound {
+    Range { from: Vec<String>, to: Vec<String> },
+    List { values: Vec<String> },
+    Hash { modulus: i32, remainder: i32 },
+    Default,
+}
+
+/// One relation in a PostgreSQL partition hierarchy, as returned by
+/// `get_table_partitioning_core`. `children` is nested to the same depth as
+/// the catalog's partition tree (PG supports multi-level partitioning).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PgPartitionNode {
+    pub schema: String,
+    pub name: String,
+    /// Set only when this node is itself a partitioned parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<PgPartitionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_definition: Option<String>,
+    /// This node's own partition bound (set for every non-root node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<PgPartitionBound>,
+    /// Raw `pg_get_expr(relpartbound)` text; retained as a display fallback
+    /// when `bound` could not be parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_definition: Option<String>,
+    #[serde(default)]
+    pub is_leaf: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_estimate: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<i64>,
+    #[serde(default)]
+    pub children: Vec<PgPartitionNode>,
+}
+
+/// Structured partitioning view of one PostgreSQL relation, used by the table
+/// structure editor's "Partitions" tab. Works for the partitioned parent
+/// (`is_partitioned`), for a member partition (`is_partition`), and reports
+/// the whole subtree rooted at the requested relation either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PgTablePartitioning {
+    pub is_partitioned: bool,
+    pub is_partition: bool,
+    /// Display form `"schema.table"` of the owning parent, when this relation
+    /// is itself a partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Parent parts, kept separate so a dotted identifier cannot be mis-split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_bound: Option<PgPartitionBound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<PgPartitionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_definition: Option<String>,
+    #[serde(default)]
+    pub key_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_expression: Option<String>,
+    /// Name of the default partition, when the parent has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_partition: Option<String>,
+    /// Descendant partitions (the root itself is not included).
+    #[serde(default)]
+    pub partitions: Vec<PgPartitionNode>,
+    /// Server version (`current_setting('server_version_num')`), used by the UI
+    /// to gate `DETACH PARTITION CONCURRENTLY` (PostgreSQL 14+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version_num: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -869,10 +1210,41 @@ pub struct CustomTypeDetails {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blob_bindings_refuse_edited_previews_and_invalid_later_parameters() {
+        let previews = vec!["first reviewed save".to_string(), "second reviewed save".to_string()];
+        let mut bound = previews
+            .iter()
+            .map(|preview| super::BlobBoundStatement {
+                preview_sql: preview.clone(),
+                sql: "BEGIN UPDATE T SET B=?; END;".into(),
+                blob_parameters: vec!["00ff".into()],
+            })
+            .collect::<Vec<_>>();
+        assert!(super::validate_blob_bound_statements(&previews, &bound).is_ok());
+        bound[1].blob_parameters[0] = "xyz".into();
+        assert!(super::validate_blob_bound_statements(&previews, &bound).is_err());
+        bound[1].blob_parameters[0] = "00ff".into();
+        bound[1].preview_sql = "user edited SQL".into();
+        assert!(super::validate_blob_bound_statements(&previews, &bound).is_err());
+        assert!(super::validate_blob_bound_statements(&previews, &bound[..1]).is_err());
+    }
     use super::{
-        CompletionAssistantCandidate, CompletionAssistantCandidateKind, ObjectInfo, ObjectSourceKind, QueryMessage,
-        SpatialColumn, SpatialColumnBuilder, TableInfo,
+        is_opaque_aggregate_state_type, CompletionAssistantCandidate, CompletionAssistantCandidateKind, ObjectInfo,
+        ObjectSource, ObjectSourceKind, QueryMessage, RoutineParameterMode, SpatialColumn, SpatialColumnBuilder,
+        TableInfo,
     };
+
+    #[test]
+    fn opaque_aggregate_state_type_is_narrow() {
+        assert!(is_opaque_aggregate_state_type("agg_state<group_concat(text)>"));
+        assert!(is_opaque_aggregate_state_type(" AGG_STATE <sum(int)> "));
+        assert!(!is_opaque_aggregate_state_type("agg_state"));
+        assert!(!is_opaque_aggregate_state_type("agg_state<"));
+        assert!(!is_opaque_aggregate_state_type("agg_state<>"));
+        assert!(!is_opaque_aggregate_state_type("😺agg_state<sum(int)>"));
+        assert!(!is_opaque_aggregate_state_type("varchar"));
+    }
 
     #[test]
     fn query_message_format_line_uppercases_severity() {
@@ -1060,6 +1432,46 @@ mod tests {
     }
 
     #[test]
+    fn object_source_accepts_legacy_payload_without_routine_parameters() {
+        let source: ObjectSource = serde_json::from_value(serde_json::json!({
+            "name": "legacy_proc",
+            "object_type": "PROCEDURE",
+            "schema": "APP",
+            "source": "CREATE PROCEDURE legacy_proc() BEGIN END"
+        }))
+        .unwrap();
+
+        assert!(source.routine_parameters.is_none());
+        assert!(serde_json::to_value(source).unwrap().get("routine_parameters").is_none());
+    }
+
+    #[test]
+    fn object_source_preserves_optional_jdbc_routine_parameters() {
+        let source: ObjectSource = serde_json::from_value(serde_json::json!({
+            "name": "calculate_total",
+            "object_type": "FUNCTION",
+            "schema": "APP",
+            "source": "",
+            "editable": false,
+            "routine_parameters": [{
+                "name": "RETURN",
+                "mode": "RETURN",
+                "jdbc_type": 3,
+                "type_name": "DECIMAL",
+                "precision": 12,
+                "scale": 2,
+                "ordinal": 0
+            }]
+        }))
+        .unwrap();
+
+        let parameters = source.routine_parameters.as_ref().unwrap();
+        assert_eq!(parameters[0].mode, RoutineParameterMode::Return);
+        assert_eq!(parameters[0].precision, Some(12));
+        assert_eq!(serde_json::to_value(source).unwrap()["routine_parameters"][0]["mode"], "RETURN");
+    }
+
+    #[test]
     fn completion_candidate_kind_accepts_uppercase_agent_wire_values() {
         for (wire_value, expected) in [
             ("DATABASE", CompletionAssistantCandidateKind::Database),
@@ -1109,6 +1521,7 @@ mod tests {
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -1216,6 +1629,28 @@ mod tests {
     }
 
     #[test]
+    fn constraint_states_preserve_unknown_and_known_values_on_the_agent_ui_wire() {
+        for states in [
+            serde_json::json!({}),
+            serde_json::json!({ "enabled": null, "valid": null, "deferrable": null, "initially_deferred": null }),
+            serde_json::json!({ "enabled": true, "valid": false, "deferrable": false, "initially_deferred": true }),
+        ] {
+            let mut payload = serde_json::json!({
+                "name": "O01_UK", "constraint_type": "UNIQUE",
+                "definition": "UNIQUE (\"B\", \"A\")", "columns": ["B", "A"]
+            });
+            payload.as_object_mut().unwrap().extend(states.as_object().unwrap().clone());
+            let constraint: super::ConstraintInfo = serde_json::from_value(payload).unwrap();
+            let wire = serde_json::to_value(constraint).unwrap();
+            for field in ["enabled", "valid", "deferrable", "initially_deferred"] {
+                assert_eq!(wire[field], states[field], "{field}");
+            }
+            assert_eq!(wire["columns"], serde_json::json!(["B", "A"]));
+            assert_eq!(wire["definition"], "UNIQUE (\"B\", \"A\")");
+        }
+    }
+
+    #[test]
     fn query_result_server_execution_microseconds_survive_agent_and_ui_wire() {
         let mut result = bigint_result_sample();
         let without_audit = serde_json::to_value(&result).unwrap();
@@ -1251,5 +1686,51 @@ mod tests {
         let deserialized: super::QueryResult =
             serde_json::from_value(serde_json::to_value(bigint_result_sample()).unwrap()).unwrap();
         assert_eq!(deserialized.rows[0][0], serde_json::json!("1391198305898897409"));
+    }
+
+    /// Agent drivers may serialize empty native slices as JSON `null` (seen on
+    /// Vastbase `UPDATE ... FROM`, #11668). A present null must mean "empty",
+    /// not a contract violation.
+    #[test]
+    fn query_result_treats_null_vectors_from_agents_as_empty() {
+        let deserialized: super::QueryResult = serde_json::from_value(serde_json::json!({
+            "columns": null,
+            "column_types": null,
+            "column_sortables": null,
+            "spatial_columns": null,
+            "spatial_values": null,
+            "rows": null,
+            "affected_rows": 3,
+            "execution_time_ms": 7,
+            "messages": null
+        }))
+        .expect("null vectors should deserialize as empty");
+
+        assert!(deserialized.columns.is_empty());
+        assert!(deserialized.column_types.is_empty());
+        assert!(deserialized.column_sortables.is_empty());
+        assert!(deserialized.spatial_columns.is_empty());
+        assert!(deserialized.spatial_values.is_empty());
+        assert!(deserialized.rows.is_empty());
+        assert!(deserialized.messages.is_empty());
+        assert_eq!(deserialized.affected_rows, 3);
+        assert_eq!(deserialized.execution_time_ms, 7);
+    }
+
+    #[test]
+    fn query_result_still_deserializes_real_columns_and_rows() {
+        let deserialized: super::QueryResult = serde_json::from_value(serde_json::json!({
+            "columns": ["id", "name"],
+            "column_types": ["int4", "text"],
+            "column_sortables": [true, true],
+            "rows": [[1, "a"]],
+            "affected_rows": 1,
+            "execution_time_ms": 2
+        }))
+        .unwrap();
+
+        assert_eq!(deserialized.columns, ["id", "name"]);
+        assert_eq!(deserialized.rows.len(), 1);
+        assert_eq!(deserialized.rows[0][1], serde_json::json!("a"));
     }
 }
