@@ -330,10 +330,12 @@ import type {
 } from "@/types/nacos";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
+import { encodeSql, encodeSqlDeep } from "@/lib/backend/wafCodec";
 import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
 import { normalizeConnectionTestResult } from "@/lib/connection/connectionDatabaseInfo";
 import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 import { uuid } from "@/lib/common/utils";
+export { encodeSqlDeep, isWafSqlField } from "@/lib/backend/wafCodec";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -363,7 +365,7 @@ async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(apiUrl(url), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(await encodeSqlDeep(body)),
   });
   if (!res.ok) throw await backendResponseError(res);
   if (res.status === 204) return undefined as T;
@@ -374,7 +376,7 @@ async function postQueryWithDiagnostics<T>(url: string, body: unknown, traceId?:
   if (!isDebugLoggingEnabled()) return post(url, body);
 
   const startedAt = performance.now();
-  const serializedBody = JSON.stringify(body);
+  const serializedBody = JSON.stringify(await encodeSqlDeep(body));
   const response = await fetch(apiUrl(url), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -435,7 +437,7 @@ async function put<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(apiUrl(url), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(await encodeSqlDeep(body)),
   });
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
@@ -460,42 +462,8 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
   return sp.toString();
 }
 
-// ---------------------------------------------------------------------------
-// 可选传输层 SQL 载荷加密(绕过内容型 WAF 对 SQL 关键字的误拦)
-// 仅在构建时设置 VITE_DBX_WAF_SQL_ENCODE=1 才启用;后端 waf_codec 负责解密,
-// 密钥需与后端 DBX_WAF_SQL_KEY 保持一致(缺省用同一内置默认值)。
-// ---------------------------------------------------------------------------
-const WAF_SQL_ENCODE = import.meta.env.VITE_DBX_WAF_SQL_ENCODE === "1";
-const WAF_SQL_KEY = import.meta.env.VITE_DBX_WAF_SQL_KEY || "dbx-waf-default-key-2026";
-const WAF_SQL_PREFIX = "dbx1:";
-
-function wafBytesToBase64(bytes: Uint8Array): string {
-  let bin = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(bin);
-}
-
-async function encodeSql(sql: string): Promise<string> {
-  if (!WAF_SQL_ENCODE) return sql;
-  try {
-    const enc = new TextEncoder();
-    const keyBytes = await crypto.subtle.digest("SHA-256", enc.encode(WAF_SQL_KEY));
-    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(sql)));
-    const payload = new Uint8Array(iv.length + cipher.length);
-    payload.set(iv, 0);
-    payload.set(cipher, iv.length);
-    return WAF_SQL_PREFIX + wafBytesToBase64(payload);
-  } catch {
-    // 加密不可用(如非 HTTPS 环境)时退回明文,保证功能可用
-    return sql;
-  }
-}
-
+// WAF 载荷加密封装(encodeSql / encodeSqlDeep / isWafSqlField)独立在 wafCodec.ts,
+// 供 http.ts 与 mq-http.ts 共用,避免循环依赖。
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
@@ -512,7 +480,7 @@ export async function testConnectionWithInfo(config: ConnectionConfig): Promise<
   const response = await fetch(apiUrl("/api/connection/test-info"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ config }),
+    body: JSON.stringify(await encodeSqlDeep({ config })),
   });
   if (response.status === 404) {
     return normalizeConnectionTestResult(await testConnection(config), config);
@@ -2193,7 +2161,7 @@ export async function aiStream(sessionId: string, request: AiCompletionRequest, 
   const res = await fetch(apiUrl("/api/ai/stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, request }),
+    body: JSON.stringify(await encodeSqlDeep({ session_id: sessionId, request })),
   });
   if (!res.ok) throw await backendResponseError(res);
 
@@ -2299,24 +2267,26 @@ export async function aiAgentStream(
   const res = await fetch(apiUrl("/api/ai/agent-stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      sessionId,
-      request,
-      connectionId,
-      database,
-      schema,
-      dbType,
-      mode: mode || "ask",
-      allowWriteSql,
-      confirmedWriteSql,
-      confirmedConnectionId,
-      confirmedDatabase,
-      confirmedSchema,
-      selectedDatabases,
-      // The web server ignores this by design: local skill files are never
-      // exposed to it (there is no request field on that route either).
-      allowSkills,
-    }),
+    body: JSON.stringify(
+      await encodeSqlDeep({
+        sessionId,
+        request,
+        connectionId,
+        database,
+        schema,
+        dbType,
+        mode: mode || "ask",
+        allowWriteSql,
+        confirmedWriteSql,
+        confirmedConnectionId,
+        confirmedDatabase,
+        confirmedSchema,
+        selectedDatabases,
+        // The web server ignores this by design: local skill files are never
+        // exposed to it (there is no request field on that route either).
+        allowSkills,
+      }),
+    ),
     signal,
   });
   if (!res.ok) throw await backendResponseError(res);
@@ -2433,7 +2403,7 @@ export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configu
   const res = await fetch(apiUrl("/api/app-settings/mcp-policy"), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(policy),
+    body: JSON.stringify(await encodeSqlDeep(policy)),
   });
   if (!res.ok) throw await backendResponseError(res);
 }
@@ -2462,7 +2432,7 @@ export async function saveWebMcpHttpSettings(settings: import("@/lib/backend/tau
   const res = await fetch(apiUrl("/api/app-settings/mcp-http"), {
     method: "PUT",
     headers: { "Content-Type": "application/json", "X-DBX-MCP-Settings": "1" },
-    body: JSON.stringify(settings),
+    body: JSON.stringify(await encodeSqlDeep(settings)),
   });
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
@@ -3148,7 +3118,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
   const res = await fetch(apiUrl("/api/transfer/start"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request: backendRequest, operationTimeoutSecs }),
+    body: JSON.stringify(await encodeSqlDeep({ request: backendRequest, operationTimeoutSecs })),
   });
   if (!res.ok) throw await backendResponseError(res);
   onStarted?.();
@@ -3206,14 +3176,16 @@ export async function previewTableImportFile(fileOrPath: string | File | TableIm
     const res = await fetch(apiUrl("/api/import/preview-source"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sourceRef: options.sourceRef,
-        connectionId: options.connectionId,
-        database: options.database,
-        sourceFormat: options.sourceFormat,
-        parseOptions: options.parseOptions,
-        previewLimit: options.previewLimit,
-      }),
+      body: JSON.stringify(
+        await encodeSqlDeep({
+          sourceRef: options.sourceRef,
+          connectionId: options.connectionId,
+          database: options.database,
+          sourceFormat: options.sourceFormat,
+          parseOptions: options.parseOptions,
+          previewLimit: options.previewLimit,
+        }),
+      ),
     });
     if (!res.ok) throw await backendResponseError(res);
     return res.json();
@@ -3238,7 +3210,7 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
   const res = await fetch(apiUrl("/api/import/execute"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request }),
+    body: JSON.stringify(await encodeSqlDeep({ request })),
   });
   if (!res.ok) throw await backendResponseError(res);
 
@@ -3427,12 +3399,14 @@ export async function previewMongodbImportFile(fileOrPath: string | File | Mongo
     const res = await fetch(apiUrl("/api/mongo/import/preview-source"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sourceRef: options.sourceRef,
-        format: options.format,
-        parseOptions: options.parseOptions,
-        previewLimit: options.previewLimit,
-      }),
+      body: JSON.stringify(
+        await encodeSqlDeep({
+          sourceRef: options.sourceRef,
+          format: options.format,
+          parseOptions: options.parseOptions,
+          previewLimit: options.previewLimit,
+        }),
+      ),
     });
     if (!res.ok) throw await backendResponseError(res);
     return res.json();
@@ -3454,7 +3428,7 @@ export async function importMongodbFile(request: MongoImportRequest, onProgress:
   const res = await fetch(apiUrl("/api/mongo/import/execute"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request }),
+    body: JSON.stringify(await encodeSqlDeep({ request })),
   });
   if (!res.ok) throw await backendResponseError(res);
   return new Promise((resolve, reject) => {
@@ -3496,7 +3470,7 @@ export async function exportMongodbQuery(request: MongoExportRequest, onProgress
   const res = await fetch(apiUrl("/api/mongo/export"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request }),
+    body: JSON.stringify(await encodeSqlDeep({ request })),
   });
   if (!res.ok) throw await backendResponseError(res);
   return new Promise((resolve, reject) => {
@@ -3545,7 +3519,7 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
   const res = await fetch(apiUrl("/api/export/database"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request }),
+    body: JSON.stringify(await encodeSqlDeep({ request })),
   });
   if (!res.ok) throw await backendResponseError(res);
 
@@ -4658,7 +4632,7 @@ export async function nacosSearchConfigContent(connectionId: string, req: NacosC
   const response = await fetch(apiUrl("/api/nacos/configs/search"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ connectionId, req }),
+    body: JSON.stringify(await encodeSqlDeep({ connectionId, req })),
   });
   if (!response.ok) throw await backendResponseError(response);
   if (!response.body) throw new Error("Nacos content search did not return a response stream");
@@ -4705,7 +4679,7 @@ export async function nacosExportConfigs(connectionId: string, selector: NacosCo
   const response = await fetch(apiUrl("/api/nacos/configs/export"), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ connectionId, selector, fileName }),
+    body: JSON.stringify(await encodeSqlDeep({ connectionId, selector, fileName })),
   });
   if (!response.ok) throw await backendResponseError(response);
   const blob = await response.blob();
@@ -5150,7 +5124,7 @@ export async function documentDownloadGridFsFile(connectionId: string, database:
   const res = await fetch(apiUrl("/api/document-store/download-gridfs-file"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ connectionId, database, bucket, fileId }),
+    body: JSON.stringify(await encodeSqlDeep({ connectionId, database, bucket, fileId })),
   });
   if (!res.ok) throw await backendResponseError(res);
   const data = (await res.json()) as number[];

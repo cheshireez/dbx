@@ -458,8 +458,10 @@ pub async fn ai_stream(
 
 pub async fn ai_agent_stream(
     State(state): State<Arc<WebState>>,
-    Json(body): Json<AiAgentStreamRequest>,
+    Json(mut body): Json<AiAgentStreamRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
+    body.confirmed_write_sql =
+        body.confirmed_write_sql.take().map(|sql| crate::waf_codec::decode_sql(&sql)).transpose()?;
     let session_id = body.session_id;
     let request = body.request;
     reject_web_unsupported_ai_provider(&request.config)?;

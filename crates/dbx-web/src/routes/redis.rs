@@ -394,8 +394,9 @@ pub async fn scan_keys_batch(
 
 pub async fn scan_values(
     State(state): State<Arc<WebState>>,
-    Json(req): Json<RedisValueScanRequest>,
+    Json(mut req): Json<RedisValueScanRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    req.query = crate::waf_codec::decode_sql(&req.query)?;
     let result = dbx_core::redis_ops::redis_scan_values_core(
         &state.app,
         &req.connection_id,

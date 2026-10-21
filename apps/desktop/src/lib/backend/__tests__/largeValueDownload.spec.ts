@@ -26,6 +26,10 @@ it("does not deliver a late snapshot export after local cancellation", async () 
     () => "delivered",
     () => "cancelled",
   );
+  // 请求体经 encodeSqlDeep 异步准备后 fetch 才会发起,需等待 fetch 桩就绪再放行响应
+  await vi.waitFor(() => {
+    expect(typeof release).toBe("function");
+  });
   release(new Response(JSON.stringify({ downloadId: "prepared" }), { status: 200, headers: { "Content-Type": "application/json" } }));
   expect(await outcome).toBe("cancelled");
   expect(click).not.toHaveBeenCalled();
@@ -62,6 +66,10 @@ it("does not deliver a browser download when cancelled while the server prepares
     () => "delivered",
     () => "cancelled",
   );
+  // 同上:等待 fetch 桩就绪(请求体异步加密准备)再放行响应
+  await vi.waitFor(() => {
+    expect(typeof release).toBe("function");
+  });
   release(new Response(JSON.stringify({ downloadId: "prepared" }), { status: 200, headers: { "Content-Type": "application/json" } }));
   expect(await outcome).toBe("cancelled");
   expect(click).not.toHaveBeenCalled();

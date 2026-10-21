@@ -1,0 +1,11 @@
+const env = $('Merge7').item.json;
+const cscode = String(env.cscode ?? '');
+const max_createtime = String(env.max_createtime ?? '2025-01-01 00:00:00');
+const pageNum = Number($('下一页7').item.json.pageNum ?? 1) || 1;
+const pageSize = Number($('初始化分页变量7').item.json.pageSize ?? 1000) || 1000;
+const offset = Math.max(0, (pageNum - 1) * pageSize);
+const table = 't_gas_bussiness_log_202407202504';
+const cols = 'id, company_id, company_code, company_name, station_id, station_name, employee_Id, employee_name, gas_id, gas_num, customer_id, customer_name, car_no, createtime, msg, request_status, request_param, flow, status, regionCode, cscode, opTime, op, steelSealId, version, unusual_tj_status, unusual_id, text1, text2, text3, request_time';
+const where = ['cscode = \'' + cscode.replace(/'/g, '') + '\'', 'createtime >= \'' + max_createtime + '\'', 'createtime <= \'2025-04-16 18:40:00\''].join(' AND ');
+const sql = 'SELECT ' + cols + ' FROM ' + table + ' WHERE ' + where + ' ORDER BY createtime ASC LIMIT ' + pageSize + ' OFFSET ' + offset + ';';
+return [{ json: { sql: sql, cscode: cscode } }];

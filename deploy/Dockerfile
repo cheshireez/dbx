@@ -34,20 +34,25 @@ FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend
 ARG TARGETARCH
 WORKDIR /app
 # 中国大陆网络加速: crates 走 rsproxy 稀疏索引
-RUN mkdir -p /root/.cargo && printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /root/.cargo/config.toml
+# 注意:rust 官方镜像的 CARGO_HOME=/usr/local/cargo,cargo 只读 $CARGO_HOME/config.toml,
+# 写 /root/.cargo 不生效(会导致 cargo install 直连被墙的 index.crates.io 而失败)。
+RUN mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /usr/local/cargo/config.toml
 # github.com 直连不可达时,git 依赖统一走 ghfast.top 代理,并让 cargo 使用 git CLI(遵循 insteadOf)。
 RUN git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # PyPI 走清华镜像
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-RUN dpkg --add-architecture arm64 \
+# apt 走清华镜像(官方源国内不稳且慢,曾导致索引拉不全 install 失败)
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
     libfontconfig-dev:arm64 libfreetype-dev:arm64 \
-    && pip3 install --break-system-packages ziglang \
-    && cargo install cargo-zigbuild \
-    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
+# 与 apt 分层:cargo 网络步骤失败重试时不必重下几百个 apt 包
+RUN pip3 install --break-system-packages ziglang \
+    && cargo install cargo-zigbuild \
+    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
 # Copy dependency manifests only and create dummy sources to pre-compile dependencies.
 # This layer is cached by GHA as long as Cargo.toml/Cargo.lock don't change.
@@ -138,7 +143,9 @@ RUN case "$TARGETARCH" in \
 # Stage 3: Final image
 FROM debian:bookworm-slim
 ARG TARGETPLATFORM
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt 走清华镜像(与 backend 阶段一致,避免官方源不稳)
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fontconfig \
     fonts-dejavu-core \

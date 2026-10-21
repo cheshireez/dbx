@@ -524,8 +524,9 @@ pub async fn execute_query(
 pub async fn execute_conditional_update(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
-    Json(req): Json<ExecuteQueryRequest>,
+    Json(mut req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    req.sql = waf_codec::decode_sql(&req.sql)?;
     let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
     let database = super::mcp_policy::ensure_sql(
         &state,
@@ -691,6 +692,21 @@ fn execute_multi_response(
     Ok(response)
 }
 
+/// 解码 BLOB 绑定语句中的 SQL 文本(preview_sql / sql 都承载 SQL,必须与
+/// statements 同口径解码,否则预览校验会因一侧密文一侧明文而失败)。
+fn decode_bound_statements(
+    bound: Vec<dbx_core::db::BlobBoundStatement>,
+) -> Result<Vec<dbx_core::db::BlobBoundStatement>, AppError> {
+    bound
+        .into_iter()
+        .map(|mut statement| {
+            statement.preview_sql = waf_codec::decode_sql(&statement.preview_sql)?;
+            statement.sql = waf_codec::decode_sql(&statement.sql)?;
+            Ok(statement)
+        })
+        .collect()
+}
+
 pub async fn execute_batch(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -698,6 +714,7 @@ pub async fn execute_batch(
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
     let mut req = req;
     req.statements = waf_codec::decode_sql_vec(req.statements)?;
+    req.bound_statements = req.bound_statements.take().map(decode_bound_statements).transpose()?;
     let database = super::mcp_policy::resolve_database(&state, &headers, &req.connection_id, &req.database).await?;
     for statement in &req.statements {
         super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &database, statement, false).await?;
@@ -925,6 +942,7 @@ pub async fn execute_in_transaction(
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
     let mut req = req;
     req.statements = waf_codec::decode_sql_vec(req.statements)?;
+    req.bound_statements = req.bound_statements.take().map(decode_bound_statements).transpose()?;
     if let Some(bound) = req.bound_statements.as_ref() {
         return dbx_core::query::execute_blob_bound_statements(
             &state.app,
@@ -961,6 +979,7 @@ pub async fn execute_script_with_2pc(
 ) -> Result<Json<dbx_core::query::SchemaDiffDeployResult>, AppError> {
     let mut req = req;
     req.statements = waf_codec::decode_sql_vec(req.statements)?;
+    req.bound_statements = req.bound_statements.take().map(decode_bound_statements).transpose()?;
     if req.bound_statements.is_some() {
         return Err(AppError::from("Bound BLOB saves must use a supported save execution endpoint.".to_string()));
     }
@@ -989,35 +1008,44 @@ fn schema_diff_deploy_may_have_changed_schema(result: &dbx_core::query::SchemaDi
 }
 
 pub async fn analyze_sql_references(
-    Json(req): Json<AnalyzeSqlReferencesRequest>,
+    Json(mut req): Json<AnalyzeSqlReferencesRequest>,
 ) -> Result<Json<dbx_core::sql_analysis::SqlReferenceAnalysis>, AppError> {
+    req.sql = waf_codec::decode_sql(&req.sql)?;
     dbx_core::sql_analysis::analyze_sql_references(&req.sql, req.dialect.as_deref()).map(Json).map_err(AppError::from)
 }
 
-pub async fn find_statement_at_cursor(Json(req): Json<FindStatementAtCursorRequest>) -> Json<String> {
-    Json(
+pub async fn find_statement_at_cursor(Json(req): Json<FindStatementAtCursorRequest>) -> Result<Json<String>, AppError> {
+    let sql = waf_codec::decode_sql(&req.sql)?;
+    Ok(Json(
         req.database_type
-            .map(|db_type| dbx_core::sql::find_statement_at_cursor_for_database(&req.sql, req.cursor_pos, db_type))
-            .unwrap_or_else(|| dbx_core::sql::find_statement_at_cursor(&req.sql, req.cursor_pos)),
-    )
+            .map(|db_type| dbx_core::sql::find_statement_at_cursor_for_database(&sql, req.cursor_pos, db_type))
+            .unwrap_or_else(|| dbx_core::sql::find_statement_at_cursor(&sql, req.cursor_pos)),
+    ))
 }
 
 pub async fn prepare_query_pagination_execution_plan(
     Json(req): Json<PrepareQueryPaginationExecutionPlanRequest>,
-) -> Json<dbx_core::query_result_sql::QueryPaginationExecutionPlan> {
-    Json(dbx_core::query_result_sql::build_query_pagination_execution_plan(req.options))
+) -> Result<Json<dbx_core::query_result_sql::QueryPaginationExecutionPlan>, AppError> {
+    let mut options = req.options;
+    options.sql = waf_codec::decode_sql(&options.sql)?;
+    options.query_base_sql = waf_codec::decode_sql(&options.query_base_sql)?;
+    Ok(Json(dbx_core::query_result_sql::build_query_pagination_execution_plan(options)))
 }
 
 pub async fn build_sorted_query_sql(
     Json(req): Json<BuildSortedQuerySqlRequest>,
-) -> Json<dbx_core::query_result_sql::QuerySqlBuildResult> {
-    Json(dbx_core::query_result_sql::build_sorted_query_sql(req.options))
+) -> Result<Json<dbx_core::query_result_sql::QuerySqlBuildResult>, AppError> {
+    let mut options = req.options;
+    options.original_sql = waf_codec::decode_sql(&options.original_sql)?;
+    Ok(Json(dbx_core::query_result_sql::build_sorted_query_sql(options)))
 }
 
 pub async fn build_explain_sql(
     Json(req): Json<BuildExplainSqlRequest>,
-) -> Json<dbx_core::query_execution_sql::ExplainSqlBuildResult> {
-    Json(dbx_core::query_execution_sql::build_explain_sql(req.options))
+) -> Result<Json<dbx_core::query_execution_sql::ExplainSqlBuildResult>, AppError> {
+    let mut options = req.options;
+    options.sql = waf_codec::decode_sql(&options.sql)?;
+    Ok(Json(dbx_core::query_execution_sql::build_explain_sql(options)))
 }
 
 #[derive(Deserialize)]
@@ -1421,8 +1449,9 @@ pub async fn build_single_column_alter_sql(
 
 pub async fn analyze_editable_query_editability(
     Json(req): Json<AnalyzeEditableQueryRequest>,
-) -> Json<dbx_core::sql_editability::QueryEditability> {
-    Json(dbx_core::sql_editability::analyze_editable_query_editability(&req.sql))
+) -> Result<Json<dbx_core::sql_editability::QueryEditability>, AppError> {
+    let sql = waf_codec::decode_sql(&req.sql)?;
+    Ok(Json(dbx_core::sql_editability::analyze_editable_query_editability(&sql)))
 }
 
 pub async fn prepare_data_grid_save(
@@ -1607,6 +1636,26 @@ mod tests {
         assert!(schema_diff_deploy_may_have_changed_schema(&deploy_result("mixed", 1)));
         assert!(!schema_diff_deploy_may_have_changed_schema(&deploy_result("rolled_back", 1)));
         assert!(!schema_diff_deploy_may_have_changed_schema(&deploy_result("committed", 0)));
+    }
+
+    #[test]
+    fn decode_bound_statements_decodes_preview_and_sql() {
+        let bound = vec![dbx_core::db::BlobBoundStatement {
+            preview_sql: crate::waf_codec::encode_sql_for_test("UPDATE t SET c = ?"),
+            sql: crate::waf_codec::encode_sql_for_test("UPDATE t SET c = ? WHERE id = 1"),
+            blob_parameters: vec!["0a".to_string()],
+        }];
+        let decoded = decode_bound_statements(bound).unwrap();
+        assert_eq!(decoded[0].preview_sql, "UPDATE t SET c = ?");
+        assert_eq!(decoded[0].sql, "UPDATE t SET c = ? WHERE id = 1");
+        // 明文透传(兼容未加密客户端)
+        let plain = vec![dbx_core::db::BlobBoundStatement {
+            preview_sql: "SELECT 1".to_string(),
+            sql: "SELECT 1".to_string(),
+            blob_parameters: Vec::new(),
+        }];
+        let decoded = decode_bound_statements(plain).unwrap();
+        assert_eq!(decoded[0].sql, "SELECT 1");
     }
 
     #[tokio::test]

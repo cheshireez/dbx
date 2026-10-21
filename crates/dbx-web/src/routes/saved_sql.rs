@@ -38,8 +38,9 @@ pub async fn delete_saved_sql_folder(
 
 pub async fn save_saved_sql_file(
     State(state): State<Arc<WebState>>,
-    Json(file): Json<SavedSqlFile>,
+    Json(mut file): Json<SavedSqlFile>,
 ) -> Result<Json<SavedSqlFile>, AppError> {
+    file.sql = crate::waf_codec::decode_sql(&file.sql)?;
     state.app.storage.save_saved_sql_file(&file).await.map_err(AppError::from)?;
     Ok(Json(file))
 }
@@ -62,8 +63,9 @@ pub struct DefaultQueryContent {
 pub async fn save_default_query_content(
     State(state): State<Arc<WebState>>,
     Path(id): Path<String>,
-    Json(content): Json<DefaultQueryContent>,
+    Json(mut content): Json<DefaultQueryContent>,
 ) -> Result<Json<()>, AppError> {
+    content.sql = crate::waf_codec::decode_sql(&content.sql)?;
     state
         .app
         .storage

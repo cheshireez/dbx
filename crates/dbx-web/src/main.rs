@@ -1534,6 +1534,8 @@ async fn serve() -> Result<(), String> {
         api.route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql));
 
     let api = add_mq_routes(api)
+        // WAF 密文请求体统一解码:auth 之后、handler 之前执行
+        .layer(middleware::from_fn(waf_codec::decode_json_request_body))
         .layer(middleware::from_fn_with_state(web_state.clone(), migration_gate))
         .layer(middleware::from_fn_with_state(web_state.clone(), demo::demo_mode_gate))
         .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))

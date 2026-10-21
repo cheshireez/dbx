@@ -700,6 +700,9 @@ impl WebBackend {
         path: &str,
         body: Option<Value>,
     ) -> Result<reqwest::Response, String> {
+        // WAF 载荷加密开关开启时对请求体做字段级深度加密(sql / filter / command 等
+        // SQL 片段字段不落明文),后端 waf_codec 中间件负责递归解密;开关关闭时原样透传。
+        let body = body.map(waf_codec::encode_json_value);
         self.ensure_auth().await?;
         let mut retried = false;
         loop {
@@ -1827,7 +1830,7 @@ impl DbxBackend for WebBackend {
         let mut body = json!({
             "connectionId": connection.id,
             "database": database,
-            "sql": sql,
+            "sql": waf_codec::maybe_encode_sql(sql),
             // Keep Web-mode structured results within the MCP 100-row contract.
             "maxRows": options.max_rows,
             "timeoutSecs": agent_tools::agent_query_timeout_secs(options.timeout_secs, Some(connection)),

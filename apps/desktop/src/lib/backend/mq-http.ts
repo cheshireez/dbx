@@ -1,5 +1,6 @@
 // HTTP fetch API for message queue admin (web mode)
 import { apiUrl } from "@/lib/common/webPath";
+import { encodeSqlDeep } from "@/lib/backend/wafCodec";
 import type {
   MqClusterInfo,
   ClusterInfo,
@@ -60,7 +61,9 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   const resp = await fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    // 与 http.ts 的 post 保持一致:请求体统一走 WAF 载荷加密(payloadText / query / body
+    // 等自由文本字段不落明文),后端 waf_codec 中间件负责递归解密。
+    body: JSON.stringify(await encodeSqlDeep(body)),
   });
   if (!resp.ok) {
     const detail = (await resp.text().catch(() => "")).trim();
