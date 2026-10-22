@@ -42,6 +42,9 @@ RUN git config --global url."https://ghfast.top/https://github.com/".insteadOf "
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # PyPI 走清华镜像
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# rustup 组件下载走 rsproxy 镜像(直连 static.rust-lang.org 会被墙,导致 rustup target add 失败)
+ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
+ENV RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 # apt 走清华镜像(官方源国内不稳且慢,曾导致索引拉不全 install 失败)
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && dpkg --add-architecture arm64 \
