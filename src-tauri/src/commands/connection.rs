@@ -1457,7 +1457,11 @@ async fn test_connection_with_info_impl(
     state: &Arc<AppState>,
     config: ConnectionConfig,
 ) -> Result<ConnectionTestResult, String> {
-    let config = if config.uses_mongodb_oidc() { config.canonicalized() } else { config };
+    let config = if config.uses_mongodb_oidc() || config.db_type == DatabaseType::SqlServer {
+        config.canonicalized()
+    } else {
+        config
+    };
     let tunnel_id = format!("{}:test", config.id);
     let has_transport_layers = config.has_effective_transport_layers();
     let connection_id = if has_transport_layers { tunnel_id.as_str() } else { config.id.as_str() };
@@ -2095,7 +2099,8 @@ async fn connect_db_inner(
     config: ConnectionConfig,
     client_attempt: Option<u64>,
 ) -> Result<String, String> {
-    let config = config.canonicalized();
+    let mut config = config.canonicalized();
+    dbx_core::query::plugin_plan::invalidate_gaussdb_dws_product_version(&mut config);
     if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_remote_worker_requested(&config) {
         db::sqlite::validate_persistent_attachments(
             &config.host,

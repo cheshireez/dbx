@@ -310,6 +310,26 @@ describe("query result grid identity", () => {
     expect(resultGridColumnWidthCacheKey(rerun)).toBe(resultGridColumnWidthCacheKey(first));
     expect(resultGridColumnWidthCacheKey({ ...first, activeResultIndex: 1 })).not.toBe(resultGridColumnWidthCacheKey(first));
   });
+
+  it("identifies external SQL file tabs stably across different tab IDs and normalizes paths", () => {
+    const tab1 = queryTab({ id: "tab-uuid-1", externalSqlPath: "/workspace/query.sql", activeResultIndex: 0 });
+    const tab2 = queryTab({ id: "tab-uuid-2", externalSqlPath: "\\workspace\\query.sql", activeResultIndex: 0 });
+    const tabOtherResult = queryTab({ id: "tab-uuid-3", externalSqlPath: "/workspace/query.sql", activeResultIndex: 1 });
+
+    expect(resultGridColumnWidthCacheKey(tab1)).toBe("result-column-width-file-/workspace/query.sql-0");
+    expect(resultGridColumnWidthCacheKey(tab2)).toBe(resultGridColumnWidthCacheKey(tab1));
+    expect(resultGridColumnWidthCacheKey(tabOtherResult)).toBe("result-column-width-file-/workspace/query.sql-1");
+  });
+
+  it("identifies saved SQL queries stably across different tab IDs", () => {
+    const tab1 = queryTab({ id: "tab-uuid-1", savedSqlId: "saved-sql-42", activeResultIndex: 0 });
+    const tab2 = queryTab({ id: "tab-uuid-2", savedSqlId: "saved-sql-42", activeResultIndex: 0 });
+    const tabOtherResult = queryTab({ id: "tab-uuid-3", savedSqlId: "saved-sql-42", activeResultIndex: 2 });
+
+    expect(resultGridColumnWidthCacheKey(tab1)).toBe("result-column-width-saved-saved-sql-42-0");
+    expect(resultGridColumnWidthCacheKey(tab2)).toBe(resultGridColumnWidthCacheKey(tab1));
+    expect(resultGridColumnWidthCacheKey(tabOtherResult)).toBe("result-column-width-saved-saved-sql-42-2");
+  });
 });
 
 describe("result run labels", () => {
@@ -1011,6 +1031,30 @@ describe("shared tab presentation helpers", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("restricts connection tab coloring to active tab when scope is active (#12955)", () => {
+    const settings = useSettingsStore().editorSettings;
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "conn-1", name: "One", db_type: "mysql", color: "#3b82f6" }] as ConnectionConfig[];
+    const tab = queryTab({ connectionId: "conn-1" });
+
+    settings.colorizeConnectionTabs = true;
+    settings.colorizeConnectionTabsScope = "all";
+    const activeAll = tabColorStyle(tab, true, false);
+    const inactiveAll = tabColorStyle(tab, false, false);
+    expect(activeAll?.["--app-tab-background"]).toBe("rgba(59, 130, 246, 0.24)");
+    expect(activeAll?.borderColor).toBe("rgba(59, 130, 246, 0.72)");
+    expect(inactiveAll?.["--app-tab-background"]).toBe("rgba(59, 130, 246, 0.09)");
+    expect(inactiveAll?.borderColor).toBe("rgba(59, 130, 246, 0.18)");
+
+    settings.colorizeConnectionTabsScope = "active";
+    const activeScope = tabColorStyle(tab, true, false);
+    const inactiveScope = tabColorStyle(tab, false, false);
+    expect(activeScope?.["--app-tab-background"]).toBe("rgba(59, 130, 246, 0.24)");
+    expect(activeScope?.borderColor).toBe("rgba(59, 130, 246, 0.72)");
+    expect(inactiveScope?.borderColor).toBeUndefined();
+    expect(inactiveScope?.["--app-tab-background"]).toBeUndefined();
   });
 
   it("swaps inline color-mix tab colors for concrete rgba on legacy WebViews", () => {

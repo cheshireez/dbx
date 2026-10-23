@@ -79,6 +79,7 @@ import type {
   SavedSqlLibrary,
   SshConfigHostEntry,
   LocalSshKey,
+  SshAgentIdentity,
   TunnelProfile,
 } from "@/types/database";
 import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
@@ -344,6 +345,7 @@ export { encodeSqlDeep, isWafSqlField } from "@/lib/backend/wafCodec";
 const DESKTOP_SETTINGS_STORAGE_KEY = "dbx-desktop-settings";
 const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   show_tray_icon: true,
+  linux_floating_frame_enabled: true,
   icon_theme: "default",
   quit_on_close: false,
   close_action_prompted: false,
@@ -626,6 +628,10 @@ export async function saveTunnelProfiles(profiles: TunnelProfile[]): Promise<voi
 
 export async function testTunnelProfile(profile: TunnelProfile): Promise<string> {
   return post("/api/tunnel-profiles/test", profile);
+}
+
+export async function listSshAgentIdentities(_sshAgentSockPath: string): Promise<SshAgentIdentity[]> {
+  return []; // The web backend cannot reach a local SSH agent socket
 }
 
 export async function resolveSshPrompt(resolution: SshPromptResolution): Promise<void> {
@@ -1875,6 +1881,14 @@ export async function buildTableSelectSql(options: BuildTableSelectSqlOptions): 
 
 export async function buildDatabaseSearchSql(options: DatabaseSearchSqlOptions): Promise<DatabaseSearchSql | null> {
   return post("/api/query/build-database-search-sql", { options });
+}
+
+export async function buildDatabaseSearchColumnsSql(options: import("@/lib/database/databaseSearchColumns").DatabaseSearchColumnsSqlOptions): Promise<{ sql: string } | null> {
+  return post("/api/query/build-database-search-columns-sql", { options });
+}
+
+export async function buildDatabaseSearchProbeSql(options: import("@/lib/database/databaseSearchProbe").DatabaseSearchProbeSqlOptions): Promise<{ sql: string; includedIndices: number[] } | null> {
+  return post("/api/query/build-database-search-probe-sql", { options });
 }
 
 export async function buildDatabaseStructureSearchSql(options: DatabaseStructureSearchSqlOptions): Promise<DatabaseStructureSearchSql | null> {
@@ -5679,6 +5693,10 @@ export async function discardDownloadedUpdate(_cacheId: string): Promise<void> {
 
 export async function installDownloadedUpdate(_cacheId: string, _expectedVersion: string): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
+}
+
+export async function relaunchApp(): Promise<void> {
+  throw new Error("Restarting DBX is only available in the desktop app.");
 }
 
 export async function getAppVersion(): Promise<string> {

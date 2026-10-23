@@ -36,11 +36,13 @@ use crate::types::SpatialColumn;
 use crate::xlsx_export::{
     finish_streaming_xlsx_workbook, start_streaming_xlsx_workbook_with_options, StreamingXlsxWriter, XlsxWorksheetData,
 };
+use mysql_async::prelude::Queryable;
 use serde_json::Value;
 use sqlparser::ast::{
-    GroupByExpr, ObjectName, ObjectNamePart, ObjectType, OrderByKind, SelectItem, SetExpr, Statement, TableFactor,
+    Expr, GroupByExpr, ObjectName, ObjectNamePart, ObjectType, OrderByKind, SelectItem, Set, SetExpr, Statement,
+    TableFactor,
 };
-use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+use sqlparser::dialect::{GenericDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 use tokio_util::sync::CancellationToken;
 
@@ -232,6 +234,43 @@ fn safe_postgres_temp_setup_sql(setup_sql: &[String]) -> Option<Vec<String>> {
     }
 
     Some(setup_sql.to_vec())
+}
+
+/// MySQL setup statements an export may replay: only `SET @user_var = <literal>`.
+///
+/// Exports run on a dedicated session, so user variables set earlier in the same batch
+/// (`SET @id = '123'; SELECT ... WHERE id = @id`) are NULL there and the export comes back
+/// empty (#13111). Literal user-variable assignments have no side effects and do not depend
+/// on the statements skipped around them, so they are the only ones replayed.
+fn mysql_user_variable_setup_sql(setup_sql: &[String]) -> Vec<String> {
+    let is_user_variable = |name: &ObjectName| {
+        let name = name.to_string();
+        name.starts_with('@') && !name.starts_with("@@")
+    };
+    let is_literal = |expr: &Expr| match expr {
+        Expr::Value(_) => true,
+        Expr::UnaryOp { expr, .. } => matches!(expr.as_ref(), Expr::Value(_)),
+        _ => false,
+    };
+    let dialect = MySqlDialect {};
+    setup_sql
+        .iter()
+        .filter(|sql| {
+            let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
+                return false;
+            };
+            match statements.as_slice() {
+                [Statement::Set(Set::SingleAssignment { scope: None, hivevar: false, variable, values })] => {
+                    is_user_variable(variable) && values.len() == 1 && is_literal(&values[0])
+                }
+                [Statement::Set(Set::MultipleAssignments { assignments })] => assignments.iter().all(|assignment| {
+                    assignment.scope.is_none() && is_user_variable(&assignment.name) && is_literal(&assignment.value)
+                }),
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 fn split_excel_cell_text(value: &str) -> Vec<String> {
@@ -1619,14 +1658,22 @@ async fn try_export_mysql_query_result_stream(
         cancel_token.as_ref(),
     )
     .await?;
+    for setup in mysql_user_variable_setup_sql(&request.setup_sql) {
+        conn.query_drop(setup)
+            .await
+            .map_err(|error| format!("Failed to restore session variables for export: {error}"))?;
+    }
     let mysql_connection_id = conn.id();
     let kill_opts = conn.opts().clone();
     if let Some(execution_id) = request.execution_id.clone() {
         let interrupt_kill_opts = kill_opts.clone();
+        let kill_timeout = operation_budget.checkout_timeout;
         state.running_queries.register_interrupt(&execution_id, move || {
             let kill_opts = interrupt_kill_opts.clone();
             tokio::spawn(async move {
-                if let Err(error) = crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id).await {
+                if let Err(error) =
+                    crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id, kill_timeout).await
+                {
                     log::warn!("Failed to cancel MySQL export query {mysql_connection_id}: {error}");
                 }
             });
@@ -1760,7 +1807,9 @@ async fn try_export_mysql_query_result_stream(
     )
     .await;
     if stream_result.as_ref().is_err_and(|error| error == &timeout_error) {
-        let _ = crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id).await;
+        let _ =
+            crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id, operation_budget.checkout_timeout)
+                .await;
     }
     watcher_done.cancel();
 
@@ -2577,6 +2626,24 @@ mod tests {
     }
 
     #[test]
+    fn mysql_setup_replays_only_literal_user_variable_assignments() {
+        let setup = vec![
+            "SET @ID = '123'".to_string(),
+            "SET @a = 1, @b = -2".to_string(),
+            "UPDATE orders SET status = 'x'".to_string(),
+            "SET @@session.sql_mode = ''".to_string(),
+            "SET SESSION wait_timeout = 10".to_string(),
+            "SET @n = (SELECT COUNT(*) FROM orders)".to_string(),
+            "SET @f = my_function()".to_string(),
+        ];
+        assert_eq!(
+            mysql_user_variable_setup_sql(&setup),
+            vec!["SET @ID = '123'".to_string(), "SET @a = 1, @b = -2".to_string()]
+        );
+        assert!(mysql_user_variable_setup_sql(&[]).is_empty());
+    }
+
+    #[test]
     fn postgres_temp_setup_accepts_only_session_local_table_operations() {
         let safe = vec![
             "CREATE TEMPORARY TABLE t1 AS SELECT 1 AS id".to_string(),
@@ -3088,9 +3155,97 @@ mod tests {
         let req = request("csv", Some(1000), None);
         assert!(supports_streaming_offset_pagination(&req, 100));
 
+        let oscar_req =
+            QueryResultExportRequest { database_type: DatabaseType::Oscar, ..request("csv", Some(1000), None) };
+        assert!(!supports_streaming_offset_pagination(&oscar_req, 100));
+
         let oracle_req =
             QueryResultExportRequest { database_type: DatabaseType::Oracle, ..request("csv", Some(1000), None) };
         assert!(!supports_streaming_offset_pagination(&oracle_req, 100));
+
+        let oracle_safe_req = QueryResultExportRequest {
+            database_type: DatabaseType::Oracle,
+            sql: "SELECT id, name FROM users".to_string(),
+            query_base_sql: "SELECT id, name FROM users".to_string(),
+            ..request("csv", Some(1000), None)
+        };
+        assert!(supports_streaming_offset_pagination(&oracle_safe_req, 100));
+    }
+
+    #[test]
+    fn oracle_streaming_offset_pagination_supports_single_and_join_queries() {
+        let mut req = request("csv", Some(1000), None);
+        req.database_type = DatabaseType::Oracle;
+        req.sql = "SELECT code, name FROM BD_MATERIAL".to_string();
+        req.query_base_sql = req.sql.clone();
+        assert!(supports_streaming_offset_pagination(&req, 100));
+        assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false, false), None);
+
+        let plan1 = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: req.sql.clone(),
+            query_base_sql: req.query_base_sql.clone(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: true,
+            execution_hint: None,
+        });
+        assert_eq!(
+            plan1.page_sql.as_deref(),
+            Some("SELECT * FROM (SELECT code, name FROM BD_MATERIAL) WHERE ROWNUM <= 100;")
+        );
+
+        let plan2 = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: req.sql.clone(),
+            query_base_sql: req.query_base_sql.clone(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit: 100, offset: 100, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: true,
+            execution_hint: None,
+        });
+        assert_eq!(
+            plan2.page_sql.as_deref(),
+            Some("SELECT * FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT code, name FROM BD_MATERIAL) dbx_inner WHERE ROWNUM <= 200) WHERE \"__dbx_row_num\" > 100;")
+        );
+
+        req.sql = "SELECT DISTINCT bm.code 物料编码, bm.name 物料名称, bs.name 仓库 FROM BD_MATERIAL bm INNER JOIN BD_MATERIALSTOCK bm2 ON bm.PK_MATERIAL = bm2.PK_MATERIAL".to_string();
+        req.query_base_sql = req.sql.clone();
+        assert!(supports_streaming_offset_pagination(&req, 100));
+        assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false, false), None);
+
+        req.sql = "SELECT code, name FROM BD_MATERIAL ORDER BY code ASC".to_string();
+        req.query_base_sql = req.sql.clone();
+        assert!(supports_streaming_offset_pagination(&req, 100));
+        assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false, false), None);
+    }
+
+    #[test]
+    fn oracle_wildcard_and_duplicate_projection_export_require_cursor_and_follow_its_end() {
+        for sql in [
+            "SELECT * FROM events",
+            "SELECT t.* FROM events t",
+            "SELECT a.name, a.* FROM people a ORDER BY a.id",
+            "SELECT a.id, b.id FROM people a JOIN people b ON a.id = b.id",
+            "SELECT id FROM people FOR UPDATE",
+            "SELECT id FROM people WHERE ROWNUM <= 10",
+            "SELECT id FROM people FETCH FIRST 10 ROWS ONLY",
+        ] {
+            let mut req = request("csv", None, None);
+            req.database_type = DatabaseType::Oracle;
+            req.sql = sql.into();
+            req.query_base_sql = req.sql.clone();
+            req.use_agent_cursor = true;
+            assert!(!supports_streaming_offset_pagination(&req, 100));
+            assert_eq!(streaming_pagination_preflight_error(&req, 100, false, false, req.use_agent_cursor), None);
+            assert!(should_fetch_next_page(true, true, 100, 100, 100));
+            assert!(!should_fetch_next_page(true, false, 100, 100, 100));
+            req.use_agent_cursor = false;
+            assert_eq!(
+                streaming_pagination_preflight_error(&req, 100, false, false, req.use_agent_cursor),
+                Some(STREAMING_PAGINATION_UNSUPPORTED_ERROR)
+            );
+        }
     }
 
     #[test]

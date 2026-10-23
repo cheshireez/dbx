@@ -87,6 +87,7 @@ export const loadConnections = forward("loadConnections");
 export const loadTunnelProfiles = forward("loadTunnelProfiles");
 export const saveTunnelProfiles = forward("saveTunnelProfiles");
 export const testTunnelProfile = forward("testTunnelProfile");
+export const listSshAgentIdentities = forward("listSshAgentIdentities");
 export const resolveSshPrompt = forward("resolveSshPrompt");
 export const readKeychainPassword = forward("readKeychainPassword");
 export const readKeychainPasswords = forward("readKeychainPasswords");
@@ -304,6 +305,8 @@ export const buildCreateUserSql = forward("buildCreateUserSql");
 export const buildDroppedFilePreviewSql = forward("buildDroppedFilePreviewSql");
 export const buildTableSelectSql = forward("buildTableSelectSql");
 export const buildDatabaseSearchSql = forward("buildDatabaseSearchSql");
+export const buildDatabaseSearchColumnsSql = forward("buildDatabaseSearchColumnsSql");
+export const buildDatabaseSearchProbeSql = forward("buildDatabaseSearchProbeSql");
 export const buildDatabaseStructureSearchSql = forward("buildDatabaseStructureSearchSql");
 export const supportsDatabaseStructureSearch = forward("supportsDatabaseStructureSearch");
 export const buildSearchResultWhere = forward("buildSearchResultWhere");
@@ -1000,6 +1003,7 @@ export const cancelUpdateDownload = forward("cancelUpdateDownload");
 export const getDownloadedUpdate = forward("getDownloadedUpdate");
 export const discardDownloadedUpdate = forward("discardDownloadedUpdate");
 export const installDownloadedUpdate = forward("installDownloadedUpdate");
+export const relaunchApp = forward("relaunchApp");
 export const getAppVersion = forward("getAppVersion");
 export const getAppSupportInfo = forward("getAppSupportInfo");
 
@@ -1159,6 +1163,7 @@ export type {
   TransferObjectKind,
   TransferObjectSelection,
   TransferTableNameCase,
+  TransferColumnNameCase,
   TransferOwnershipPolicy,
   TransferStructureOperation,
   TransferStructureOperationKind,

@@ -452,6 +452,8 @@ pub struct TabRuntimeCachePruneResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopSettings {
     pub show_tray_icon: bool,
+    #[serde(default = "default_linux_floating_frame_enabled")]
+    pub linux_floating_frame_enabled: bool,
     pub icon_theme: DesktopIconTheme,
     #[serde(default)]
     pub quit_on_close: bool,
@@ -1000,10 +1002,15 @@ pub fn default_duckdb_worker_max_processes() -> usize {
     DUCKDB_WORKER_MAX_PROCESSES_DEFAULT
 }
 
+fn default_linux_floating_frame_enabled() -> bool {
+    true
+}
+
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
             show_tray_icon: true,
+            linux_floating_frame_enabled: true,
             icon_theme: DesktopIconTheme::Default,
             quit_on_close: false,
             close_action_prompted: false,
@@ -5393,6 +5400,10 @@ impl Storage {
 
     pub async fn save_desktop_settings(&self, desktop_settings: &DesktopSettings) -> Result<(), String> {
         let mut settings = self.load_app_settings_json().await?;
+        settings.insert(
+            "linux_floating_frame_enabled".to_string(),
+            serde_json::Value::Bool(desktop_settings.linux_floating_frame_enabled),
+        );
         settings.remove("run_in_background");
         settings.insert("show_tray_icon".to_string(), serde_json::Value::Bool(desktop_settings.show_tray_icon));
         settings.insert(
@@ -5482,6 +5493,10 @@ impl Storage {
     pub async fn load_desktop_settings(&self) -> Result<DesktopSettings, String> {
         let settings = self.load_app_settings_json().await?;
         Ok(DesktopSettings {
+            linux_floating_frame_enabled: settings
+                .get("linux_floating_frame_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
             show_tray_icon: settings
                 .get("show_tray_icon")
                 .and_then(|value| value.as_bool())
@@ -9434,6 +9449,10 @@ fn apply_desktop_settings_in_tx(
     selected_keys: Option<&[String]>,
 ) -> Result<(), String> {
     let mut values = serde_json::Map::new();
+    values.insert(
+        "linux_floating_frame_enabled".to_string(),
+        serde_json::Value::Bool(settings.linux_floating_frame_enabled),
+    );
     values.insert("show_tray_icon".to_string(), serde_json::Value::Bool(settings.show_tray_icon));
     values.insert("icon_theme".to_string(), serde_json::to_value(settings.icon_theme).map_err(|e| e.to_string())?);
     values.insert("quit_on_close".to_string(), serde_json::Value::Bool(settings.quit_on_close));
@@ -11716,6 +11735,7 @@ mod tests {
             expose_lan: false,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
+            ssh_agent_key_fingerprint: String::new(),
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
@@ -11761,6 +11781,7 @@ mod tests {
             enabled: true,
             url: "https://bastion.example.com".to_string(),
             token: "tunnel-token".to_string(),
+            protocol: crate::models::connection::HttpTunnelProtocol::DbxTcp,
             connect_timeout_secs: 5,
             profile_id: String::new(),
         });
@@ -13443,6 +13464,7 @@ mod tests {
         storage
             .save_desktop_settings(&DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 quit_on_close: true,
                 close_action_prompted: false,
@@ -13467,6 +13489,7 @@ mod tests {
             storage.load_desktop_settings().await.unwrap(),
             DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 quit_on_close: true,
                 close_action_prompted: false,
@@ -13587,6 +13610,21 @@ mod tests {
             settings.get("sidebar_table_page_size").and_then(|value| value.as_u64()),
             Some(DesktopSettings::default().sidebar_table_page_size as u64)
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_settings_persist_linux_floating_frame_preference() {
+        let path = temp_db_path("desktop-settings-linux-floating-frame");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        assert!(storage.load_desktop_settings().await.unwrap().linux_floating_frame_enabled);
+        for enabled in [false, true] {
+            let settings = DesktopSettings { linux_floating_frame_enabled: enabled, ..DesktopSettings::default() };
+            storage.save_desktop_settings(&settings).await.unwrap();
+            assert_eq!(storage.load_desktop_settings().await.unwrap().linux_floating_frame_enabled, enabled);
+        }
+        let mut legacy = serde_json::to_value(DesktopSettings::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("linux_floating_frame_enabled");
+        assert!(serde_json::from_value::<DesktopSettings>(legacy).unwrap().linux_floating_frame_enabled);
     }
 
     #[tokio::test]
@@ -13744,6 +13782,7 @@ mod tests {
         storage
             .save_desktop_settings(&DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 ..DesktopSettings::default()
             })
@@ -13756,6 +13795,7 @@ mod tests {
             storage.load_desktop_settings().await.unwrap(),
             DesktopSettings {
                 show_tray_icon: false,
+                linux_floating_frame_enabled: true,
                 icon_theme: DesktopIconTheme::Black,
                 ..DesktopSettings::default()
             }
@@ -13874,6 +13914,8 @@ mod tests {
             default_mode: Some(AiAssistantMode::Agent),
             default_auto_routing: true,
             restore_last_conversation: true,
+            include_query_result: false,
+            exclude_query_result: false,
             default_templates_by_db_type: BTreeMap::from([("postgresql".to_string(), vec!["tpl-1".to_string()])]),
             last_used_templates_by_db_type: BTreeMap::from([("mysql".to_string(), vec!["tpl-2".to_string()])]),
         };

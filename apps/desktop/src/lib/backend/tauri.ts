@@ -111,6 +111,7 @@ import type {
   SavedSqlLibrary,
   SshConfigHostEntry,
   LocalSshKey,
+  SshAgentIdentity,
   TunnelProfile,
   TransactionLog,
   ExternalSqlFileVersion,
@@ -318,6 +319,7 @@ export interface DriverRuntimeSummary {
 
 export interface DesktopSettings {
   show_tray_icon: boolean;
+  linux_floating_frame_enabled?: boolean;
   icon_theme: "default" | "black";
   quit_on_close: boolean;
   close_action_prompted: boolean;
@@ -2310,6 +2312,14 @@ export async function buildDatabaseSearchSql(options: DatabaseSearchSqlOptions):
   return invoke("build_database_search_sql", { options });
 }
 
+export async function buildDatabaseSearchColumnsSql(options: import("@/lib/database/databaseSearchColumns").DatabaseSearchColumnsSqlOptions): Promise<{ sql: string } | null> {
+  return invoke("build_database_search_columns_sql", { options });
+}
+
+export async function buildDatabaseSearchProbeSql(options: import("@/lib/database/databaseSearchProbe").DatabaseSearchProbeSqlOptions): Promise<{ sql: string; includedIndices: number[] } | null> {
+  return invoke("build_database_search_probe_sql", { options });
+}
+
 export async function buildDatabaseStructureSearchSql(options: DatabaseStructureSearchSqlOptions): Promise<DatabaseStructureSearchSql | null> {
   return invoke("build_database_structure_search_sql", { options });
 }
@@ -2872,6 +2882,10 @@ export async function saveTunnelProfiles(profiles: TunnelProfile[]): Promise<voi
 
 export async function testTunnelProfile(profile: TunnelProfile): Promise<string> {
   return invoke("test_tunnel_profile", { profile });
+}
+
+export async function listSshAgentIdentities(sshAgentSockPath: string): Promise<SshAgentIdentity[]> {
+  return invoke("list_ssh_agent_identities", { sshAgentSockPath });
 }
 
 export async function resolveSshPrompt(resolution: SshPromptResolution): Promise<void> {
@@ -3474,6 +3488,11 @@ export async function discardDownloadedUpdate(cacheId: string): Promise<void> {
 
 export async function installDownloadedUpdate(cacheId: string, expectedVersion: string): Promise<void> {
   return invoke("install_downloaded_update", { cacheId, expectedVersion });
+}
+
+export async function relaunchApp(): Promise<void> {
+  // macOS relaunches through LaunchServices so the new process keeps its local-network grant.
+  return invoke("relaunch_app");
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -5832,6 +5851,7 @@ export async function listenSqlFileProgress(handler: (progress: SqlFileProgress)
 // --- Data Transfer ---
 export type TransferMode = "append" | "overwrite" | "upsert";
 export type TransferTableNameCase = "preserve" | "lower" | "upper";
+export type TransferColumnNameCase = "preserve" | "lower" | "upper";
 export type TransferOwnershipPolicy = "preserve" | "skip" | "reassignMissing";
 export type TransferContent = "structureAndData" | "structureOnly" | "dataOnly";
 export type TransferObjectKind = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "EVENT";
@@ -5857,6 +5877,7 @@ export interface TransferRequest {
   objects: TransferObjectSelection[];
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
+  targetColumnNameCase?: TransferColumnNameCase;
   quoteTargetColumnNames: boolean;
   ownershipPolicy?: TransferOwnershipPolicy;
   batchSize: number;

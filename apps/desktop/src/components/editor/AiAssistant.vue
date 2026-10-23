@@ -54,8 +54,10 @@ import {
   Bot,
   Camera,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Clock,
   Hourglass,
   CircleSlash,
@@ -79,6 +81,7 @@ import {
   Server,
   ShieldCheck,
   Table2,
+  Target,
   Play,
   Square,
   Sparkles,
@@ -144,6 +147,7 @@ import {
   type CustomPromptContext,
 } from "@/lib/ai/ai";
 import { activeAiRunBinding, aiContextTargetFor, bindingForSnapshot, resolveConversationBinding, resolveExternalSendTarget, sameConversationBinding, type AiConversationBinding } from "@/lib/ai/aiConversationBinding";
+import { resolveComposerDatabaseReset, toggleSelectedDatabase, withDatabaseSelected, type AiComposerScope } from "@/lib/ai/aiComposerDatabases";
 import type { AiExternalContextRequest } from "@/lib/ai/aiExternalContext";
 import {
   AI_IMAGE_ATTACHMENT_MAX_BYTES,
@@ -1043,6 +1047,17 @@ watch([skillStateKey, () => selectedSkillChips.value.map((chip) => chip.id).join
   conversationSkillHintSeen.add(key);
   skillHintLatch.value = { key, id: chips[0].id, name: chips[0].name };
 });
+const selectedSkillsCollapsed = ref(false);
+const loadedSelectedSkillsCount = computed(() => selectedSkillChips.value.filter((chip) => chip.loaded).length);
+
+watch(
+  () => selectedSkillChips.value.length,
+  (len) => {
+    if (len === 0) {
+      selectedSkillsCollapsed.value = false;
+    }
+  },
+);
 // Minting the unsaved chat's id on its first send (or when queueing) is not a
 // conversation switch: move the unsaved chat's skill state onto the id it just
 // adopted, or the brand-new id would read as a fresh conversation (Req 14) and
@@ -2457,44 +2472,92 @@ function syncSelectedDatabases() {
   const active = selectedNamespace.value;
   const available = dbSelectOptions.value.map((option) => option.database);
   const retained = selectedDatabases.value.filter((database) => available.includes(database));
-  const next = retained.length ? retained : active ? [active] : [];
+  // The target is always part of the scope: the run executes on it even when the
+  // options list has not loaded yet, and @ mentions resolve against the selection
+  // (#12972).
+  const next = withDatabaseSelected(retained.length ? retained : active ? [active] : [], active);
   removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
   selectedDatabases.value = next;
 }
 
 function toggleDatabase(database: string) {
-  if (selectedDatabaseValues.value.has(database)) {
-    if (selectedDatabases.value.length === 1) return;
-    selectedDatabases.value = selectedDatabases.value.filter((item) => item !== database);
-    removeMentionsOfDatabases([database]);
-  } else {
-    selectedDatabases.value = [...selectedDatabases.value, database];
+  // Extra selected databases are read-only context. The target is set through
+  // `setDatabaseTarget` instead, so unchecking cannot silently move SQL elsewhere.
+  const next = toggleSelectedDatabase(selectedDatabases.value, database, selectedNamespace.value);
+  if (!next) return;
+  removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
+  selectedDatabases.value = next;
+}
+
+/** Drop the extra context databases. The target itself is never deselectable (#12972). */
+function clearDatabaseSelection() {
+  const next = selectedNamespace.value ? [selectedNamespace.value] : [];
+  removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
+  selectedDatabases.value = next;
+}
+
+/** Whether `database` is the namespace this chat executes on. */
+function isTargetNamespace(database: string): boolean {
+  return !!database && database === selectedNamespace.value;
+}
+
+/**
+ * Make `database` the database this chat executes on (#12972).
+ *
+ * The conversation binding is the single execution target (SQL actions, agent
+ * handoff, write confirmations), so retargeting writes it — it must not touch the
+ * visible editor tab (#9902). Dameng's top-level namespace is a schema, so there
+ * the target is the conversation schema, not its configured database.
+ */
+function setDatabaseTarget(database: string) {
+  const connection = boundConnection.value;
+  if (!connection || !database || isTargetNamespace(database)) return;
+  clearContextReferences();
+  selectedDatabases.value = withDatabaseSelected(selectedDatabases.value, database);
+  if (resolveAiNamespaceSelection({ database: boundDatabase.value, schema: boundSchema.value }, connection).kind === "schema") {
+    void rebindConversation(connection, boundDatabase.value, database);
+    return;
   }
+  // A schema belongs to one database: the previous one may not exist (or may
+  // name a different namespace) in the database being retargeted, and it is used
+  // for metadata reads and SQL execution alike (#12972). Re-pick it instead.
+  void rebindConversation(connection, database, undefined);
 }
 
 const selectedNamespace = computed(() => (boundConnection.value ? resolveAiNamespaceSelection({ database: boundDatabase.value, schema: boundSchema.value }, boundConnection.value).value : ""));
 
-// Reset the composer's database multi-select whenever the *namespace* changes.
+/** Scope a selection belongs to; see `resolveComposerDatabaseReset`. */
+const composerDatabaseScope = computed<AiComposerScope>(() => ({
+  conversationId: conversationId.value,
+  connectionId: boundConnectionId.value,
+  namespace: selectedNamespace.value,
+}));
+
+// Reset the composer's database multi-select when the *scope* moves: another
+// conversation, another connection, or (on schema-scoped engines such as Dameng)
+// another namespace.
 //
 // `selectedDatabases` is a single ref for the whole panel, and the key used to be
 // `connection:tab` — so switching to another conversation kept the previous one's
 // selection, i.e. the "bound database" leaked between chats (#9902). The
 // conversation id belongs in the key; the namespace keeps a fresh, unsaved chat
-// following the visible tab. A bound conversation's namespace no longer depends
-// on the visible tab, so switching tabs inside it no longer resets the selection.
-watch(
-  () => `${boundConnectionId.value}\u0000${boundDatabase.value}\u0000${boundSchema.value ?? ""}\u0000${conversationId.value}`,
-  () => {
-    const next = selectedNamespace.value ? [selectedNamespace.value] : [];
-    // A chip naming a database this namespace change just dropped out of the
-    // selection would be quoted in the message while the run refuses to read it
-    // (#11660) — the same rule the deselect handler applies, at the other place
-    // the selection changes. An unresolved namespace prunes nothing: the chip is
-    // inert and the request-time scope guard still refuses it.
-    if (next.length) removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
-    selectedDatabases.value = next;
-  },
-);
+// following the visible tab.
+//
+// A schema change on a database-scoped engine is deliberately NOT a scope change:
+// the schema belongs to the target database, and resetting here used to move the
+// chat back to the connection's default database (`postgres` on PostgreSQL) while
+// the picker still showed the user's choice (#12972).
+watch(composerDatabaseScope, (next, previous) => {
+  const reset = resolveComposerDatabaseReset(previous, next, selectedDatabases.value);
+  if (!reset) return;
+  // A chip naming a database this scope change just dropped out of the
+  // selection would be quoted in the message while the run refuses to read it
+  // (#11660) — the same rule the deselect handler applies, at the other place
+  // the selection changes. An unresolved namespace prunes nothing: the chip is
+  // inert and the request-time scope guard still refuses it.
+  if (reset.length) removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !reset.includes(database)));
+  selectedDatabases.value = reset;
+});
 watch([dbSelectOptions, selectedNamespace], syncSelectedDatabases, { immediate: true });
 
 const showAiDatabaseSelector = computed(() => !!boundConnection.value && supportsAiAssistantContext(boundConnection.value.db_type));
@@ -4674,13 +4737,14 @@ async function send() {
       // paying for buildAiContext() too; it can do real backend/schema work that
       // would be entirely wasted on an already-abandoned request.
       if (!generationCanContinue()) return;
-      const requestDatabase = runDatabases[0] ?? tab.database;
+      // The run's primary database is the chat's execution target (the picker's
+      // "target"), not the first database in the context selection: the model
+      // must answer for the database its SQL will actually run on (#12972).
+      const requestDatabase = tab.database;
       const context = await buildAiContext(
-        {
-          ...tab,
-          database: requestDatabase,
-          schema: runDatabases.length > 1 || requestDatabase !== tab.database ? undefined : tab.schema,
-        },
+        // The schema belongs to the target database; extra context databases must
+        // not drop it — they are only readable alongside the target.
+        { ...tab, database: requestDatabase },
         connection,
         {
           databases: runDatabases,
@@ -4688,6 +4752,7 @@ async function send() {
           sqlFiles,
           csvFiles: csvAttachments,
           selections: selectionContexts,
+          includeQueryResult: settings.includeQueryResult,
         },
       );
       context.selectedDatabases = runDatabases;
@@ -7252,6 +7317,11 @@ async function openExternalUrl(url: string) {
                   <PopoverTrigger as-child>
                     <Button variant="ghost" :title="selectedDatabaseLabel" :aria-label="selectedDatabaseLabel" :class="['ai-database-selector-trigger h-5 min-w-0 max-w-64 justify-start gap-1 border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'flex-1']">
                       <Database class="ai-database-selector-icon h-3 w-3 shrink-0 text-foreground/40" />
+                      <!-- Non-target databases are read-only context; the target is
+                           where AI SQL actions run, so it is marked in the trigger (#12972). -->
+                      <span v-if="selectedNamespace" class="flex shrink-0 items-center" :title="t('ai.databaseTarget')" data-ai-database-target-icon>
+                        <Target class="h-3 w-3 text-primary/70" />
+                      </span>
                       <span class="truncate">{{ selectedDatabaseLabel }}</span>
                     </Button>
                   </PopoverTrigger>
@@ -7260,12 +7330,16 @@ async function openExternalUrl(url: string) {
                       <Search class="pointer-events-none absolute left-3 h-3 w-3 text-muted-foreground" />
                       <input v-model="databaseSearchQuery" type="search" class="h-6 w-full bg-transparent pl-5 text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('ai.searchDatabases')" />
                     </div>
-                    <button v-if="selectedDatabases.length > 1" type="button" class="mb-1 flex w-full items-center justify-end gap-1 border-b px-2 py-1 text-xs" @click.stop="selectedDatabases = []"><X class="h-3 w-3" />{{ t("ai.clearDatabaseSelection") }}</button>
+                    <button v-if="selectedDatabases.length > 1" type="button" class="mb-1 flex w-full items-center justify-end gap-1 border-b px-2 py-1 text-xs" @click.stop="clearDatabaseSelection()"><X class="h-3 w-3" />{{ t("ai.clearDatabaseSelection") }}</button>
                     <div class="max-h-64 overflow-y-auto overscroll-contain">
-                      <button v-for="option in filteredDbSelectOptions" :key="option.value" type="button" :title="option.label" class="flex w-full min-w-0 items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted" @click="toggleDatabase(option.database)">
-                        <Check :class="['h-4 w-4 shrink-0', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
-                        <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
-                      </button>
+                      <div v-for="option in filteredDbSelectOptions" :key="option.value" class="flex w-full min-w-0 items-center gap-1 rounded-sm pr-1 text-sm hover:bg-muted">
+                        <button type="button" :title="option.label" class="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left" @click="toggleDatabase(option.database)">
+                          <Check :class="['h-4 w-4 shrink-0', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
+                          <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
+                        </button>
+                        <span v-if="isTargetNamespace(option.database)" class="shrink-0 rounded-sm bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary" data-ai-database-target>{{ t("ai.databaseTarget") }}</span>
+                        <button v-else type="button" class="shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground" data-ai-database-target-action @click.stop="setDatabaseTarget(option.database)">{{ t("ai.setDatabaseTarget") }}</button>
+                      </div>
                       <div v-if="!filteredDbSelectOptions.length" class="px-2 py-1.5 text-sm text-muted-foreground">{{ t("ai.noDatabasesFound") }}</div>
                     </div>
                   </PopoverContent>
@@ -7505,31 +7579,62 @@ async function openExternalUrl(url: string) {
           <!-- Req 13: a chip has two states (idle / loaded in this conversation)
                and clicking its body force-loads the skill. Removal therefore needs
                its own control — one button cannot both load and remove. -->
-          <div v-if="selectedSkillChips.length" class="mb-1.5 flex flex-wrap gap-1">
-            <span v-for="chip in selectedSkillChips" :key="chip.id" class="inline-flex max-w-full items-center rounded border bg-muted/60 text-[11px] text-foreground/90" :class="chip.unavailable ? 'border-destructive/50 text-destructive' : chip.loaded ? 'border-emerald-500/60' : 'border-border/80'">
+          <div v-if="selectedSkillChips.length" class="mb-1.5 flex flex-wrap items-center gap-1">
+            <template v-if="selectedSkillsCollapsed">
               <button
                 type="button"
-                class="ai-skill-chip flex min-w-0 items-center gap-1 py-0.5 pl-1.5 pr-1 hover:bg-muted disabled:cursor-not-allowed"
-                :disabled="skillCapabilityUnavailable || chip.loaded"
-                :title="chip.loaded ? t('ai.skillsLoadedState') : skillCapabilityUnavailable ? t('ai.skillsUnsupportedForCliProvider') : t('ai.skillsPreload')"
-                @click="preloadSkill(chip.id)"
+                class="ai-skills-expand-toggle inline-flex max-w-full items-center gap-1.5 rounded border border-border/80 bg-muted/60 px-2 py-0.5 text-[11px] text-foreground/90 hover:bg-muted"
+                :title="t('ai.skillsExpand')"
+                :aria-label="t('ai.skillsExpand')"
+                @click="selectedSkillsCollapsed = false"
               >
-                <Loader2 v-if="skillPreloadPending.includes(chip.id)" class="h-3 w-3 shrink-0 animate-spin" />
-                <Check v-else-if="chip.loaded" class="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                <AlertTriangle v-else-if="chip.unavailable" class="h-3 w-3 shrink-0" />
-                <Layers v-else class="h-3 w-3 shrink-0 text-primary" />
-                <span class="truncate" :title="chip.description || chip.name">{{ chip.name }}</span>
-                <span class="shrink-0 text-[9px] text-muted-foreground">{{ t(chip.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}</span>
-                <span v-if="chip.loaded" class="shrink-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400">{{ t("ai.skillsLoadedState") }}</span>
+                <Layers class="h-3 w-3 shrink-0 text-primary" />
+                <span class="truncate font-medium">{{ t("ai.skillsSelectedCount", { count: selectedSkillChips.length }) }}</span>
+                <span v-if="loadedSelectedSkillsCount > 0" class="shrink-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400"> ({{ loadedSelectedSkillsCount }}/{{ selectedSkillChips.length }} {{ t("ai.skillsLoadedState") }}) </span>
+                <ChevronDown class="h-3 w-3 shrink-0 text-muted-foreground" />
               </button>
-              <button type="button" class="ai-skill-chip-remove shrink-0 py-0.5 pl-0.5 pr-1.5 hover:text-destructive" :aria-label="t('common.remove')" :title="t('common.remove')" @click="removeSelectedSkill(chip.id)">
-                <X class="h-3 w-3 shrink-0" />
+            </template>
+            <template v-else>
+              <span
+                v-for="chip in selectedSkillChips"
+                :key="chip.id"
+                class="inline-flex max-w-full items-center rounded border bg-muted/60 text-[11px] text-foreground/90"
+                :class="chip.unavailable ? 'border-destructive/50 text-destructive' : chip.loaded ? 'border-emerald-500/60' : 'border-border/80'"
+              >
+                <button
+                  type="button"
+                  class="ai-skill-chip flex min-w-0 items-center gap-1 py-0.5 pl-1.5 pr-1 hover:bg-muted disabled:cursor-not-allowed"
+                  :disabled="skillCapabilityUnavailable || chip.loaded"
+                  :title="chip.loaded ? t('ai.skillsLoadedState') : skillCapabilityUnavailable ? t('ai.skillsUnsupportedForCliProvider') : t('ai.skillsPreload')"
+                  @click="preloadSkill(chip.id)"
+                >
+                  <Loader2 v-if="skillPreloadPending.includes(chip.id)" class="h-3 w-3 shrink-0 animate-spin" />
+                  <Check v-else-if="chip.loaded" class="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <AlertTriangle v-else-if="chip.unavailable" class="h-3 w-3 shrink-0" />
+                  <Layers v-else class="h-3 w-3 shrink-0 text-primary" />
+                  <span class="truncate" :title="chip.description || chip.name">{{ chip.name }}</span>
+                  <span class="shrink-0 text-[9px] text-muted-foreground">{{ t(chip.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}</span>
+                  <span v-if="chip.loaded" class="shrink-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400">{{ t("ai.skillsLoadedState") }}</span>
+                </button>
+                <button type="button" class="ai-skill-chip-remove shrink-0 py-0.5 pl-0.5 pr-1.5 hover:text-destructive" :aria-label="t('common.remove')" :title="t('common.remove')" @click="removeSelectedSkill(chip.id)">
+                  <X class="h-3 w-3 shrink-0" />
+                </button>
+              </span>
+              <button
+                type="button"
+                class="ai-skills-collapse-toggle inline-flex items-center gap-1 rounded border border-border/80 bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('ai.skillsCollapse')"
+                :aria-label="t('ai.skillsCollapse')"
+                @click="selectedSkillsCollapsed = true"
+              >
+                <ChevronUp class="h-3 w-3 shrink-0" />
+                <span>{{ t("ai.skillsCollapse") }}</span>
               </button>
-            </span>
+            </template>
           </div>
           <!-- Req 14: one one-time hint per conversation while nothing selected has
                been loaded yet. Clicking it is the same force-load as the chip. -->
-          <div v-if="showSkillHint" class="mb-1.5">
+          <div v-if="showSkillHint && !selectedSkillsCollapsed" class="mb-1.5">
             <button type="button" class="ai-skill-hint inline-flex max-w-full items-center gap-1 rounded border border-primary/40 bg-primary/5 px-1.5 py-0.5 text-left text-[11px] text-primary hover:bg-primary/10" :title="t('ai.skillsPreload')" @click="preloadHintedSkill">
               <Sparkles class="h-3 w-3 shrink-0" />
               <span class="truncate">{{ skillHintText }}</span>

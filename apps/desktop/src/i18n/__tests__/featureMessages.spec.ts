@@ -95,7 +95,7 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
   { feature: "SunDB bundled JDBC driver (#10732)", keys: ["connection.sundbCustomDriverHint"], translated: true },
   { feature: "user administration Host change", keys: ["userAdmin.changeHost", "userAdmin.newHost"], translated: true },
   { feature: "plugin batch actions", keys: ["pluginPlatform.batchDuplicateSources", "pluginPlatform.batchRefreshFailed"], locales: EXCEPT_AZ_TR },
-  { feature: "plugin marketplace sorting (#10078)", keys: under("pluginPlatform", ["sortBy", "sortByName", "sortByRecentlyUpdated", "sortByRecentlyListed", "sortByUpdatesFirst"]), locales: EXCEPT_AZ_TR, translated: true },
+  { feature: "plugin marketplace sorting (#10078)", keys: under("pluginPlatform", ["sortBy", "sortByName", "sortByRecentlyUpdated", "sortByRecentlyListed", "sortByUpdatesFirst", "sortByInstalls", "installCount"]), locales: EXCEPT_AZ_TR, translated: true },
   { feature: "shared refresh action (#8768)", keys: ["common.refresh"] },
   {
     feature: "Xugu field lineage scope and coverage",
@@ -151,6 +151,11 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
   { feature: "schema diff deploy ignores foreign key checks", keys: under("diff", ["ignoreForeignKeyChecks", "ignoreForeignKeyChecksHint"]), translated: true },
   { feature: "shortcut recorder", keys: under("settings", ["shortcutRecordKeys", "shortcutRecordKeysRecordingHint", "shortcutRecordKeysWindowInactive"]), locales: ALL_LOCALES.filter((locale) => locale !== "th") },
   { feature: "select current statement", keys: ["settings.shortcutSelectCurrentStatement", "editor.contextMenu.selectCurrentStatement"] },
+  {
+    feature: "statement navigation shortcuts",
+    keys: under("settings", ["shortcutPreviousStatement", "shortcutNextStatement", "shortcutStatementStart"]),
+    translated: true,
+  },
   { feature: "MCP history kind", keys: ["history.kinds.mcp"] },
   { feature: "editor selection to AI (#10058)", keys: under("ai", ["selectionChipLabel", "selectionChipDetail", "externalTargetUnavailable"]) },
   { feature: "SQL formatter layout style", keys: under("settings", ["sqlFormatterLayoutStyle", "sqlFormatterLayoutStyleDbx", "sqlFormatterLayoutStyleClassic"]) },

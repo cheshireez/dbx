@@ -12,16 +12,15 @@ const mocks = vi.hoisted(() => ({
   discardDownloadedUpdate: vi.fn(),
   getAppVersion: vi.fn(),
   listen: vi.fn(),
-  relaunch: vi.fn(),
+  relaunchApp: vi.fn(),
   persist: vi.fn(),
   toast: vi.fn(),
 }));
 vi.mock("@/lib/backend/api", () => mocks);
 vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
-vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: mocks.relaunch }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
-const settings = reactive({ updateDownloadSource: "official", ignoredUpdateVersion: "", updateNotificationsEnabled: true, autoDownloadUpdates: true, autoUpdateApp: true });
+const settings = reactive({ updateDownloadSource: "official", ignoredUpdateVersion: "", updateNotificationsEnabled: true, autoDownloadUpdates: true, autoUpdateApp: true, toolbarItems: { checkUpdates: true } });
 vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: settings, updateEditorSettingsAndPersist: mocks.persist }) }));
 const info = { current_version: "1.0.0", latest_version: "1.1.0", update_available: true, portable_mode: false, manual_update_only: false, release_name: "v1.1.0", release_url: "https://example.com", release_notes: "Changes" };
 const cache = { cache_id: "cached", version: "1.1.0", portable_mode: false, release_url: "https://example.com", release_notes: "Changes", downloaded_at: 1 };
@@ -61,6 +60,7 @@ beforeEach(() => {
   settings.updateNotificationsEnabled = true;
   settings.autoDownloadUpdates = true;
   settings.autoUpdateApp = true;
+  settings.toolbarItems.checkUpdates = true;
   mocks.checkForUpdates.mockResolvedValue(info);
   mocks.downloadUpdate.mockResolvedValue(cache);
   mocks.getDownloadedUpdate.mockResolvedValue(null);
@@ -205,7 +205,7 @@ describe("silent update lifecycle", () => {
     expect(updater.showUpdateDialog.value).toBe(false);
     expect(mocks.toast).not.toHaveBeenCalled();
     expect(mocks.installDownloadedUpdate).not.toHaveBeenCalled();
-    expect(mocks.relaunch).not.toHaveBeenCalled();
+    expect(mocks.relaunchApp).not.toHaveBeenCalled();
   });
   it("keeps the cloud icon available while downloading, and closing does not cancel", async () => {
     const pending = deferred<typeof cache>();
@@ -232,7 +232,7 @@ describe("silent update lifecycle", () => {
     expect(mocks.downloadUpdate).not.toHaveBeenCalled();
     expect(mocks.installDownloadedUpdate).toHaveBeenCalledWith("cached", "1.1.0");
     expect(prepare.mock.invocationCallOrder[0]).toBeLessThan(mocks.installDownloadedUpdate.mock.invocationCallOrder[0]);
-    expect(mocks.installDownloadedUpdate.mock.invocationCallOrder[0]).toBeLessThan(mocks.relaunch.mock.invocationCallOrder[0]);
+    expect(mocks.installDownloadedUpdate.mock.invocationCallOrder[0]).toBeLessThan(mocks.relaunchApp.mock.invocationCallOrder[0]);
     expect(release).not.toHaveBeenCalled();
   });
   it("preparation failure retains the package and repeated clicks cannot bypass preparation", async () => {
@@ -256,13 +256,13 @@ describe("silent update lifecycle", () => {
     expect(mocks.installDownloadedUpdate).not.toHaveBeenCalled();
   });
   it("retries only restart after relaunch fails", async () => {
-    mocks.relaunch.mockRejectedValueOnce(new Error("restart failed"));
+    mocks.relaunchApp.mockRejectedValueOnce(new Error("restart failed"));
     const updater = mount();
     await updater.checkUpdates({ silent: true });
     await updater.installDownloadedUpdate();
     await updater.restartApp();
     expect(mocks.installDownloadedUpdate).toHaveBeenCalledOnce();
-    expect(mocks.relaunch).toHaveBeenCalledTimes(2);
+    expect(mocks.relaunchApp).toHaveBeenCalledTimes(2);
   });
   it("persists ignore before deleting a ready cache", async () => {
     const updater = mount();
@@ -368,7 +368,7 @@ describe("silent update lifecycle", () => {
     await updater.installDownloadedUpdate();
     expect(updater.phase.value).toBe("idle");
     expect(updater.updateDownloaded.value).toBe(false);
-    expect(mocks.relaunch).not.toHaveBeenCalled();
+    expect(mocks.relaunchApp).not.toHaveBeenCalled();
   });
 
   it("holds the preparation barrier through install and releases it only on failure", async () => {
@@ -492,5 +492,69 @@ describe("silent update lifecycle", () => {
     expect(mocks.downloadUpdate).not.toHaveBeenCalled();
     expect(updater.updateDownloaded.value).toBe(true);
     expect(updater.updateCheckMessage.value).toContain("file busy");
+  });
+});
+
+describe("toolbar update entry visibility (#11041)", () => {
+  it("does not start an automatic download when a silent check completes after the entry is hidden", async () => {
+    const pendingCheck = deferred<typeof info>();
+    mocks.checkForUpdates.mockReturnValue(pendingCheck.promise);
+    const updater = mount();
+    await updater.initialize();
+    await flush();
+    expect(mocks.checkForUpdates).toHaveBeenCalledOnce();
+
+    settings.toolbarItems.checkUpdates = false;
+    await flush();
+    pendingCheck.resolve(info);
+    await flush();
+
+    expect(mocks.downloadUpdate).not.toHaveBeenCalled();
+    expect(updater.hasUpdateAvailable.value).toBe(false);
+  });
+
+  it("skips silent checks while the toolbar update entry is hidden", async () => {
+    settings.toolbarItems.checkUpdates = false;
+    const updater = mount();
+    await updater.initialize();
+    await flush();
+    expect(mocks.checkForUpdates).not.toHaveBeenCalled();
+    expect(updater.showUpdateDialog.value).toBe(false);
+  });
+
+  it("keeps the explicit check-for-updates action working while the entry is hidden", async () => {
+    settings.toolbarItems.checkUpdates = false;
+    const updater = mount();
+    await updater.initialize();
+    await flush();
+    await updater.checkUpdates();
+    expect(mocks.checkForUpdates).toHaveBeenCalledOnce();
+    expect(updater.showUpdateDialog.value).toBe(true);
+  });
+
+  it("resumes silent checks when the entry is shown again", async () => {
+    settings.toolbarItems.checkUpdates = false;
+    const updater = mount();
+    await updater.initialize();
+    await flush();
+    expect(mocks.checkForUpdates).not.toHaveBeenCalled();
+    settings.toolbarItems.checkUpdates = true;
+    await flush();
+    expect(mocks.checkForUpdates).toHaveBeenCalledOnce();
+  });
+
+  it("stops an in-flight automatic download when the entry is hidden mid-session", async () => {
+    const updater = mount();
+    await updater.initialize();
+    await flush();
+    expect(mocks.checkForUpdates).toHaveBeenCalledOnce();
+    let releaseDownload!: (value: typeof cache) => void;
+    mocks.downloadUpdate.mockReturnValue(new Promise<typeof cache>((resolve) => (releaseDownload = resolve)));
+    const background = updater.downloadUpdateInBackground(true);
+    settings.toolbarItems.checkUpdates = false;
+    await flush();
+    expect(mocks.cancelUpdateDownload).toHaveBeenCalled();
+    releaseDownload(cache);
+    await background;
   });
 });

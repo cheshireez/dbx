@@ -883,11 +883,15 @@ fn statement_split_database_type(config: &ConnectionConfig) -> DatabaseType {
     }
 }
 
-async fn connection_sql_compatibility_mode(
+pub(crate) async fn connection_sql_compatibility_mode(
     state: &AppState,
     pool_key: &str,
     db_type: Option<DatabaseType>,
 ) -> Option<String> {
+    if db_type == Some(DatabaseType::Kingbase) {
+        let Some(PoolKind::Agent(client)) = state.pool_handle(pool_key).await else { return None };
+        return client.compatibility_mode().map(str::to_owned);
+    }
     if db_type != Some(DatabaseType::OpenGauss) {
         return None;
     }
@@ -1835,10 +1839,16 @@ async fn do_execute_typed(
             let connection_id = conn.id();
             if let Some(ref execution_id) = options.execution_id {
                 let kill_opts = conn.opts().clone();
+                // The interrupt runs after the user asked to cancel; give the
+                // dedicated kill connection the same infrastructure budget as
+                // the query path instead of the old compile-time 5 s.
+                let kill_timeout = operation_budget.checkout_timeout;
                 state.running_queries.register_interrupt(execution_id, move || {
                     let kill_opts = kill_opts.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = db::mysql::kill_query_with_opts(kill_opts, connection_id).await {
+                        if let Err(error) =
+                            db::mysql::kill_query_with_opts(kill_opts, connection_id, kill_timeout).await
+                        {
                             log::warn!("Failed to cancel MySQL query {connection_id}: {error}");
                         }
                     });
@@ -2032,11 +2042,20 @@ async fn do_execute_typed(
                     Ok(value) => value,
                     Err(err) => return Err(err.into()),
                 };
+            // A display-bound execution must not pay for the rows the caller
+            // discards: the driver stops the TDS stream at `max_rows` and marks
+            // the connection as abandoned, which then gets dropped instead of
+            // returned to the pool. Session-pinned executions keep the old
+            // draining path because the connection carries user state.
+            let stop_at_row_limit =
+                max_rows.is_some() && options.client_session_id.is_none() && !options.use_transaction.unwrap_or(false);
             let execution = async {
                 if execution_mode == QueryExecutionMode::Simple {
                     let mut results =
                         db::sqlserver::execute_simple_batch_with_max_rows(&mut client, &sql, max_rows).await?;
                     Ok(results.remove(0))
+                } else if stop_at_row_limit {
+                    db::sqlserver::execute_query_with_max_rows_stopping(&mut client, &sql, max_rows).await
                 } else {
                     db::sqlserver::execute_query_with_max_rows(&mut client, &sql, max_rows).await
                 }
@@ -2048,7 +2067,11 @@ async fn do_execute_typed(
                     result.execution_time_ms += lock_wait_ms;
                     result
                 });
+            let abandoned = client.take_abandoned_after_row_limit();
             drop(client);
+            if abandoned {
+                state.remove_pool_by_key(pool_key).await;
+            }
             if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -4616,16 +4639,35 @@ async fn execute_multi_sqlserver(
 
         let execution_sql =
             sql_for_execution_context_with_identifier_quote(Some(DatabaseType::SqlServer), batch, schema, Some("["));
+        // Only a single-statement batch can abandon its stream early: a real
+        // multi-statement script must keep draining so the later statements
+        // still produce their own results. Session-pinned tabs keep draining
+        // because the pooled connection carries their temporary objects.
+        let stop_at_row_limit = batches.len() == 1
+            && max_rows.is_some()
+            && options.client_session_id.is_none()
+            && !options.use_transaction.unwrap_or(false);
         let execution = async {
             if execution_mode == QueryExecutionMode::Simple {
                 db::sqlserver::execute_simple_batch_with_max_rows_metadata(&mut client_guard, &execution_sql, max_rows)
                     .await
+            } else if stop_at_row_limit {
+                db::sqlserver::execute_batch_with_max_rows_metadata_stopping(
+                    &mut client_guard,
+                    &execution_sql,
+                    max_rows,
+                )
+                .await
             } else {
                 db::sqlserver::execute_batch_with_max_rows_metadata(&mut client_guard, &execution_sql, max_rows).await
             }
         };
         let result = wait_for_result_opt(cancel_token.clone(), query_timeout, execution).await;
+        let abandoned = client_guard.take_abandoned_after_row_limit();
         drop(client_guard);
+        if abandoned {
+            state.remove_pool_by_key(pool_key).await;
+        }
 
         match result {
             Ok(results) => all_results.extend(sqlserver_batch_results(results).into_iter().map(|mut item| {
@@ -5119,23 +5161,11 @@ pub async fn execute_schema_diff_deploy(
     let now = chrono::Utc::now().to_rfc3339();
     let db_type = connection_database_type(state, connection_id).await;
 
-    // openGauss A-mode deploy scripts may contain CREATE PACKAGE … / blocks
-    // that must stay intact. Probe the database compatibility mode when a pool
-    // is available; on failure fall back to the plain openGauss splitter.
-    let compatibility_mode = if db_type == Some(DatabaseType::OpenGauss) {
-        let pool = match state
-            .get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) })
-            .await
-        {
-            Ok(pool_key) => match state.pool_handle(&pool_key).await {
-                Some(PoolKind::Postgres(pool)) => Some(pool),
-                _ => None,
-            },
+    // Resolve the live session mode, not the potentially stale saved UI metadata.
+    let compatibility_mode = if matches!(db_type, Some(DatabaseType::OpenGauss | DatabaseType::Kingbase)) {
+        match state.get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) }).await {
+            Ok(pool_key) => connection_sql_compatibility_mode(state, &pool_key, db_type).await,
             Err(_) => None,
-        };
-        match pool {
-            Some(pool) => db::postgres::opengauss_compatibility_mode(&pool).await.ok().flatten(),
-            None => None,
         }
     } else {
         None

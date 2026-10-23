@@ -1430,13 +1430,13 @@ pub async fn apply_sync_snapshot_with_selection(
                                                 .and_then(serde_json::Value::as_str)
                                                 == Some("none"))
                                 });
-                        !forbidden_rocketmq_auth
-                            && !(matches!(
-                                secret.key.as_str(),
-                                "password" | NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY
-                            ) && connections
-                                .iter()
-                                .any(|config| config.id == secret.connection_id && !config.save_password))
+                        let password_like_secret_unsaved = matches!(
+                            secret.key.as_str(),
+                            "password" | NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY
+                        ) && connections
+                            .iter()
+                            .any(|config| config.id == secret.connection_id && !config.save_password);
+                        !(forbidden_rocketmq_auth || password_like_secret_unsaved)
                     })
                     .map(|secret| SyncImportSecret {
                         connection_id: secret.connection_id.clone(),
@@ -4142,6 +4142,7 @@ mod tests {
                     expose_lan: false,
                     use_ssh_agent: false,
                     ssh_agent_sock_path: String::new(),
+                    ssh_agent_key_fingerprint: String::new(),
                     auth_method: "password".to_string(),
                     allow_exec_channel_proxy: false,
                     proxy_command: String::new(),
@@ -4153,6 +4154,7 @@ mod tests {
                     enabled: true,
                     url: "https://dbx.example.com/dbx_tunnel.php".to_string(),
                     token: "tunnel-token".to_string(),
+                    protocol: crate::models::connection::HttpTunnelProtocol::DbxTcp,
                     connect_timeout_secs: 10,
                 }),
             ],
@@ -5828,6 +5830,7 @@ mod tests {
             expose_lan: false,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
+            ssh_agent_key_fingerprint: String::new(),
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),

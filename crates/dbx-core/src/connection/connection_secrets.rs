@@ -1185,6 +1185,7 @@ mod tests {
             expose_lan: false,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
+            ssh_agent_key_fingerprint: String::new(),
             auth_method: "key".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
@@ -1199,6 +1200,7 @@ mod tests {
             enabled: true,
             url: "https://dbx.example.com/dbx_tunnel.php".to_string(),
             token: token.to_string(),
+            protocol: crate::models::connection::HttpTunnelProtocol::DbxTcp,
             connect_timeout_secs: 10,
         })
     }

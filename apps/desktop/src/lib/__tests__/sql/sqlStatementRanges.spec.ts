@@ -582,6 +582,12 @@ describe("splitSqlStatementRanges", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["SELECT 1", "SELECT 2"]);
   });
 
+  it("treats hash comments as line comments on generic JDBC and Hive connections", () => {
+    const sql = "SELECT 1 # comment;\n;\nSELECT 2";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "jdbc"))).toEqual(["SELECT 1", "SELECT 2"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "hive"))).toEqual(["SELECT 1", "SELECT 2"]);
+  });
+
   it("keeps SQL Server temporary table names instead of treating them as hash comments", () => {
     const sql = "DROP TABLE IF EXISTS #Temp;\nSELECT * FROM ##GlobalTemp;";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["DROP TABLE IF EXISTS #Temp", "SELECT * FROM ##GlobalTemp"]);
@@ -723,6 +729,61 @@ SELECT f1 + f2 FROM dual;`;
     expect(hasMultipleExecutionTargets(argoProcedureFixture, "argo")).toBe(false);
     expect(rangeSqlTexts(executableStatementRanges(argoProcedureFixture, "argo"))).toEqual([argoProcedureFixture]);
     expect(rangeSqlTexts(splitSqlStatementRanges(argoProcedureFixture, "transwarp"))).toEqual([argoProcedureFixture]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(argoProcedureFixture, "jdbc"))).toEqual([argoProcedureFixture]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(argoProcedureFixture, "hive"))).toEqual([argoProcedureFixture]);
+  });
+
+  it("keeps procedure bodies together on JDBC and Hive connections (#12321)", () => {
+    const procedure = `CREATE OR REPLACE PROCEDURE pro_cbs_check_his(is_date IN VARCHAR(8))
+IS
+BEGIN
+    DELETE FROM transwarp.tmp_cbs_t00_corp_cust_his
+    WHERE data_date = is_date;
+
+    INSERT INTO transwarp.tmp_cbs_t00_corp_cust_his
+    SELECT * FROM transwarp.cbs_t00_corp_cust_his
+    WHERE data_date = is_date;
+
+    COMMIT;
+END;`;
+
+    for (const dbType of ["jdbc", "hive", "argo", "transwarp"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(procedure, dbType))).toEqual([procedure]);
+      expect(hasMultipleExecutionTargets(procedure, dbType)).toBe(false);
+      expect(rangeSqlTexts(executableStatementRanges(procedure, dbType))).toEqual([procedure]);
+    }
+
+    const procedureWithAs = `CREATE OR REPLACE PROCEDURE pro_cbs_check_his(is_date IN VARCHAR(8))
+AS
+BEGIN
+    DELETE FROM transwarp.tmp_cbs_t00_corp_cust_his
+    WHERE data_date = is_date;
+
+    COMMIT;
+END;`;
+
+    for (const dbType of ["jdbc", "hive", "argo", "transwarp"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(procedureWithAs, dbType))).toEqual([procedureWithAs]);
+      expect(hasMultipleExecutionTargets(procedureWithAs, dbType)).toBe(false);
+      expect(rangeSqlTexts(executableStatementRanges(procedureWithAs, dbType))).toEqual([procedureWithAs]);
+    }
+  });
+
+  it("splits vanilla Hive string-bodied functions at semicolons on JDBC and Hive connections", () => {
+    const sqlBasic = `CREATE FUNCTION my_udf AS 'com.example.Mask';
+SELECT mask_fn(x) FROM t;`;
+
+    const sqlIfNotExists = `CREATE FUNCTION IF NOT EXISTS my_udf AS 'com.example.Mask';
+SELECT mask_fn(x) FROM t;`;
+
+    const sqlTemporary = `CREATE TEMPORARY FUNCTION my_udf AS 'com.example.Mask';
+SELECT mask_fn(x) FROM t;`;
+
+    for (const dbType of ["jdbc", "hive"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(sqlBasic, dbType))).toEqual(["CREATE FUNCTION my_udf AS 'com.example.Mask'", "SELECT mask_fn(x) FROM t"]);
+      expect(rangeSqlTexts(splitSqlStatementRanges(sqlIfNotExists, dbType))).toEqual(["CREATE FUNCTION IF NOT EXISTS my_udf AS 'com.example.Mask'", "SELECT mask_fn(x) FROM t"]);
+      expect(rangeSqlTexts(splitSqlStatementRanges(sqlTemporary, dbType))).toEqual(["CREATE TEMPORARY FUNCTION my_udf AS 'com.example.Mask'", "SELECT mask_fn(x) FROM t"]);
+    }
   });
 
   it("statement at cursor inside an ArgoDB procedure body returns the whole definition", () => {
@@ -1590,6 +1651,44 @@ AND ts = toDateTime('2026-07-15 12:00:00');`;
 
     expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "postgres")?.sql.trim()).toBe(expected);
     expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual([expected, "SELECT 2"]);
+  });
+
+  it("does not merge a query after an inline EXPLAIN statement without semicolons (#12811)", () => {
+    const sql = "SELECT 1\nEXPLAIN SELECT 2\nSELECT 3";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "postgres")?.sql.trim()).toBe("EXPLAIN SELECT 2");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual(["SELECT 1", "EXPLAIN SELECT 2", "SELECT 3"]);
+  });
+
+  it("does not merge a query after an inline EXPLAIN ANALYZE statement (#12811)", () => {
+    const sql = "SELECT 1\nEXPLAIN ANALYZE SELECT 2\nSELECT 3";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "postgres")?.sql.trim()).toBe("EXPLAIN ANALYZE SELECT 2");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual(["SELECT 1", "EXPLAIN ANALYZE SELECT 2", "SELECT 3"]);
+  });
+
+  it("does not merge a query after an inline EXPLAIN with parenthesized options (#12811)", () => {
+    const sql = "EXPLAIN (ANALYZE, BUFFERS) SELECT 1\nSELECT 2";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "postgres")?.sql.trim()).toBe("EXPLAIN (ANALYZE, BUFFERS) SELECT 1");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual(["EXPLAIN (ANALYZE, BUFFERS) SELECT 1", "SELECT 2"]);
+  });
+
+  it("does not merge a query after MySQL EXPLAIN with options", () => {
+    const sql = "EXPLAIN FORMAT = JSON SELECT 1\nSELECT 2";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "mysql")?.sql.trim()).toBe("EXPLAIN FORMAT = JSON SELECT 1");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual(["EXPLAIN FORMAT = JSON SELECT 1", "SELECT 2"]);
+  });
+
+  it("does not merge a query after a plain MySQL EXPLAIN table statement", () => {
+    const sql = "EXPLAIN users\nSELECT * FROM users;";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "mysql")?.sql.trim()).toBe("EXPLAIN users");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "SELECT"), "mysql")?.sql.trim()).toBe("SELECT * FROM users");
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual(["EXPLAIN users", "SELECT * FROM users"]);
+  });
+
+  it("does not merge a query after an EXPLAIN UPDATE statement", () => {
+    const sql = "EXPLAIN UPDATE test_orders a\nJOIN test_users b ON a.id=b.id\nSET a.name = '张三'\nWHERE b.id > 10\nSELECT 1";
+    const expectedExplain = "EXPLAIN UPDATE test_orders a\nJOIN test_users b ON a.id=b.id\nSET a.name = '张三'\nWHERE b.id > 10";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "EXPLAIN"), "mysql")?.sql.trim()).toBe(expectedExplain);
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([expectedExplain, "SELECT 1"]);
   });
 
   it("keeps EXPLAIN options CTE UPDATE assignments as one statement", () => {

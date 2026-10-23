@@ -5,6 +5,7 @@ import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import type { SqlExecutionOverride, SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import type { AiConversationBinding } from "@/lib/ai/aiConversationBinding";
+import type { ObjectDependencyTarget } from "@/lib/database/objectDependencyDetails";
 
 export interface StatementRange {
   from: number;
@@ -21,6 +22,7 @@ export interface QueryEditorSurfaceHandle {
   refreshQueryEditorCompletionCache(): boolean;
   handleModRTarget(target: Element): boolean;
   requestQueryEditorExecute(): boolean;
+  requestQueryEditorExecuteAll(): boolean;
   captureQueryEditorExecutionSnapshot(): SqlExecutionSnapshot | undefined;
   requestQueryEditorExecuteInNewResultTab(): boolean;
   requestQueryEditorPreviewChanges(stackSql?: string): Promise<boolean>;
@@ -107,6 +109,7 @@ export interface ContentAreaSurfaceEmits {
   viewTableDdl: [tabId: string, target: SqlObjectNavigationTarget];
   editTableStructure: [tabId: string, target: SqlObjectNavigationTarget];
   openObjectSource: [tabId: string, target: SqlObjectNavigationTarget, initialEditing: boolean];
+  openDependencyObject: [context: ObjectDependencyTarget, target: SqlObjectNavigationTarget];
   openObjectTable: [tabId: string, target: { tableName: string; schema?: string; tableType?: string; catalog?: string; comment?: string | null }];
   openDatabaseSearchTarget: [tabId: string, target: NavigationTarget];
   objectSchemaChange: [tabId: string, schema: string | undefined];

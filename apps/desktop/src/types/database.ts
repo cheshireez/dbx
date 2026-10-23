@@ -1,5 +1,5 @@
 import type { BackendError } from "@/lib/backend/errorUtils";
-import type { TransferContent, TransferMode, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/tauri";
+import type { TransferColumnNameCase, TransferContent, TransferMode, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/tauri";
 import type { SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/sqlExecution";
 import type { DatabaseType } from "@/types/generated/databaseTypes";
@@ -247,6 +247,7 @@ export type ProductionBadgeScope = "connection" | "database" | "table";
 export type IdentifierCase = "lower" | "upper" | "mixed";
 
 export interface DatabaseConnectionInfo {
+  compatibilityMode?: string;
   productName?: string;
   productVersion?: string;
   currentDatabase?: string;
@@ -319,6 +320,11 @@ export interface SshTunnelConfig {
   use_ssh_agent?: boolean;
   ssh_agent_sock_path?: string;
   /**
+   * SHA-256 fingerprint (`SHA256:...`) of the one SSH agent identity to use.
+   * Empty means every identity the agent reports is tried, in order.
+   */
+  ssh_agent_key_fingerprint?: string;
+  /**
    * UI-facing choice of login method. Drives which credential inputs the
    * connection dialog shows; the backend still probes "none" then falls
    * back to key > password > agent based on which fields are non-empty,
@@ -347,6 +353,12 @@ export interface SshTunnelConfig {
    * and `enabled` are kept).
    */
   profile_id?: string;
+}
+
+export interface SshAgentIdentity {
+  fingerprint: string;
+  algorithm: string;
+  comment: string;
 }
 
 export interface SshConfigHostEntry {
@@ -379,6 +391,7 @@ export interface HttpTunnelConfig {
   enabled?: boolean;
   url: string;
   token?: string;
+  protocol?: "dbx_tcp" | "navicat_mysql";
   connect_timeout_secs?: number;
   /** See {@link SshTunnelConfig.profile_id}. */
   profile_id?: string;
@@ -1514,6 +1527,18 @@ export interface QueryResult {
   has_more?: boolean;
   /** Frontend-only SQL page lookahead, independent of the driver's cursor has_more. */
   page_has_more?: boolean;
+  /** Frontend-only page state, owned by the result rather than the active tab. */
+  sqlPage?: {
+    sql: string;
+    executedSql: string;
+    limit: number;
+    offset: number;
+    executedLimit: number;
+    executedOffset: number;
+    probe: boolean;
+    countSql?: string;
+    exactQueryRowBound?: number;
+  };
   /** For Elasticsearch REST search results parsed into a _source table,
    *  this carries the raw HTTP response body so the UI can toggle between
    *  the tabular view and the original JSON. */
@@ -1586,6 +1611,8 @@ export interface QueryResultSourceColumnRef {
 
 export interface QueryResultRun {
   id: string;
+  /** Source connection retained when the editor switches to another connection. */
+  connectionId?: string;
   title: string;
   sequence: number;
   sql: string;
@@ -1678,6 +1705,12 @@ export interface TransactionLog {
   error?: string;
 }
 
+/**
+ * 1-based line and column range in SQL text.
+ * Both `start_column` and `end_column` are 1-based and inclusive.
+ * For example, a 1-character token at line 1, column 5 has:
+ * `{ start_line: 1, start_column: 5, end_line: 1, end_column: 5 }`.
+ */
 export interface SqlTextSpan {
   start_line: number;
   start_column: number;
@@ -2078,6 +2111,12 @@ export interface TabUiState {
   resultPaneOpen?: boolean;
   /** Tracks whether the active output view was auto-switched to "messages" by live server output during execution. */
   autoSwitchedToMessagesDuringExecution?: boolean;
+  /**
+   * Execution id whose batch run already auto-switched the output view to the
+   * summary. Keying the switch by run keeps it to once per execution, so a user
+   * who picks another view mid-run stays there.
+   */
+  batchSummaryExecutionId?: string;
   /** Small JSON-compatible snapshots owned by special-page components. */
   page?: Record<string, TabPageUiState>;
 }
@@ -2153,6 +2192,17 @@ export interface QueryTab {
   /** Optional branch context for a driver-profile database workspace. */
   workspaceBranch?: string;
   schema?: string;
+  /**
+   * 该 Schema 是否由用户为当前页签显式选择（工具栏 / 侧栏 Schema 节点）。
+   *
+   * SQL Server 没有会话级 Schema 切换，后端会把未限定的表名按页签 Schema
+   * 改写（#8951）。只有显式选择才能参与改写：连接默认 Schema、恢复的页签、
+   * 保存的 SQL、外部文件带来的 Schema 只用于浏览/补全/预填，否则
+   * `SELECT * FROM t` 会被错误地限定到非默认 Schema。
+   *
+   * 该字段是运行时状态，不随页签持久化，恢复的页签因此回到服务器默认解析。
+   */
+  schemaQualifiesSql?: boolean;
   /** Doris / StarRocks multi-catalog: the external catalog this tab's
    * database belongs to (undefined for internal/default catalog). */
   catalog?: string;
@@ -2354,6 +2404,16 @@ export interface QueryTab {
   };
   /** Opened to view object source, including objects without editable source metadata. */
   sourceView?: boolean;
+  /** Stable object identity and local section, independent of pending source loading. */
+  objectDetails?: {
+    connectionId: string;
+    database: string;
+    schema: string;
+    catalog?: string;
+    name: string;
+    objectType: ObjectSourceKind;
+    section: "source" | "dependencies" | "dependents";
+  };
   ddlViewer?: {
     schema?: string;
     tableName: string;
@@ -2603,6 +2663,7 @@ export interface TransferTaskConfig {
   content: TransferContent;
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
+  targetColumnNameCase?: TransferColumnNameCase;
   quoteTargetColumnNames: boolean;
   batchSize: number;
   /** Per-operation timeout for this task. Undefined inherits each connection; 0 disables the limit. */

@@ -1,10 +1,10 @@
 plugins {
     id 'java'
-    id 'com.gradleup.shadow' version '9.0.0-beta12'
+    id 'com.gradleup.shadow' version '9.6.1'
 }
 
 group = 'app.dbx'
-version = '0.1.47'
+version = '0.1.48'
 
 java {
     toolchain {
@@ -20,7 +20,7 @@ def mavenResolverVersion = '2.0.24'
 def mavenCoreVersion = '4.0.0-rc-5'
 
 dependencies {
-    implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.3'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.4'
     implementation('org.slf4j:slf4j-api') {
         version {
             strictly '1.7.36'
@@ -42,6 +42,7 @@ dependencies {
     runtimeOnly 'org.slf4j:slf4j-nop:1.7.36'
 
     testImplementation 'com.h2database:h2:2.2.224'
+    testRuntimeOnly 'org.duckdb:duckdb_jdbc:2.0.0.0'
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.3'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }

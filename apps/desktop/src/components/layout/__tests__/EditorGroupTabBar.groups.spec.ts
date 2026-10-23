@@ -222,6 +222,116 @@ describe("EditorGroupTabBar group behavior", () => {
     }
   });
 
+  it("marks the active horizontal grouped tab with a full-width group-colored underline", async () => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "pg-1", name: "Postgres", db_type: "postgres", driver_profile: "postgres", color: "#3b82f6" } as ConnectionConfig];
+    settings.editorSettings.appLayout = "separated";
+    settings.editorSettings.tabGroupMode = "connection";
+    settings.editorSettings.tabPlacement = "top";
+    const activeTabId = store.createTab("pg-1", "app", "PG 1", "query");
+    store.createTab("pg-1", "app", "PG 2", "query");
+    const { app, host } = mountBar(store.groups[0]!.id, store.tabs.slice(), activeTabId, pinia);
+    const styles = document.createElement("style");
+    styles.textContent = `html { font-size: 16px; } .h-full { height: 100%; }\n${sharedStyles}`;
+    document.head.appendChild(styles);
+
+    try {
+      await settle();
+      // Exactly one pill carries the active state.
+      const activeTabs = host.querySelectorAll('.tab-group-tab[data-active-tab="true"]');
+      expect(activeTabs).toHaveLength(1);
+      expect(activeTabs[0]!.getAttribute("data-tab-id")).toBe(activeTabId);
+
+      // The old primary ::before top accent was removed; the active grouped tab
+      // is marked by a single full-width underline on its bottom edge instead.
+      const beforeSelectors: string[] = [];
+      for (const sheet of document.styleSheets) {
+        for (const rule of sheet.cssRules) {
+          const styleRule = rule as CSSStyleRule;
+          if (styleRule.selectorText?.includes(".tab-group-tab") && styleRule.selectorText.includes('[data-active-tab="true"]') && styleRule.selectorText.endsWith("::before")) {
+            beforeSelectors.push(styleRule.selectorText);
+          }
+        }
+      }
+      expect(beforeSelectors).toHaveLength(0);
+
+      // Geometry and paint: the underline spans the pill (no inline inset) and
+      // uses the group color, so it is not confused with the classic dark
+      // selected-state bar injected inline by tabColorStyle.
+      const underlineStart = sharedStyles.indexOf('.tab-group-tab[data-active-tab="true"]::after');
+      expect(underlineStart).toBeGreaterThan(-1);
+      const underlineBlock = sharedStyles.slice(underlineStart, sharedStyles.indexOf("}", underlineStart) + 1);
+      expect(underlineBlock).toContain("var(--tab-group-color)");
+      expect(underlineBlock).toContain("left: 0");
+      expect(underlineBlock).toContain("right: 0");
+
+      // Group headers keep their color on the marker/underline instead of the
+      // label itself, which previously used the same group color as the tinted
+      // header background and was hard to read.
+      const headerStart = sharedStyles.lastIndexOf(".app-tab-bar:not(.vertical-tab-layout) .tab-group-header {");
+      expect(headerStart).toBeGreaterThan(-1);
+      const headerBlock = sharedStyles.slice(headerStart, sharedStyles.indexOf("}", headerStart) + 1);
+      expect(headerBlock).toContain("color: var(--foreground)");
+    } finally {
+      app.unmount();
+      host.remove();
+      styles.remove();
+    }
+  });
+
+  it.each(["classic", "separated"] as const)("keeps configured connection colors on inactive horizontal tabs when grouping is off in %s layout", async (layout) => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "pg-1", name: "Postgres", db_type: "postgres", driver_profile: "postgres", color: "#3b82f6" } as ConnectionConfig, { id: "pg-2", name: "Auto", db_type: "postgres", driver_profile: "postgres", color: "" } as ConnectionConfig];
+    settings.editorSettings.appLayout = layout;
+    settings.editorSettings.tabGroupMode = "none";
+    settings.editorSettings.tabPlacement = "top";
+    settings.editorSettings.colorizeConnectionTabs = true;
+    const activeTabId = store.createTab("pg-1", "app", "PG 1", "query");
+    const configuredTabId = store.createTab("pg-1", "app", "PG 2", "query");
+    const autoTabId = store.createTab("pg-2", "app", "PG 3", "query");
+    const { app, host } = mountBar(store.groups[0]!.id, store.tabs.slice(), activeTabId, pinia);
+
+    try {
+      for (const placement of ["top", "bottom"] as const) {
+        settings.editorSettings.tabPlacement = placement;
+        await settle();
+        const activeTab = host.querySelector<HTMLElement>(`[data-tab-id="${activeTabId}"]`)!;
+        const configuredTab = host.querySelector<HTMLElement>(`[data-tab-id="${configuredTabId}"]`)!;
+        const autoTab = host.querySelector<HTMLElement>(`[data-tab-id="${autoTabId}"]`)!;
+        const activeBackground = activeTab.style.getPropertyValue("--app-tab-background");
+        const configuredBackground = configuredTab.style.getPropertyValue("--app-tab-background");
+        expect(configuredTab.getAttribute("data-active-tab")).toBe("false");
+        // A color the user picked in the connection settings keeps marking its
+        // tabs when no group header/rail carries it; auto-generated hues stay
+        // quiet and the active tab still reads stronger than its peers.
+        expect(configuredBackground).toBe(layout === "classic" ? "rgba(59, 130, 246, 0.07)" : "rgba(59, 130, 246, 0.09)");
+        expect(autoTab.style.getPropertyValue("--app-tab-background")).toBe("");
+        expect(activeBackground).toBe("rgba(59, 130, 246, 0.24)");
+      }
+
+      // Restricting connection-tab colors to active tab silences the inactive wash.
+      settings.editorSettings.colorizeConnectionTabsScope = "active";
+      await settle();
+      expect(host.querySelector<HTMLElement>(`[data-tab-id="${configuredTabId}"]`)!.style.getPropertyValue("--app-tab-background")).toBe("");
+      expect(host.querySelector<HTMLElement>(`[data-tab-id="${activeTabId}"]`)!.style.getPropertyValue("--app-tab-background")).toBe("rgba(59, 130, 246, 0.24)");
+      settings.editorSettings.colorizeConnectionTabsScope = "all";
+      await settle();
+
+      // Turning the connection-tab colors off must silence the inactive wash
+      // even for a configured connection color.
+      settings.editorSettings.colorizeConnectionTabs = false;
+      await settle();
+      expect(host.querySelector<HTMLElement>(`[data-tab-id="${configuredTabId}"]`)!.style.getPropertyValue("--app-tab-background")).toBe("");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
   it("renders one header per connection cluster and collapses it to a count badge", async () => {
     const store = useQueryStore();
     const settings = useSettingsStore();
@@ -281,6 +391,16 @@ describe("EditorGroupTabBar group behavior", () => {
       expect(inactiveTab.style.getPropertyValue("--app-tab-background")).toBe("rgba(59, 130, 246, 0.09)");
       expect(inactiveTab.style.getPropertyValue("--app-tab-hover-background")).toBe("rgba(59, 130, 246, 0.16)");
       expect(inactiveTab.style.borderColor).toBe("rgba(59, 130, 246, 0.18)");
+
+      // Restricting connection-tab colors to active tab keeps active accents but removes inactive styles.
+      settings.editorSettings.colorizeConnectionTabsScope = "active";
+      await settle();
+      expect(tab.style.getPropertyValue("--app-tab-background")).toBe("rgba(34, 197, 94, 0.24)");
+      expect(tab.style.getPropertyValue("--app-tab-active-border")).toBe("rgba(34, 197, 94, 0.72)");
+      expect(tab.style.getPropertyValue("--app-tab-active-accent")).toBe("#22c55e");
+      expect(inactiveTab.style.getPropertyValue("--app-tab-background")).toBe("");
+      expect(inactiveTab.style.getPropertyValue("--app-tab-hover-background")).toBe("");
+      expect(inactiveTab.style.borderColor).toBe("");
 
       settings.editorSettings.colorizeConnectionTabs = false;
       await settle();
@@ -781,6 +901,23 @@ describe("EditorGroupTabBar special page navigation", () => {
     });
     return { ...mounted, store, settings, tabId, specialPageTabs, events };
   }
+
+  it("returns from a special page when the current two-row group is clicked", async () => {
+    const activate = vi.fn();
+    const { app, host, settings, tabId } = mountSpecialBar({ "onActivate-tab": activate });
+    settings.editorSettings.tabGroupRows = "two-row";
+    try {
+      await settle();
+      const group = host.querySelector<HTMLButtonElement>(".tab-group-rail-scroll .tab-group-header");
+      expect(group).not.toBeNull();
+      group!.click();
+      await settle();
+      expect(activate).toHaveBeenCalledWith(tabId);
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
 
   it.each(["classic", "separated"] as const)("keeps grouped tabs and both special pages at every placement in %s layout", async (layout) => {
     const { app, host, settings, store, tabId } = mountSpecialBar();

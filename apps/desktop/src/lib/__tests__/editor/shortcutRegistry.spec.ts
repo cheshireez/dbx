@@ -169,6 +169,17 @@ describe("shortcutRegistry editor actions", () => {
     expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.openDataInNewTab, "MacIntel")).toBe("Alt");
   });
 
+  it("registers a conflict-free DBeaver-style shortcut for executing all SQL", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "executeAllSql");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Alt+X" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.executeAllSql).toBe("Alt+X");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.executeAllSql, "MacIntel")).toBe("Alt+X");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.executeAllSql, "Win32")).toBe("Alt+X");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.executeAllSql)).toBe("Alt-x");
+    expect(findShortcutConflict("executeAllSql", DEFAULT_SHORTCUT_SETTINGS.executeAllSql, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
   it("registers a conflict-free DBeaver-style shortcut for executing in a new result tab", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "executeSqlInNewResultTab");
 
@@ -204,6 +215,22 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("selectCurrentStatement", DEFAULT_SHORTCUT_SETTINGS.selectCurrentStatement, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
     // 与侧栏「断开连接」同键属于有意的跨作用域复用（仅提示，不影响编辑器内触发）
     expect(findCrossScopeShortcutConflicts(DEFAULT_SHORTCUT_SETTINGS).selectCurrentStatement).toContain("disconnectSidebarConnection");
+  });
+
+  it("registers conflict-free statement navigation shortcuts", () => {
+    const previous = SHORTCUT_DEFINITIONS.find((item) => item.id === "previousStatement");
+    const next = SHORTCUT_DEFINITIONS.find((item) => item.id === "nextStatement");
+    const start = SHORTCUT_DEFINITIONS.find((item) => item.id === "statementStart");
+
+    expect(previous).toMatchObject({ labelKey: "settings.shortcutPreviousStatement", scope: "editor", defaultShortcut: "Ctrl+Shift+ArrowUp" });
+    expect(next).toMatchObject({ labelKey: "settings.shortcutNextStatement", scope: "editor", defaultShortcut: "Ctrl+Shift+ArrowDown" });
+    expect(start).toMatchObject({ labelKey: "settings.shortcutStatementStart", scope: "editor", defaultShortcut: "Alt+Home" });
+
+    for (const id of ["previousStatement", "nextStatement", "statementStart"] as const) {
+      expect(DEFAULT_SHORTCUT_SETTINGS[id]).toBe(SHORTCUT_DEFINITIONS.find((item) => item.id === id)?.defaultShortcut);
+      expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS[id])).not.toBe("");
+      expect(findShortcutConflict(id, DEFAULT_SHORTCUT_SETTINGS[id], DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    }
   });
 
   it("keeps current-view search and editor find contextual on Mod+F", () => {
