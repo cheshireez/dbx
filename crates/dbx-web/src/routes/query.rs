@@ -1641,8 +1641,8 @@ mod tests {
     #[test]
     fn decode_bound_statements_decodes_preview_and_sql() {
         let bound = vec![dbx_core::db::BlobBoundStatement {
-            preview_sql: crate::waf_codec::encode_sql_for_test("UPDATE t SET c = ?"),
-            sql: crate::waf_codec::encode_sql_for_test("UPDATE t SET c = ? WHERE id = 1"),
+            preview_sql: crate::waf_codec::encode_sql_v2_for_test("UPDATE t SET c = ?"),
+            sql: crate::waf_codec::encode_sql_v2_for_test("UPDATE t SET c = ? WHERE id = 1"),
             blob_parameters: vec!["0a".to_string()],
         }];
         let decoded = decode_bound_statements(bound).unwrap();

@@ -7198,6 +7198,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_string_context_filter_value_stays_an_empty_literal() {
+        // 回归锚点:右键「筛选此值」筛空字符串时,value 必须原样是空串(不能被 WAF 密文
+        // 顶替),条件要是 `cbzt` = '',而不是 `cbzt` = '<密文>' 导致查不出数据。
+        let condition = build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            column_name: "cbzt".to_string(),
+            mode: DataGridContextFilterMode::Equals,
+            value: json!(""),
+            values: Vec::new(),
+            end_value: None,
+            column_info: None,
+        });
+        assert_eq!(condition.as_deref(), Some("`cbzt` = ''"));
+    }
+
+    #[test]
     fn keeps_iotdb_tree_time_epoch_filters_unquoted_without_column_metadata() {
         let condition = |mode, value, values, end_value| {
             build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {

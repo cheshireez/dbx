@@ -1,6 +1,6 @@
 //! 可选传输层 SQL 载荷加密(用于绕过内容型 WAF 的误拦)。
 //!
-//! ## 格式(v2,当前)
+//! ## 格式(v2,唯一格式)
 //! 密文无固定前缀,外观与普通随机 token 无异:
 //! `base64( nonce[12] || masked_magic[4] || ciphertext || tag[16] )`,
 //! 其中 `masked_magic = "DBX1" XOR SHA256(key || nonce)[0..4]`。
@@ -8,9 +8,10 @@
 //! (无 `dbx1:` 前缀、无明文 magic),避免被按签名/固定模式拦截。
 //! magic 匹配但 GCM 解密失败视为篡改,返回 400;mismatch 一律按明文透传。
 //!
-//! ## 兼容(v1,旧格式)
-//! 仍接受 `dbx1:<base64(nonce[12] || ciphertext || tag[16])>` 旧格式
-//! (n8n 工作流等旧客户端在用),语义保持严格。
+//! 旧 v1 格式(`dbx1:<base64>` 固定前缀,含空串密文 28 字节)已于 2026-10 移除:
+//! 前缀公开导致业务值被误判,且长度下限依赖明文长度、边界易错。n8n 工作流已改用
+//! v2(`scripts/js_encrypt_sql.txt`);若仍有旧客户端发 `dbx1:` 密文,会被当普通
+//! 明文执行(表现为 SQL 语法错误),需先升级该客户端。
 //!
 //! 密钥来自环境变量 `DBX_WAF_SQL_KEY`(经 SHA-256 派生为 32 字节),缺省用内置默认值,
 //! 该默认值与前端构建期 `VITE_DBX_WAF_SQL_KEY` 保持一致。
@@ -26,7 +27,6 @@ use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 
-const WAF_PREFIX: &str = "dbx1:";
 const DEFAULT_WAF_KEY: &str = "dbx-waf-default-key-2026";
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -66,21 +66,14 @@ fn decrypt_parts(nonce: &[u8], ciphertext: &[u8]) -> Result<String, AppError> {
 
 /// 内部解码:Ok(None)=明文透传;Ok(Some(_))=解密成功;Err=密文损坏/篡改。
 fn decode_sql_inner(value: &str) -> Result<Option<String>, AppError> {
-    // v1 旧格式(显式前缀,严格语义)
-    if let Some(payload) = value.strip_prefix(WAF_PREFIX) {
-        let raw =
-            BASE64.decode(payload).map_err(|_| AppError::bad_request("invalid waf-encoded sql payload (base64)"))?;
-        if raw.len() < NONCE_LEN + TAG_LEN {
-            return Err(AppError::bad_request("invalid waf-encoded sql payload (too short)"));
-        }
-        let (nonce, ciphertext) = raw.split_at(NONCE_LEN);
-        return decrypt_parts(nonce, ciphertext).map(Some);
-    }
-    // v2 无前缀格式:凭混淆 magic 识别;不像密文就当明文
+    // 无前缀格式:凭混淆 magic 识别;不像密文就当明文。
+    // (旧 v1 `dbx1:` 前缀格式已移除,这类字符串只是普通文本。)
     let Ok(raw) = BASE64.decode(value) else {
         return Ok(None);
     };
-    if raw.len() < NONCE_LEN + MAGIC_LEN + TAG_LEN + 1 {
+    // 空字符串明文的密文恰好是 12+4+0+16=32 字节,下限不能要求明文至少 1 字节,
+    // 否则空串密文会被当明文透传(如筛选空字符串值时条件变成密文字面量)。
+    if raw.len() < NONCE_LEN + MAGIC_LEN + TAG_LEN {
         return Ok(None);
     }
     let (nonce, rest) = raw.split_at(NONCE_LEN);
@@ -92,8 +85,8 @@ fn decode_sql_inner(value: &str) -> Result<Option<String>, AppError> {
     decrypt_parts(nonce, ciphertext).map(Some)
 }
 
-/// 解码 SQL 载荷:自动识别 v2(无前缀)与 v1(`dbx1:` 前缀)密文;
-/// 非密文原样返回(兼容明文请求)。密文损坏时返回错误(篡改拒绝)。
+/// 解码 SQL 载荷:识别 v2 无前缀密文;非密文原样返回(兼容明文请求)。
+/// 密文损坏(magic 对上但解不开)时返回错误(篡改拒绝)。
 pub fn decode_sql(value: &str) -> Result<String, AppError> {
     Ok(decode_sql_inner(value)?.unwrap_or_else(|| value.to_string()))
 }
@@ -103,8 +96,8 @@ pub fn decode_sql_vec(values: Vec<String>) -> Result<Vec<String>, AppError> {
     values.into_iter().map(|value| decode_sql(&value)).collect()
 }
 
-/// 递归解码 JSON 中所有密文字符串(v2 无前缀 / v1 `dbx1:` 前缀;build-* options、
-/// AI 消息、导出过滤等任意嵌套结构使用,避免逐字段样板)。
+/// 递归解码 JSON 中所有密文字符串(build-* options、AI 消息、导出过滤等任意嵌套
+/// 结构使用,避免逐字段样板)。
 /// 采用尽力解码语义:解不出的(业务数据恰好像密文)原样保留,不报错——
 /// 本方案只做防内容检测,不承担完整性校验。
 /// 通过 `changed` 报告是否真的解出了密文(请求体中间件据此决定透传原字节还是重写)。
@@ -175,19 +168,6 @@ pub async fn decode_json_request_body(
     next.run(axum::http::Request::from_parts(parts, axum::body::Body::from(decoded))).await
 }
 
-/// 测试辅助:构造 v1 旧格式密文(`dbx1:` 前缀),供其他模块单测复用。
-#[cfg(test)]
-pub(crate) fn encode_sql_for_test(plain: &str) -> String {
-    let cipher = Aes256Gcm::new_from_slice(&waf_key()).unwrap();
-    let nonce_bytes = uuid::Uuid::new_v4().as_bytes()[..NONCE_LEN].to_vec();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plain.as_bytes()).unwrap();
-    let mut raw = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    raw.extend_from_slice(&nonce_bytes);
-    raw.extend_from_slice(&ciphertext);
-    format!("{WAF_PREFIX}{}", BASE64.encode(raw))
-}
-
 /// 测试辅助:构造 v2 无前缀密文(与前端 encodeSql 现行输出同格式)。
 #[cfg(test)]
 pub(crate) fn encode_sql_v2_for_test(plain: &str) -> String {
@@ -206,20 +186,6 @@ pub(crate) fn encode_sql_v2_for_test(plain: &str) -> String {
 mod tests {
     use super::*;
 
-    fn encode_for_test(plain: &str) -> String {
-        encode_sql_for_test(plain)
-    }
-
-    #[test]
-    fn round_trip_encodes_and_decodes() {
-        let sql = "SELECT * FROM users WHERE id = 1;";
-        let encoded = encode_for_test(sql);
-        assert!(encoded.starts_with(WAF_PREFIX));
-        assert_eq!(decode_sql(&encoded).unwrap(), sql);
-        // 密文中不应出现明文关键字
-        assert!(!encoded.contains("SELECT"));
-    }
-
     #[test]
     fn v2_round_trip_hides_all_fixed_markers() {
         let sql = "SELECT * FROM users WHERE id = 1;";
@@ -232,6 +198,30 @@ mod tests {
         assert_eq!(decode_sql(&encoded).unwrap(), sql);
         // magic 随 nonce 变化:同一明文两次编码外观不同
         assert_ne!(encode_sql_v2_for_test(sql), encoded);
+    }
+
+    #[test]
+    fn v2_empty_string_round_trips() {
+        // 空字符串密文只有 32 字节(12+4+0+16),不能被长度下限挡在解码之外,
+        // 否则筛选空字符串值时条件会残留密文字面量。
+        let encoded = encode_sql_v2_for_test("");
+        assert_eq!(BASE64.decode(&encoded).unwrap().len(), NONCE_LEN + MAGIC_LEN + TAG_LEN);
+        assert_eq!(decode_sql(&encoded).unwrap(), "");
+    }
+
+    #[test]
+    fn v2_empty_string_golden_sample_decodes_to_empty() {
+        // 线上复现样本:右键「筛选此值」筛空字符串时,条件里残留的正是这种 32 字节密文
+        // (明文为空串,12+4+0+16)。解码侧必须还原成空串,否则请求体会被当明文透传,
+        // 最终条件变成 `cbzt` = '<密文>' 而查不出数据。
+        let golden = "AQIDBAUGBwgJCgsMMarRuJC4NAYYHjkUuqhQJWguHI8=";
+        assert_eq!(BASE64.decode(golden).unwrap().len(), NONCE_LEN + MAGIC_LEN + TAG_LEN);
+        assert_eq!(decode_sql(golden).unwrap(), "");
+        // 请求体递归解码同样要命中(筛条件走的是整包 JSON 递归解码,而非单字段)。
+        let mut changed = false;
+        let decoded = decode_sql_in_json(serde_json::json!({ "options": { "value": golden } }), &mut changed);
+        assert!(changed);
+        assert_eq!(decoded["options"]["value"], "");
     }
 
     #[test]
@@ -259,9 +249,9 @@ mod tests {
     }
 
     #[test]
-    fn vec_decode_mixes_v1_v2_and_plain() {
+    fn vec_decode_mixes_v2_and_plain() {
         let values = vec![
-            encode_for_test("DELETE FROM t"),
+            encode_sql_v2_for_test("DELETE FROM t"),
             encode_sql_v2_for_test("UPDATE t SET c = 1"),
             "SELECT 2".to_string(),
         ];
@@ -278,19 +268,22 @@ mod tests {
     }
 
     #[test]
-    fn tampered_payload_is_rejected() {
-        let encoded = encode_for_test("SELECT 1");
-        let mut bytes = BASE64.decode(encoded.trim_start_matches(WAF_PREFIX)).unwrap();
-        bytes[NONCE_LEN] ^= 0x01;
-        let tampered = format!("{WAF_PREFIX}{}", BASE64.encode(bytes));
-        assert!(decode_sql(&tampered).is_err());
+    fn dbx1_prefixed_text_is_plain_after_v1_removal() {
+        // v1(`dbx1:` 固定前缀)已移除:这类字符串一律是普通文本,原样透传。
+        // 这样业务值(外部系统 ID、编码等)不会再被误判,也不会让接口 400。
+        assert_eq!(decode_sql("dbx1:not-valid-ciphertext").unwrap(), "dbx1:not-valid-ciphertext");
+        assert_eq!(decode_sql("dbx1:").unwrap(), "dbx1:");
+        assert_eq!(decode_sql("dbx1:YWJj").unwrap(), "dbx1:YWJj");
+        // 即便前缀后是"像模像样"的旧密文,也不再解码(旧客户端需升级到 v2)
+        let legacy = format!("dbx1:{}", BASE64.encode(vec![0u8; NONCE_LEN + TAG_LEN]));
+        assert_eq!(decode_sql(&legacy).unwrap(), legacy);
     }
 
     #[test]
     fn json_recursive_decode_covers_nested_fields() {
         let value: serde_json::Value = serde_json::json!({
             "options": { "originalSql": encode_for_test("SELECT 1"), "limit": 10 },
-            "statements": [encode_for_test("DELETE FROM t"), encode_sql_v2_for_test("UPDATE t SET c = 1"), "plain text"],
+            "statements": [encode_sql_v2_for_test("DELETE FROM t"), encode_sql_v2_for_test("UPDATE t SET c = 1"), "plain text"],
             "flag": true,
         });
         let mut changed = false;
@@ -306,7 +299,7 @@ mod tests {
 
     #[test]
     fn json_decode_keeps_business_data_with_dbx1_prefix() {
-        // 业务数据恰好以 dbx1: 开头但解不出密文时,原样保留(尽力解码语义)
+        // v1 移除后,以 dbx1: 开头的业务数据就是普通文本,递归解码不得改动它。
         let value = serde_json::json!({ "cell": "dbx1:not-valid-ciphertext" });
         let mut changed = false;
         let decoded = decode_sql_in_json(value, &mut changed);

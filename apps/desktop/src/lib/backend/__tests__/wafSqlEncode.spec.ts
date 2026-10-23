@@ -75,6 +75,47 @@ describe("WAF 深度加密", () => {
     expect(encoded.columns).toEqual(["body", "id"]);
   });
 
+  it("空字符串不加密(避免空值筛选条件退化成密文字面量)", async () => {
+    // 空串密文恰好 32 字节(12+4+0+16);一旦任一侧长度下限/幂等识别差一个字节,
+    // 密文就会当明文透传,条件变成 `cbzt` = '<密文>'。空串无 SQL 特征,不加密最稳。
+    const encoded = (await encodeSqlDeep({ value: "" })) as { value: unknown };
+    expect(encoded.value).toBe("");
+  });
+
+  it("旧客户端留下的 32 字节空串密文按密文识别,不会被二次加密", async () => {
+    // 32 字节 = nonce(12) + 混淆 magic(4) + 空明文密文(16 tag)。
+    const golden = "AQIDBAUGBwgJCgsMMarRuJC4NAYYHjkUuqhQJWguHI8=";
+    expect(atob(golden).length).toBe(32);
+    expect(await encodeSqlDeep({ value: golden })).toEqual({ value: golden });
+  });
+
+  it("以 dbx1: 开头的普通值照常加密(v1 前缀已移除,不再当密文)", async () => {
+    // 旧 v1 的固定前缀兼容已删除,这类值就是普通文本,必须参与加密;
+    // 否则会明文过网关,还会被后端当业务数据原样执行。
+    const encoded = (await encodeSqlDeep({ value: "dbx1:not-a-ciphertext" })) as { value: string };
+    expect(encoded.value).not.toBe("dbx1:not-a-ciphertext");
+    expect(encoded.value.startsWith("dbx1:")).toBe(false);
+  });
+
+  it("Date/Uint8Array 等非纯对象原样透传,不被深拷贝成空对象", async () => {
+    const when = new Date("2026-10-22T09:00:00.000Z");
+    const bytes = new Uint8Array([1, 2, 3]);
+    const encoded = (await encodeSqlDeep({ when, bytes, meta: { createdAt: when } })) as {
+      when: unknown;
+      bytes: unknown;
+      meta: { createdAt: unknown };
+    };
+    expect(encoded.when).toBe(when);
+    expect(encoded.bytes).toBe(bytes);
+    expect(encoded.meta.createdAt).toBe(when);
+    // 交给 JSON.stringify 后仍是时间字符串与数字键对象,没有被遍历成 {}。
+    expect(JSON.parse(JSON.stringify(encoded))).toEqual({
+      when: "2026-10-22T09:00:00.000Z",
+      bytes: { "0": 1, "1": 2, "2": 3 },
+      meta: { createdAt: "2026-10-22T09:00:00.000Z" },
+    });
+  });
+
   it("开关关闭时原样透传", async () => {
     vi.stubEnv("VITE_DBX_WAF_SQL_ENCODE", "0");
     const body = { options: { whereInput: "a = 1" } };

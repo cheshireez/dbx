@@ -2,16 +2,15 @@
 // 可选传输层载荷加密(绕过内容型 WAF 对 SQL 关键字的误拦)
 // 仅在构建时设置 VITE_DBX_WAF_SQL_ENCODE=1 才启用;后端 waf_codec 负责解密,
 // 密钥需与后端 DBX_WAF_SQL_KEY 保持一致(缺省用同一内置默认值)。
-// v2 格式:base64(nonce[12] || masked_magic[4] || cipher(含 tag)),无固定前缀,
+// 格式:base64(nonce[12] || masked_magic[4] || cipher(含 tag)),无固定前缀,
 // masked_magic = "DBX1" XOR SHA256(key || nonce)[0..4],外观与随机 token 无异,
-// 传输中不出现任何固定明文特征;旧 `dbx1:` 前缀格式仅作识别兼容(后端仍接受)。
+// 传输中不出现任何固定明文特征。旧 v1(`dbx1:` 固定前缀)格式已移除,前后端一致。
 //
 // 独立成模块的原因:http.ts 与 mq-http.ts 都需要请求体加密,而 http.ts 又
 // `export * from mq-http`,放在 http.ts 会形成循环依赖。
 // ---------------------------------------------------------------------------
 const WAF_SQL_ENCODE_FLAG = "VITE_DBX_WAF_SQL_ENCODE";
 const WAF_SQL_KEY = import.meta.env.VITE_DBX_WAF_SQL_KEY || "dbx-waf-default-key-2026";
-const WAF_SQL_PREFIX = "dbx1:";
 const WAF_MAGIC = [0x44, 0x42, 0x58, 0x31]; // "DBX1",经混淆后才出现在传输中
 
 /**
@@ -146,13 +145,14 @@ function wafBase64ToBytes(value: string): Uint8Array {
 
 /**
  * 判断字符串是否已是密文(幂等加密用)。
- * 输入:任意字符串;输出:true 表示已加密(v2 混淆 magic 匹配或旧 dbx1: 前缀)。
+ * 输入:任意字符串;输出:true 表示已加密(无前缀,按混淆 magic 识别)。
+ * 旧 v1 的 `dbx1:` 前缀格式已移除,这类字符串只是普通文本,照常参与加密。
  */
 async function isWafEncoded(value: string): Promise<boolean> {
-  if (value.startsWith(WAF_SQL_PREFIX)) return true;
   try {
     const raw = wafBase64ToBytes(value);
-    if (raw.length < 12 + 4 + 16 + 1) return false;
+    // 空字符串密文为 12+4+0+16=32 字节:下限不校验明文长度,保证空串加密结果可被幂等识别。
+    if (raw.length < 12 + 4 + 16) return false;
     const masked = raw.slice(12, 16);
     const expected = await wafMaskedMagic((await wafImportKey()).keyBytes, raw.slice(0, 12));
     return masked.every((byte, index) => byte === expected[index]);
@@ -167,7 +167,10 @@ async function isWafEncoded(value: string): Promise<boolean> {
  * 加密不可用(如非 HTTPS)时退回明文。
  */
 export async function encodeSql(sql: string): Promise<string> {
-  if (!isWafEncodeEnabled() || (await isWafEncoded(sql))) return sql;
+  // 空串不加密:它没有任何可被内容型 WAF 识别的 SQL 特征,加密只会制造风险——
+  // 空串密文恰好 32 字节(12+4+0+16),只要任一侧的长度下限或幂等识别差一个字节,
+  // 密文就会原样漏进 WHERE 条件(筛选空值时条件变成 cbzt = '<密文>')。
+  if (!isWafEncodeEnabled() || sql === "" || (await isWafEncoded(sql))) return sql;
   try {
     const { key, keyBytes } = await wafImportKey();
     const nonce = crypto.getRandomValues(new Uint8Array(12));
@@ -182,6 +185,16 @@ export async function encodeSql(sql: string): Promise<string> {
     // 加密不可用(如非 HTTPS 环境)时退回明文,保证功能可用
     return sql;
   }
+}
+
+/**
+ * 只对"纯对象"做深拷贝遍历。Date/Blob/Uint8Array/Map/Set 等实例一旦被
+ * Object.entries 展开就会退化成 {} 或 {"0":..},请求体里的时间、二进制、表单
+ * 数据会被静默改坏 —— 这类值原样交给 JSON.stringify(它自带 toJSON 语义)。
+ */
+function isPlainObject(value: object): boolean {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
@@ -201,6 +214,7 @@ export async function encodeSqlDeep(value: unknown, fieldName = "", force = fals
     return Promise.all(value.map((item) => encodeSqlDeep(item, fieldName, force)));
   }
   if (value && typeof value === "object") {
+    if (!isPlainObject(value)) return value;
     const matched = force || (fieldName !== "" && isWafSqlField(fieldName));
     const entries = await Promise.all(Object.entries(value as Record<string, unknown>).map(async ([key, item]) => [key, await encodeSqlDeep(item, key, matched)] as const));
     return Object.fromEntries(entries);

@@ -92,15 +92,14 @@ fn encode_sql(sql: &str) -> Result<String, String> {
     Ok(BASE64.encode(raw))
 }
 
-/// 判断字符串是否已是密文(v2 混淆 magic 匹配或旧 `dbx1:` 前缀;幂等加密用)。
+/// 判断字符串是否已是密文(按 v2 混淆 magic 识别;幂等加密用)。
+/// 旧 v1 的 `dbx1:` 固定前缀格式已移除,这类字符串只是普通文本,照常参与加密。
 pub fn is_waf_encoded(value: &str) -> bool {
-    if value.starts_with("dbx1:") {
-        return true;
-    }
     let Ok(raw) = BASE64.decode(value) else {
         return false;
     };
-    if raw.len() < NONCE_LEN + MAGIC_LEN + TAG_LEN + 1 {
+    // 空字符串密文只有 32 字节(明文 0 字节),下限与加密侧产出对齐,否则幂等识别会失效。
+    if raw.len() < NONCE_LEN + MAGIC_LEN + TAG_LEN {
         return false;
     }
     let (nonce, rest) = raw.split_at(NONCE_LEN);
@@ -110,8 +109,11 @@ pub fn is_waf_encoded(value: &str) -> bool {
 
 /// 加密一条文本(内部):幂等,已加密字符串原样返回,避免深度加密与逐字段
 /// 加密(如查询接口显式加密的 `sql`)叠加成双层密文。
+/// 空串一律不加密:它没有任何可被内容型 WAF 识别的特征,而空串密文恰好只有
+/// 32 字节(12+4+0+16),一旦对端长度下限/幂等识别差一个字节,密文就会漏进
+/// SQL 字面量(筛选空值的经典故障),故从源头不产出这种载荷。
 fn encode_text_once(text: &str) -> String {
-    if is_waf_encoded(text) {
+    if text.is_empty() || is_waf_encoded(text) {
         return text.to_string();
     }
     encode_sql(text).unwrap_or_else(|_| text.to_string())
@@ -209,7 +211,7 @@ mod tests {
 
     fn decode_sql(value: &str) -> Result<String, String> {
         let raw = BASE64.decode(value).map_err(|_| "invalid base64".to_string())?;
-        if raw.len() < NONCE_LEN + MAGIC_LEN + TAG_LEN + 1 {
+        if raw.len() < NONCE_LEN + MAGIC_LEN + TAG_LEN {
             return Err("payload too short".to_string());
         }
         let (nonce, rest) = raw.split_at(NONCE_LEN);
@@ -234,6 +236,38 @@ mod tests {
         assert_eq!(decode_sql(&encoded).unwrap(), sql);
         // magic 随 nonce 变化:同一明文两次编码外观不同
         assert_ne!(encode_sql(sql).unwrap(), encoded);
+    }
+
+    #[test]
+    fn empty_string_payload_is_recognized_and_round_trips() {
+        // 空字符串密文仅 32 字节:幂等识别与解码的长度下限必须放行,否则空值会被二次加密。
+        let encoded = encode_sql("").unwrap();
+        assert_eq!(BASE64.decode(&encoded).unwrap().len(), NONCE_LEN + MAGIC_LEN + TAG_LEN);
+        assert!(is_waf_encoded(&encoded));
+        assert_eq!(decode_sql(&encoded).unwrap(), "");
+        assert_eq!(encode_text_once(&encoded), encoded);
+    }
+
+    #[test]
+    fn dbx1_prefixed_text_is_not_ciphertext_after_v1_removal() {
+        // v1(`dbx1:` 固定前缀)已移除:这类值一律按普通文本处理,照常加密。
+        assert!(!is_waf_encoded("dbx1:not-valid-ciphertext"));
+        assert!(!is_waf_encoded("dbx1:YWJj"));
+        // 与旧 v1 密文同形状(前缀 + 28 字节)也不再识别,避免误判业务数据。
+        let raw = vec![0u8; NONCE_LEN + TAG_LEN];
+        assert!(!is_waf_encoded(&format!("dbx1:{}", BASE64.encode(raw))));
+        // 同样的字节去掉前缀(v2 形态但 magic 为 0)不匹配 magic,仍非密文。
+        assert!(!is_waf_encoded(&BASE64.encode(vec![0u8; NONCE_LEN + MAGIC_LEN + TAG_LEN])));
+    }
+
+    #[test]
+    fn empty_text_is_never_encoded_by_the_funnel() {
+        // 源头不产出空串密文:即使旧载荷(32 字节空串密文)仍需被识别,新请求不再制造它。
+        assert_eq!(encode_text_once(""), "");
+        let golden = "AQIDBAUGBwgJCgsMMarRuJC4NAYYHjkUuqhQJWguHI8=";
+        assert_eq!(BASE64.decode(golden).unwrap().len(), NONCE_LEN + MAGIC_LEN + TAG_LEN);
+        assert!(is_waf_encoded(golden));
+        assert_eq!(decode_sql(golden).unwrap(), "");
     }
 
     #[test]
