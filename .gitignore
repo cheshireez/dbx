@@ -112,3 +112,7 @@ dbx-devtest-connections.json
 # Real database integration credentials (see docs/TEST_ENVIRONMENTS.md)
 /docs/TEST_ENVIRONMENTS.md
 .wrangler/
+
+# 镜像归档（144MB 二进制，随构建产物重新导出，不入库）
+/dbx-waf.tar
+/dbx-waf-*.tar
